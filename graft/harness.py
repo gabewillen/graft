@@ -19,7 +19,7 @@ import json
 import re
 from typing import Callable
 
-from . import compaction
+from . import callsites, compaction
 from .db import NESTING_ENABLED, Store, render, validate
 from .machine import Machines
 from .providers import Provider, prefix_nonce
@@ -70,18 +70,22 @@ class Harness:
         # Compaction threshold (estimated tokens of a working view); None = never compact.
         self.compact_tokens = compact_tokens
         if compaction_mode not in ("turns", "summary"):
-            raise ValueError(f"compaction_mode must be 'turns' or 'summary', got {compaction_mode!r}")
+            raise ValueError(f"compaction_mode must be turns or summary, got {compaction_mode!r}")
         # turns: kept rows + compressed windows (default); summary: one summary row (ablation)
         self.compaction_mode = compaction_mode
         self.compactions: list[str] = []  # timelines that compacted, in order
         self.compaction_log: list[dict] = []  # per compaction: tokens before/after, kept, notes
         self.compaction_failures: list[str] = []  # timelines whose selection was refused twice
+        self.compaction_failure_calls: list[dict] = []  # cost of refused-twice compactions
+        self._after_compaction: dict[str, dict] = {}  # tl -> log event awaiting its next model call
 
     def complete(self, tag: str, system: str, messages: list[dict], tools: list[dict], **kw) -> list[dict]:
-        """Every model call goes through here: applies the run nonce and the usage-role tag."""
+        """Every model call goes through here: applies the run nonce, the usage-role tag, and the
+        call site's reasoning effort and model (graft/callsites.py)."""
+        cs = callsites.settings(tag, messages)
         tagger = getattr(self.provider, "usage_tag", None)
         with tagger(tag) if tagger else contextlib.nullcontext():
-            return self.provider.complete(system, prefix_nonce(messages, self.nonce), tools, **kw)
+            return self.provider.complete(system, prefix_nonce(messages, self.nonce), tools, **kw, **cs)
 
     def role(self, tl: str) -> str:
         return "original" if self.store.timeline(tl)["source_id"] is None else f"clone:{tl}"
@@ -158,12 +162,16 @@ class Harness:
             self._summary_compact(tl, rows)
             return
         violations: list[str] | None = None
+        calls: list[dict] = []
         for attempt in range(2):
             budget = int(self.compact_tokens * compaction.BUDGET_FRACTION)
             blocks = self.complete(f"{self.role(tl)}:compaction", self.system(tl),
                                    compaction.extract_request(render(prefix), prefix, violations, budget,
                                                               compaction.estimate_tokens(render(rows))),
                                    [compaction.COMPACT_TOOL], max_tokens=4000)
+            last = getattr(self.provider, "last_call", lambda: None)()
+            if last:
+                calls.append(last)
             items = compaction.parse_items(blocks)
             if items is None:
                 violations = ["call the compact tool (no tool call was made)"]
@@ -185,10 +193,12 @@ class Harness:
                         self.store.add_compressed_turn(tl, it["role"], it["content"], *it["window"])
                         for it in new_rows] + [fresh["row_id"]]
             self.store.mark_compaction(tl, view_ids)
-            self._log_compaction(tl, rows, view_ids, attempt + 1)
+            self._log_compaction(tl, rows, view_ids, attempt + 1, calls)
             self.trace(f"[{tl}] COMPACTED: {len(new_rows)} items for {len(prefix)} rows")
             return
         self.compaction_failures.append(tl)
+        self.compaction_failure_calls.append({"timeline": tl, "output_tokens": sum(c["output"] for c in calls),
+                                              "calls": len(calls)})
         self.trace(f"[{tl}] compaction abandoned after 2 attempts: {violations}")
 
     def _summary_compact(self, tl: str, rows: list[dict]) -> None:
@@ -202,17 +212,22 @@ class Harness:
                                              prefix[0]["row_id"], prefix[-1]["row_id"])
         view_ids = [sid, fresh["row_id"]]
         self.store.mark_compaction(tl, view_ids)
-        self._log_compaction(tl, rows, view_ids, 1)
+        last = getattr(self.provider, "last_call", lambda: None)()
+        self._log_compaction(tl, rows, view_ids, 1, [last] if last else [])
         self.trace(f"[{tl}] COMPACTED (summary) -> row {sid}")
 
-    def _log_compaction(self, tl: str, rows: list[dict], view_ids: list[int], attempts: int) -> None:
-        """Record a committed compaction for metrics: tokens before/after, kept rows, and each
-        compressed message with its window (the prefix rows it condenses)."""
+    def _log_compaction(self, tl: str, rows: list[dict], view_ids: list[int], attempts: int,
+                        calls: list[dict] | None = None) -> None:
+        """Record a committed compaction for metrics: tokens before/after, kept rows, each
+        compressed message with its window, the compaction calls' output tokens, the kept head
+        (prefix rows kept unchanged before the first window), and, filled in by run(), the cached
+        input tokens of the first model call after it."""
         prefix = rows[:-1]
         ids = [r["row_id"] for r in prefix]
         windows = []
         for rid in view_ids:
-            w = self.store.compression_window(rid)
+            # only messages written by this compaction; an earlier compressed row kept now is a keep
+            w = self.store.compression_window(rid) if rid not in set(ids) else None
             if w:
                 covered = ids[ids.index(w[0]):ids.index(w[1]) + 1]
                 windows.append({"row_id": rid, "begin": w[0], "end": w[1], "covers": covered,
@@ -223,7 +238,12 @@ class Harness:
             "after_tokens": compaction.estimate_tokens(render(self.store.working_view(tl))),
             "rows_before": len(rows), "kept_ids": [i for i in view_ids[:-1] if i in set(ids)],
             "windows": windows, "prefix": [(r["row_id"], r["content"]) for r in prefix],
-            "fresh": rows[-1]["content"], "attempts": attempts})
+            "fresh": rows[-1]["content"], "attempts": attempts,
+            "output_tokens": sum(c["output"] for c in calls or []), "calls": len(calls or []),
+            "kept_head": next((i for i, rid in enumerate(view_ids[:-1]) if rid not in set(ids)),
+                              len(view_ids) - 1),
+            "first_call_after": None})
+        self._after_compaction[tl] = self.compaction_log[-1]
 
     async def run(self, tl: str) -> None:
         clone_attempts = 0
@@ -235,6 +255,10 @@ class Harness:
                 raise RuntimeError(f"{tl} view invalid before model call: {violations}")
             tools = self.store.tools_for(tl)
             blocks = self.complete(self.role(tl), self.system(tl), render(rows), tools)
+            pending = self._after_compaction.pop(tl, None)
+            last = getattr(self.provider, "last_call", lambda: None)()
+            if pending is not None and last:
+                pending["first_call_after"] = {k: last[k] for k in ("input", "cached", "cache_write", "uncached")}
             if not any(b["type"] in ("text", "tool_use") for b in blocks):
                 self.trace(f"[{tl}] (empty response)")
                 return

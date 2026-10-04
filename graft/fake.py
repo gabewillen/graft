@@ -157,24 +157,27 @@ def _holder_policy(names: set[str], messages: list[dict]) -> list[dict]:
 
 
 def _fake_compact(messages: list[dict]) -> list[dict]:
-    """Keep the user's text rows; compress each run of other rows into one assistant message."""
+    """Keep the user's text rows; compress each run of other rows into one assistant message
+    (a lone row is kept)."""
     index = _user_texts(messages)[-1]
-    rows = re.findall(r"row_id=(\d+) (user|assistant) (\w+)", index)
+    rows = re.findall(r"row_id=(\d+) (user|assistant) (\w+)[^:\n]*?()(?=:)", index)
     items: list[dict] = []
-    run: list[int] = []
+    run: list[tuple[int, bool]] = []
 
     def flush():
-        if run:
-            items.append({"role": "assistant", "text": "I have been noting the details so far.",
-                          "begin_row_id": run[0], "end_row_id": run[-1]})
-            run.clear()
+        if len(run) == 1:
+            items.append({"op": "keep", "row_id": run[0][0]})
+        elif run:
+            items.append({"op": "compress", "role": "assistant", "text": "I have been noting the details so far.",
+                          "begin_row_id": run[0][0], "end_row_id": run[-1][0]})
+        run.clear()
 
-    for rid, role, kind in rows:
+    for rid, role, kind, short in rows:
         if role == "user" and kind == "text":
             flush()
-            items.append({"keep": int(rid)})
+            items.append({"op": "keep", "row_id": int(rid)})
         else:
-            run.append(int(rid))
+            run.append((int(rid), bool(short)))
     flush()
     return _use("compact", items=items)
 

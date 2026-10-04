@@ -20,7 +20,7 @@ import contextlib
 import json
 from dataclasses import dataclass, field
 
-from . import compaction
+from . import callsites, compaction
 from .db import Store
 from .providers import Provider, prefix_nonce
 from .skills import BASE_SYSTEM, CATALOG, LOAD_SKILL_TOOL, BUILTIN, World, load_skill, skill_listing
@@ -94,9 +94,10 @@ class SubagentRunner:
             SUBAGENT_NOTE])
 
     def _complete(self, tag: str, system: str, msgs: list[dict], tools: list[dict]) -> list[dict]:
+        cs = callsites.settings(tag, msgs)  # per-call-site effort and model (graft/callsites.py)
         tagger = getattr(self.provider, "usage_tag", None)
         with tagger(tag) if tagger else contextlib.nullcontext():
-            return self.provider.complete(system, prefix_nonce(msgs, self.nonce), tools)
+            return self.provider.complete(system, prefix_nonce(msgs, self.nonce), tools, **cs)
 
     def _retag(self, tag: str) -> None:
         retag = getattr(self.provider, "retag_last", None)

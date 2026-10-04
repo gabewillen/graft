@@ -177,7 +177,11 @@ def test_partition_validation():
     assert probs  # window out of order
     _, probs = compaction.partition(prefix, [{"keep": 10}, {"role": "assistant", "text": "",
                                                              "begin_row_id": 11, "end_row_id": 13}])
-    assert probs and "must be" in probs[0]  # empty text
+    assert probs and ("must be" in probs[0] or "needs op" in probs[0])  # empty text
+    _, probs = compaction.partition(prefix, [{"op": "keep", "row_id": 10}, {"op": "compress", "role": "assistant",
+                                                                            "text": "", "begin_row_id": 11,
+                                                                            "end_row_id": 13}])
+    assert probs and "must be" in probs[0]  # empty text with an explicit op
 
 
 def test_invalid_compaction_gets_one_retry_then_gives_up(tmp_path):
@@ -289,3 +293,67 @@ def test_compaction_over_budget_is_refused(tmp_path):
 
     asyncio.run(go())
     assert h.compaction_failures and not h.compaction_log
+
+
+# ------------------------------------------------------------------ op schema + metrics
+def _rows(*specs):
+    return [{"row_id": rid, "role": role, "kind": "text", "owner_timeline": "c1", "tool_name": None, "content": text}
+            for rid, role, text in specs]
+
+
+def test_compaction_metrics_logged(tmp_path):
+    store, fp, h = _compacting_harness(tmp_path)
+
+    async def go():
+        await h.start()
+        await run_script(h, LONG_SCRIPT, echo=False)
+        await h.machines.stop()
+
+    asyncio.run(go())
+    e = h.compaction_log[0]
+    assert e["calls"] >= 1 and "output_tokens" in e
+    assert 0 <= e["kept_head"] <= len(e["prefix"])
+    assert e["first_call_after"] is not None and set(e["first_call_after"]) >= {"input", "cached"}
+
+
+def test_op_discriminator_disambiguates_filled_fields():
+    """Models fill every schema field; `op` decides (the bug behind 'every row compressed')."""
+    prefix = _rows((1, "user", "Hi."), (2, "assistant", "x" * 400))
+    rows, probs = compaction.partition(prefix, [
+        {"op": "keep", "row_id": 1, "role": "user", "text": "Hi.", "begin_row_id": 1, "end_row_id": 1},
+        {"op": "compress", "row_id": 2, "role": "assistant", "text": "x", "begin_row_id": 2, "end_row_id": 2}],
+    )
+    assert not probs and rows[0]["row_id"] == 1 and rows[1]["window"] == (2, 2)
+    _, probs = compaction.partition(prefix, [{"op": "drop", "row_id": 1}, {"op": "keep", "row_id": 2}])
+    assert probs and "op" in probs[0]
+    schema = compaction.COMPACT_TOOL["input_schema"]["properties"]["items"]["items"]["anyOf"]
+    assert [s["properties"]["op"]["enum"] for s in schema] == [["keep"], ["compress"]]
+
+
+def test_second_compaction_keeping_an_earlier_compressed_row(tmp_path):
+    """Regression: a compressed row from an earlier compaction, kept by a later one, is a keep."""
+    store, fp, h = _compacting_harness(tmp_path, threshold=200)
+
+    async def go():
+        await h.start()
+        await run_script(h, LONG_SCRIPT + ["Our tagline is 'Bright smiles on the lake', and keep the tone formal.",
+                                           "The audience is families in the Duluth area; parking is on Lake Avenue."],
+                         echo=False)
+        await h.machines.stop()
+
+    asyncio.run(go())
+    assert len(h.compaction_log) >= 2
+    for e in h.compaction_log:
+        prefix_ids = [p[0] for p in e["prefix"]]
+        assert all(w["begin"] in prefix_ids for w in e["windows"])
+
+
+def test_instruction_has_plain_keep_hint_and_no_rules():
+    req = compaction.extract_request([], _rows((1, "user", "Hi.")), None)
+    text = req[-1]["content"][-1]["text"]
+    assert "Keep short rows and exact details" in text and "[short]" not in text and "Keep the head" not in text
+    # a single short row compressed alone is accepted (no refusal rule)
+    _, probs = compaction.partition(_rows((1, "user", "Hi."), (2, "assistant", "x" * 400)),
+                                    [{"op": "compress", "role": "user", "text": "Hi", "begin_row_id": 1, "end_row_id": 1},
+                                     {"op": "keep", "row_id": 2}])
+    assert not probs

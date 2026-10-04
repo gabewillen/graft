@@ -65,25 +65,29 @@ COMPACT_TOOL = {
                    "the index exactly once: keep a row, or compress a contiguous window of rows "
                    "into one message.",
     "input_schema": {"type": "object", "properties": {
-        "items": {"type": "array", "items": {"type": "object", "properties": {
-            "keep": {"type": "integer"},
-            "role": {"type": "string", "enum": ["user", "assistant"]},
-            "text": {"type": "string"},
-            "begin_row_id": {"type": "integer"},
-            "end_row_id": {"type": "integer"}}}}},
+        "items": {"type": "array", "items": {"anyOf": [
+            {"type": "object", "description": "Keep one row unchanged (a pointer).",
+             "properties": {"op": {"type": "string", "enum": ["keep"]}, "row_id": {"type": "integer"}},
+             "required": ["op", "row_id"], "additionalProperties": False},
+            {"type": "object", "description": "Replace rows begin_row_id..end_row_id with one message.",
+             "properties": {"op": {"type": "string", "enum": ["compress"]},
+                            "role": {"type": "string", "enum": ["user", "assistant"]},
+                            "text": {"type": "string"},
+                            "begin_row_id": {"type": "integer"}, "end_row_id": {"type": "integer"}},
+             "required": ["op", "role", "text", "begin_row_id", "end_row_id"], "additionalProperties": False}]}}},
         "required": ["items"]}}
 
 EXTRACT_INSTRUCTION = (
     "Before you continue: your conversation is getting long. Compact it by calling the `compact` "
     "tool once with an ordered list of `items` that covers every row of the index below exactly "
     "once, in order:\n"
-    "- {\"keep\": row_id} keeps that row unchanged. Prefer this for short messages and exact "
-    "details (names, numbers, dates, quotes); do not rewrite a short user message one-for-one, keep it.\n"
-    "- {\"role\": \"user\"|\"assistant\", \"text\": ..., \"begin_row_id\": a, \"end_row_id\": b} "
-    "replaces the contiguous rows a..b (inclusive, in index order) with one condensed message. A "
-    "user-role message must only restate what the user said in those rows. Use windows to drop "
-    "chit-chat, tool noise and superseded drafts, but keep every fact, requirement and preference "
-    "the user gave and the results of work you still need.\n"
+    "- {\"op\": \"keep\", \"row_id\": id} keeps that row unchanged (a pointer; nothing is rewritten).\n"
+    "- {\"op\": \"compress\", \"role\": \"user\"|\"assistant\", \"text\": ..., \"begin_row_id\": a, "
+    "\"end_row_id\": b} replaces the contiguous rows a..b (inclusive, in index order) with one condensed "
+    "message. A user-role message must only restate what the user said in those rows.\n"
+    "Keep short rows and exact details (names, numbers, dates, quotes) verbatim; compress long or "
+    "redundant rows (tool noise, superseded drafts, chit-chat). Keep every fact, requirement and "
+    "preference the user gave and the results of work you still need.\n"
     "Windows and kept rows may not overlap or skip rows. A kept tool_use row needs its kept "
     "tool_result row (or put both inside one window). The result, followed by the user's latest "
     "message (kept automatically), must start with a user turn.")
@@ -146,14 +150,20 @@ def partition(prefix: list[dict], items: list) -> tuple[list[dict], list[str]]:
             problems.append(f"item {k} is past the end of the index (every row is already covered)")
             break
         want = ids[cur]
-        # A compressed message is any item with text and a window; models often also fill unused
-        # fields (e.g. keep: 0), so `keep` counts only when there is no window.
-        is_window = bool(str(it.get("text") or "").strip()) and _int(it.get("begin_row_id")) is not None
-        if not is_window and it.get("keep") is not None:
-            rid = _int(it["keep"])
+        # The op field decides; extra fields on a keep are ignored. Items without op fall back to
+        # the old shape ({keep: id} or a window) for robustness.
+        op = it.get("op")
+        if op is None:
+            op = "compress" if (str(it.get("text") or "").strip() and _int(it.get("begin_row_id")) is not None
+                                and it.get("keep") in (None, 0)) else ("keep" if it.get("keep") is not None else None)
+        if op not in ("keep", "compress"):
+            problems.append(f"item {k} needs op 'keep' or 'compress'")
+            break
+        if op == "keep":
+            rid = _int(it.get("row_id", it.get("keep")))
             if rid != want:
-                problems.append(f"item {k} keeps row {it['keep']}, but the next uncovered row is {want}: item {k} "
-                                f"must be {{keep: {want}}} or a window with begin_row_id {want} (items must cover "
+                problems.append(f"item {k} keeps row {it.get('row_id', it.get('keep'))}, but the next uncovered row is {want}: item {k} "
+                                f"must be {{op: keep, row_id: {want}}} or a window with begin_row_id {want} (items must cover "
                                 f"the row ids in order without gaps or overlap; ids are not consecutive)")
                 break
             out.append(prefix[cur])
@@ -162,11 +172,12 @@ def partition(prefix: list[dict], items: list) -> tuple[list[dict], list[str]]:
         role, text = it.get("role"), str(it.get("text") or "").strip()
         b, e = _int(it.get("begin_row_id")), _int(it.get("end_row_id"))
         if role not in ("user", "assistant") or not text or b is None or e is None:
-            problems.append(f"item {k} must be {{keep: row_id}} or {{role, text, begin_row_id, end_row_id}}")
+            problems.append(f"item {k} must be {{op: keep, row_id}} or {{op: compress, role, text, begin_row_id, "
+                            f"end_row_id}}")
             break
         if b != want:
             problems.append(f"item {k} window begins at row {b}, but the next uncovered row is {want}: item {k} "
-                            f"must be {{keep: {want}}} or a window with begin_row_id {want}")
+                            f"must be {{op: keep, row_id: {want}}} or a window with begin_row_id {want}")
             break
         if e not in at or at[e] < at[b]:
             problems.append(f"item {k} window end row {e} is not at or after row {b} in the index")

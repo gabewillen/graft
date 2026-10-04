@@ -29,7 +29,8 @@ class Provider(Protocol):
     model: str
 
     def complete(self, system: str, messages: list[dict], tools: list[dict],
-                 max_tokens: int = 4096) -> list[dict]: ...
+                 max_tokens: int = 4096, *, model: str | None = None, effort: str | None = None,
+                 site: str | None = None) -> list[dict]: ...
 
 
 class MissingKey(SystemExit):
@@ -83,6 +84,7 @@ class UsageMixin:
     def _init_usage(self) -> None:
         self.usage = empty_usage()
         self.by_tag: dict[str, dict] = {}
+        self.by_model: dict[str, dict] = {}
         self.call_log: list[dict] = []
         self._lock = threading.Lock()
         self._local = threading.local()
@@ -106,6 +108,8 @@ class UsageMixin:
         with self._lock:
             add_usage(self.usage, call)
             add_usage(self.by_tag.setdefault(tag, empty_usage()), call)
+            add_usage(self.by_model.setdefault(str(meta.get("model") or getattr(self, "model", "?")),
+                                               empty_usage()), call)
             self.call_log.append(entry)
         self._local.last_call = entry
         t = getattr(self._local, "usage", None)
@@ -209,20 +213,23 @@ class AnthropicProvider(UsageMixin):
                                                  **kw).input_tokens
         return {"system": sys_n - base, "tools_and_system": both - base, "exact": True}
 
-    def complete(self, system, messages, tools, max_tokens=4096):
+    def complete(self, system, messages, tools, max_tokens=4096, *, model=None, effort=None, site=None):
+        model = model or self.model
         kwargs: dict = {}
-        if self.model == "claude-sonnet-5-5":
+        if model == "claude-sonnet-5-5":
             # Lowest thinking setting on Sonnet 5.5 (no extended thinking); effort <= high.
             kwargs["thinking"] = {"type": "between_tools"}
-            kwargs["output_config"] = {"effort": "medium"}
+            effort = effort if effort in ("low", "medium", "high") else "medium"
         else:
-            kwargs["output_config"] = {"effort": "low"}
+            effort = effort or "low"
+        kwargs["output_config"] = {"effort": effort}
         kwargs.update(self.request_cache_kwargs(system, tools))
         resp = self.client.messages.create(
-            model=self.model, max_tokens=max_tokens, messages=self.wire_messages(messages), **kwargs)
+            model=model, max_tokens=max_tokens, messages=self.wire_messages(messages), **kwargs)
         u = resp.usage
         self._record(u.input_tokens, u.output_tokens, cached=u.cache_read_input_tokens or 0,
-                     cache_write=u.cache_creation_input_tokens or 0, cache_key=None)
+                     cache_write=u.cache_creation_input_tokens or 0, cache_key=None,
+                     model=model, effort=effort, site=site)
         if resp.stop_reason == "refusal":
             return [{"type": "text", "text": "(refused)"}]
         blocks = []
@@ -310,17 +317,20 @@ class OpenAIProvider(UsageMixin):
                 # thinking blocks are Anthropic-only and are not sent
         return out
 
-    def complete_responses(self, system, messages, tools, max_tokens):
+    def complete_responses(self, system, messages, tools, max_tokens, model=None, effort=None, site=None):
+        model, effort = model or self.model, effort or self.effort
         kwargs: dict = self._cache_kwargs(system, tools)
         if tools:
             kwargs["tools"] = self.wire_tools_responses(tools)
-        if self.model.startswith(("gpt-5", "gpt-6", "o")):
-            kwargs["reasoning"] = {"effort": self.effort}
+        if model.startswith(("gpt-5", "gpt-6", "o")):
+            kwargs["reasoning"] = {"effort": effort}
+        else:
+            effort = None
         resp = self.client.responses.create(
-            model=self.model, instructions=system, input=self.wire_input(messages),
+            model=model, instructions=system, input=self.wire_input(messages),
             max_output_tokens=max_tokens, store=False, **kwargs)
         self._record_openai(resp.usage, "input_tokens", "output_tokens", "input_tokens_details",
-                            kwargs.get("prompt_cache_key"))
+                            kwargs.get("prompt_cache_key"), model=model, effort=effort, site=site)
         blocks: list[dict] = []
         for item in resp.output:
             if item.type == "message":
@@ -335,17 +345,17 @@ class OpenAIProvider(UsageMixin):
                 blocks.append({"type": "tool_use", "id": item.call_id, "name": item.name, "input": args})
         return blocks
 
-    def _record_openai(self, usage, in_f: str, out_f: str, details_f: str, key: str | None) -> None:
+    def _record_openai(self, usage, in_f: str, out_f: str, details_f: str, key: str | None, **meta) -> None:
         """OpenAI counts cached reads (and cache writes) inside the input total; split them out."""
         if usage is None:
-            self._record(0, 0, cache_key=key)
+            self._record(0, 0, cache_key=key, **meta)
             return
         total = getattr(usage, in_f) or 0
         det = getattr(usage, details_f, None)
         cached = (getattr(det, "cached_tokens", 0) or 0) if det is not None else 0
         write = (getattr(det, "cache_write_tokens", 0) or 0) if det is not None else 0
         self._record(total - cached - write, getattr(usage, out_f) or 0, cached=cached, cache_write=write,
-                     cache_key=key, raw_input=total)
+                     cache_key=key, raw_input=total, **meta)
 
     @staticmethod
     def wire_messages(system: str, messages: list[dict]) -> list[dict]:
@@ -372,21 +382,23 @@ class OpenAIProvider(UsageMixin):
                 out.append(msg)  # thinking blocks have no OpenAI equivalent and are not sent
         return out
 
-    def complete(self, system, messages, tools, max_tokens=4096):
+    def complete(self, system, messages, tools, max_tokens=4096, *, model=None, effort=None, site=None):
         if self.api == "responses":
-            return self.complete_responses(system, messages, tools, max_tokens)
+            return self.complete_responses(system, messages, tools, max_tokens, model, effort, site)
+        model = model or self.model
         kwargs: dict = self._cache_kwargs(system, tools)
         if tools:
             kwargs["tools"] = [{"type": "function", "function": {
                 "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
                 for t in tools]
-        if self.model.startswith(("gpt-5.", "gpt-6")):
+        if model.startswith(("gpt-5.", "gpt-6")):
             kwargs["reasoning_effort"] = "none"  # no extended thinking; required for tools here
         resp = self.client.chat.completions.create(
-            model=self.model, messages=self.wire_messages(system, messages),
+            model=model, messages=self.wire_messages(system, messages),
             max_completion_tokens=max_tokens, **kwargs)
         self._record_openai(resp.usage, "prompt_tokens", "completion_tokens", "prompt_tokens_details",
-                            kwargs.get("prompt_cache_key"))
+                            kwargs.get("prompt_cache_key"), model=model,
+                            effort="none" if model.startswith(("gpt-5.", "gpt-6")) else None, site=site)
         msg = resp.choices[0].message
         blocks: list[dict] = []
         if msg.content:
@@ -412,9 +424,10 @@ class FakeProvider(UsageMixin):
         self.calls: list[dict] = []
         self._init_usage()
 
-    def complete(self, system, messages, tools, max_tokens=4096):
-        self.calls.append({"system": system, "messages": messages, "tools": tools})
-        self._record(0, 0)
+    def complete(self, system, messages, tools, max_tokens=4096, *, model=None, effort=None, site=None):
+        self.calls.append({"system": system, "messages": messages, "tools": tools, "model": model or self.model,
+                           "effort": effort, "site": site})
+        self._record(0, 0, model=model or self.model, effort=effort, site=site)
         return self.policy(system, messages, tools)
 
     def count_prefix_tokens(self, system, tools):

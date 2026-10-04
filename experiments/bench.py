@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from isolation import fisher_two_sided, permutation_p  # noqa: E402
 from scenarios import SCENARIOS, RunContext, Scenario, fact_survival  # noqa: E402
 
-from graft import cachestats  # noqa: E402
+from graft import cachestats, callsites  # noqa: E402
 from graft.db import Store  # noqa: E402
 from graft.fake import bench_graft_policy, bench_subagent_policy  # noqa: E402
 from graft.harness import Harness  # noqa: E402
@@ -74,14 +74,16 @@ async def run_one(sc: Scenario, arm: str, i: int, fake: bool, compact: int | Non
     provider = FakeProvider(bench_graft_policy if arm == "graft" else bench_subagent_policy) \
         if fake else make_provider()
     world = sc.world()
-    label = "graft_summary" if arm == "graft" and compaction_mode == "summary" else arm
+    label = arm if arm != "graft" or compaction_mode == "turns" else f"graft_{compaction_mode}"
     rec: dict = {"scenario": sc.name, "arm": label, "run": i}
     t0 = time.perf_counter()
     agent = None
     transcript: list = []
     try:
         if arm == "graft":
-            store = Store(os.path.join(tempfile.mkdtemp(prefix=f"bench-{sc.name}-"), "m.db"))
+            store_path = os.path.join(tempfile.mkdtemp(prefix=f"bench-{sc.name}-"), "m.db")
+            rec["store"] = store_path  # kept on disk for post-hoc diagnosis
+            store = Store(store_path)
             install(store)
             agent = Harness(store, provider, world=world, nonce=nonce, compact_tokens=compact,
                             compaction_mode=compaction_mode)
@@ -112,6 +114,18 @@ async def run_one(sc: Scenario, arm: str, i: int, fake: bool, compact: int | Non
     for u in roles.values():
         add_usage(total, u)
     rec["roles"], rec["total"] = roles, total
+    rec["by_model"] = {m: u for m, u in provider.by_model.items() if u["calls"]}
+    # per-call-site settings actually used, and $ per role (n/a if a model has no known price)
+    pricing = cachestats.Pricing.from_env()
+    sites: Counter = Counter()
+    role_cost: dict[str, float | None] = {}
+    for c in provider.call_log:
+        role = role_of(arm, c["tag"])
+        sites[f"{role} | site={c.get('site')} model={c.get('model')} effort={c.get('effort')}"] += 1
+        cc = pricing.cost_model(c.get("model"), c)
+        role_cost[role] = None if cc is None or (role in role_cost and role_cost[role] is None) \
+            else role_cost.get(role, 0.0) + cc
+    rec["call_sites"], rec["role_cost"] = dict(sites), role_cost
     if arm == "graft" and agent is not None:
         rec["handoffs"] = agent.store.con.execute(
             "SELECT count(*) FROM timelines WHERE source_id IS NOT NULL").fetchone()[0]
@@ -133,10 +147,18 @@ async def run_one(sc: Scenario, arm: str, i: int, fake: bool, compact: int | Non
         "before": [e["before_tokens"] for e in log], "after": [e["after_tokens"] for e in log],
         "kept": [len(e.get("kept_ids", [])) for e in log],
         "compressed_msgs": [len(e.get("windows", [])) if "windows" in e else 1 for e in log],
-        "failures": len(getattr(agent, "compaction_failures", []) or [])}
+        "failures": len(getattr(agent, "compaction_failures", []) or []),
+        "output_tokens": [e.get("output_tokens", 0) for e in log],
+        "calls": [e.get("calls", 0) for e in log],
+        "kept_head": [e.get("kept_head") for e in log if "kept_head" in e],
+        "prefix_rows": [len(e.get("prefix", [])) for e in log],
+        "after_cached": [e["first_call_after"]["cached"] for e in log if e.get("first_call_after")],
+        "after_input": [e["first_call_after"]["input"] for e in log if e.get("first_call_after")],
+        "failed_output_tokens": sum(f["output_tokens"] for f in getattr(agent, "compaction_failure_calls", []) or [])}
     if sc.survival_facts:
         rec["fact_survival"] = fact_survival(log, sc.survival_facts)
     rec["transcript"] = transcript
+    rec["decks"] = world.decks
     rec["compaction_log"] = [{k: v for k, v in e.items() if k not in ("prefix", "prefix_texts")} for e in log]
     return rec
 
@@ -199,6 +221,11 @@ def msd(v: list[float], fmt: str = "{:.0f}") -> str:
     return f"{fmt.format(statistics.mean(v))} ± {fmt.format(sd)}"
 
 
+def run_cost(pricing: cachestats.Pricing, r: dict) -> float | None:
+    """$ for one run, priced per model (n/a if any model has no known price)."""
+    return pricing.cost_by_model(r["by_model"]) if r.get("by_model") else pricing.cost(r["total"])
+
+
 def report(recs: list[dict], pricing: cachestats.Pricing, scenarios: list[str], arms: list[str]) -> None:
     print("\n================ BENCH SUMMARY ================")
     print(pricing.assumptions())
@@ -210,7 +237,7 @@ def report(recs: list[dict], pricing: cachestats.Pricing, scenarios: list[str], 
             rs = [r for r in recs if r["scenario"] == sc and r["arm"] == arm]
             if not rs:
                 continue
-            costs = [pricing.cost(r["total"]) for r in rs]
+            costs = [run_cost(pricing, r) for r in rs]
             rows.append((sc, arm, f"{sum(r['ok'] for r in rs)}/{len(rs)}",
                          msd([pricing.effective_total(r["total"]) for r in rs]),
                          msd(costs, "{:.5f}") if None not in costs else "n/a",
@@ -237,9 +264,19 @@ def report(recs: list[dict], pricing: cachestats.Pricing, scenarios: list[str], 
                                  f"{statistics.mean(pricing.effective_total(u) for u in us):.0f}")
             hit = statistics.mean(cachestats.hit_rate(r["total"]) for r in rs)
             print(f"  {sc:<16} {arm:<9} hit rate {hit:.0%}; " + "; ".join(parts))
+            costs = [run_cost(pricing, r) for r in rs]
+            cc = [r.get("role_cost", {}).get("handoff/clone-tx") for r in rs]
+            if None not in costs and cc and None not in cc and sum(costs):
+                print(f"      clone-call / handoff $ share {sum(cc) / sum(costs):.1%}")
+            sites: Counter = Counter()
+            for r in rs:
+                sites.update(r.get("call_sites", {}))
+            for k, n in sorted(sites.items()):
+                print(f"      calls: {k}: {n}")
 
     pairs = [(a, b) for a in ("graft", "graft_summary") for b in ("subagent", "subagent_batched")
-             if a in arms and b in arms] + ([("graft", "graft_summary")] if {"graft", "graft_summary"} <= set(arms) else [])
+             if a in arms and b in arms] + [("graft", b) for b in ("graft_summary",)
+                                            if {"graft", b} <= set(arms)]
     print("\nsignificance (effective total and pass; two-sided):")
     for a_arm, b_arm in pairs:
         for sc in scenarios:
@@ -273,6 +310,16 @@ def report(recs: list[dict], pricing: cachestats.Pricing, scenarios: list[str], 
                         f"compressed msgs/event {statistics.mean(k for r in cs for k in r['compaction']['compressed_msgs']):.1f}; "
                         f"refused-twice {sum(r['compaction']['failures'] for r in rs)}")
                 print(line)
+                c = [r["compaction"] for r in cs]
+                out = [x for k in c for x in k.get("output_tokens", [])]
+                head = [x for k in c for x in k.get("kept_head", [])]
+                pre = [x for k in c for x in k.get("prefix_rows", [])]
+                ac, ai = [x for k in c for x in k.get("after_cached", [])], [x for k in c for x in k.get("after_input", [])]
+                if out:
+                    print(f"      compaction output tokens/event {statistics.mean(out):.0f}; kept head (rows before first "
+                          f"window) {statistics.mean(head):.1f} of {statistics.mean(pre):.1f} prefix rows; first call "
+                          f"after compaction: cached {sum(ac)}/{sum(ai)} input tokens ({sum(ac) / max(1, sum(ai)):.0%}); "
+                          f"refused-twice output tokens {sum(k.get('failed_output_tokens', 0) for k in c)}")
                 surv = Counter(v for r in rs for v in (r.get("fact_survival") or {}).values())
                 if surv:
                     per = {}
@@ -313,7 +360,17 @@ def main() -> int:
     ap.add_argument("--compact-tokens", type=int, default=None,
                     help="override every scenario's compaction threshold (estimated tokens); 0 = off")
     ap.add_argument("--out", default=None, help="write per-run records as JSON")
+    ap.add_argument("--effort", action="append", default=[], metavar="SITE=LEVEL",
+                    help="per-call-site effort, e.g. clone_call=high (sets GRAFT_EFFORT_<SITE>; see graft/callsites.py)")
+    ap.add_argument("--model", action="append", default=[], metavar="SITE=MODEL",
+                    help="per-call-site model, e.g. clone_call=gpt-6-luna (sets GRAFT_MODEL_<SITE>)")
     a = ap.parse_args()
+    for what, pairs in (("EFFORT", a.effort), ("MODEL", a.model)):
+        for kv in pairs:
+            site, _, val = kv.partition("=")
+            if site not in callsites.SITES or not val:
+                raise SystemExit(f"--{what.lower()} expects SITE=VALUE with SITE in {callsites.SITES}")
+            os.environ[f"GRAFT_{what}_{site.upper()}"] = val
     names = list(SCENARIOS) if a.scenario == "all" else a.scenario.split(",")
     arms = {"both": ["graft", "subagent"], "all": list(ARMS)}.get(a.arm) or a.arm.split(",")
     bad = [x for x in arms if x not in ARMS]
@@ -335,9 +392,9 @@ def main() -> int:
     for r in recs:
         if r["error"]:
             print(f"  ERROR {r['scenario']}/{r['arm']}#{r['run']}: {r['error'][:200]}")
-    labels = ["graft_summary" if x == "graft" and a.compaction == "summary" else x for x in arms]
+    labels = [x if x != "graft" or a.compaction == "turns" else f"graft_{a.compaction}" for x in arms]
     report(recs, pricing, names, labels)
-    spend = [pricing.cost(r["total"]) for r in recs]
+    spend = [run_cost(pricing, r) for r in recs]
     if None not in spend:
         print(f"\ntotal spend this invocation: ${sum(spend):.4f}")
     if a.out:

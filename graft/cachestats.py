@@ -19,6 +19,7 @@ Missing cached/write prices fall back to the input price times the multipliers.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 
@@ -38,6 +39,19 @@ MIN_CACHEABLE = {"openai": 1024, "anthropic": 512}
 
 def min_cacheable(provider_name: str) -> int:
     return MIN_CACHEABLE.get(provider_name, 1024)
+
+
+# Official prices only (USD per 1M tokens: input, cached input, cache write, output), each with
+# its source. A model not listed here and not priced by env is reported in tokens with $ n/a.
+OFFICIAL_PRICES: dict[str, dict] = {
+    "gpt-6-luna": {"in": 0.10, "cached": 0.01, "write": 0.125, "out": 0.50,
+                   "source": "developers.openai.com/api/docs/pricing, standard tier, short context; "
+                             "verified 2026-10-04"},
+}
+
+
+def model_env_key(model: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "_", model.upper())
 
 
 @dataclass(frozen=True)
@@ -71,6 +85,42 @@ class Pricing:
     def effective_total(self, u: dict) -> float:
         """Effective input plus output weighted by out_mult (ASSUMED output/input price ratio)."""
         return self.effective_input(u) + u.get("output", 0) * self.out_mult
+
+    def prices_for(self, model: str | None) -> dict | None:
+        """Per-model prices, most specific first: GRAFT_PRICE_{IN,CACHED_IN,CACHE_WRITE,OUT}_PER_M__<MODEL>
+        (model upper-cased, non-alphanumerics -> _), then the global GRAFT_PRICE_* for the default
+        model (GRAFT_MODEL), then OFFICIAL_PRICES. None if the model has no known price."""
+        if not model:
+            return None
+        k = model_env_key(model)
+        pin, pout = _env_float(f"GRAFT_PRICE_IN_PER_M__{k}"), _env_float(f"GRAFT_PRICE_OUT_PER_M__{k}")
+        if pin is not None and pout is not None:
+            c, w = _env_float(f"GRAFT_PRICE_CACHED_IN_PER_M__{k}"), _env_float(f"GRAFT_PRICE_CACHE_WRITE_PER_M__{k}")
+            return {"in": pin, "cached": _or(c, pin * self.read_mult), "write": _or(w, pin * self.write_mult),
+                    "out": pout}
+        if self.priced and model == os.environ.get("GRAFT_MODEL"):
+            return {"in": self.price_in, "cached": _or(self.price_cached, self.price_in * self.read_mult),
+                    "write": _or(self.price_write, self.price_in * self.write_mult), "out": self.price_out}
+        return OFFICIAL_PRICES.get(model)
+
+    def cost_model(self, model: str | None, u: dict) -> float | None:
+        p = self.prices_for(model)
+        if p is None:
+            return None
+        return (u.get("uncached", 0) * p["in"] + u.get("cached", 0) * p["cached"]
+                + u.get("cache_write", 0) * p["write"] + u.get("output", 0) * p["out"]) / 1e6
+
+    def cost_by_model(self, by_model: dict[str, dict]) -> float | None:
+        """Total $ over models; None (n/a) if any model that made calls has no known price."""
+        total = 0.0
+        for model, u in by_model.items():
+            if not u.get("calls"):
+                continue
+            c = self.cost_model(model, u)
+            if c is None:
+                return None
+            total += c
+        return total
 
     def cost(self, u: dict) -> float | None:
         if not self.priced:
