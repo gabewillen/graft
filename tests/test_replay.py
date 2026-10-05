@@ -108,3 +108,106 @@ def test_structured_payload_kind():
 
     assert is_messages([{"role": "user", "content": "q"}])
     assert not is_messages([{"id": 0, "question": "q"}]) and not is_messages({"a": 1}) and not is_messages([])
+
+
+# ------------------------------------------------------------------ writable sandbox + worktrees
+from replay import worktree  # noqa: E402
+
+
+def _commit(r, msg="c"):
+    subprocess.run(["git", "-C", str(r), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(r), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", msg], check=True)
+
+
+@pytest.fixture
+def wt(repo, tmp_path):
+    (repo / ".gitignore").write_text(".env\n")
+    (repo / ".env").write_text("OPENAI_API_KEY=" + "q" * 30 + "\n")  # untracked, must never be copied
+    (repo / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    _commit(repo)
+    commit = worktree.git(str(repo), "rev-parse", "HEAD")
+    w = worktree.DisposableWorktree(str(repo), commit, str(tmp_path / "wt"))
+    path = w.__enter__()
+    yield w, path
+    w.remove()
+
+
+def test_disposable_worktree_no_env_and_cleanup(repo, tmp_path):
+    (repo / ".gitignore").write_text(".env\n")
+    (repo / ".env").write_text("SECRET=1\n")
+    _commit(repo)
+    commit = worktree.git(str(repo), "rev-parse", "HEAD")
+    path = str(tmp_path / "wt2")
+    with worktree.DisposableWorktree(str(repo), commit, path) as p:
+        assert os.path.isdir(p) and not os.path.exists(os.path.join(p, ".env"))
+        assert p in worktree.git(str(repo), "worktree", "list")
+    assert not os.path.exists(path) and path not in worktree.git(str(repo), "worktree", "list")
+    try:
+        with worktree.DisposableWorktree(str(repo), commit, path):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert not os.path.exists(path)
+
+
+def test_writable_sandbox_confinement(wt, tmp_path):
+    w, path = wt
+    sb = sandbox.Sandbox(path, writable=True)
+    out, err = sb.execute("Edit", {"file_path": "src/parser.cpp", "old_string": "int other();", "new_string": "int other2();"})
+    assert not err and "other2" in open(os.path.join(path, "src", "parser.cpp")).read()
+    out, err = sb.execute("Write", {"file_path": "src/new.cpp", "content": "int n;"})
+    assert not err and os.path.exists(os.path.join(path, "src", "new.cpp"))
+    for bad in ({"file_path": str(tmp_path / "escape.txt"), "content": "x"}, {"file_path": "../escape.txt", "content": "x"},
+                {"file_path": ".git/config", "content": "x"}):
+        out, err = sb.execute("Write", bad)
+        assert err and out.startswith("refused"), bad
+    assert not (tmp_path / "escape.txt").exists()
+    out, err = sb.execute("Edit", {"file_path": "src/parser.cpp", "old_string": "int", "new_string": "long"})
+    assert err and "occurs" in out  # ambiguous edit refused
+    diff = w.diff()
+    assert worktree.diff_files(diff) == {"src/new.cpp", "src/parser.cpp"}
+    ro = sandbox.Sandbox(path)
+    out, err = ro.execute("Write", {"file_path": "x.txt", "content": "x"})
+    assert err and "read-only" in out and "Edit" not in [t["name"] for t in ro.tools()]
+
+
+def test_writable_allowlist_tests_and_status(wt):
+    w, path = wt
+    sb = sandbox.Sandbox(path, writable=True, test_commands=[[sys.executable, "-m", "pytest", "-q"]])
+    out, err = sb.execute("Bash", {"command": "git status --short"})
+    assert not err
+    out, err = sb.execute("Bash", {"command": f"{sys.executable} -m pytest -q test_ok.py"})
+    assert "(exit 0)" in out and sb.test_runs[-1]["returncode"] == 0
+    for cmd in (f"{sys.executable} -c print(1)", "uv pip install requests", "git commit -m x", "git push",
+                f"{sys.executable} -m pytest -q; rm -rf src"):
+        out, err = sb.execute("Bash", {"command": cmd})
+        assert err and out.startswith("refused"), cmd
+    out, err = sandbox.Sandbox(path).execute("Bash", {"command": "git status"})
+    assert err  # status only in writable mode
+
+
+def test_resolve_checkout_superproject_and_submodule(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    (sub / "a.py").write_text("x = 1\n")
+    _commit(sub, "sub1")
+    sup = tmp_path / "sup"
+    sup.mkdir()
+    subprocess.run(["git", "init", "-q", str(sup)], check=True)
+    subprocess.run(["git", "-C", str(sup), "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub),
+                    "lib"], check=True)
+    _commit(sup, "add lib")
+    ts = "2037-01-01T00:00:00Z"
+    r = worktree.resolve_checkout(str(sup), f"{sup}/.claude/worktrees/w1/lib/pkg", None, ts)
+    assert r["repo"] == os.path.join(str(sup), "lib") and r["subdir"] == "pkg" and r["commit"]
+    assert r["how"].startswith("submodule lib: gitlink")
+    r2 = worktree.resolve_checkout(str(sup), str(sup), "main", ts)
+    assert r2["repo"] == str(sup) and r2["subdir"] == "" and r2["how"].startswith("superproject")
+
+
+def test_diff_similarity():
+    a = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n+foo\n-bar\n"
+    b = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n+foo\n"
+    s = worktree.diff_similarity(a, b)
+    assert s["files_jaccard"] == 1.0 and 0 < s["line_similarity"] < 1
