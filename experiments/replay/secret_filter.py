@@ -1,9 +1,12 @@
 """Secret filter for anything sent to a provider in the replay.
 
-Two checks: generic credential patterns (API keys, tokens, private keys, KEY=value assignments
-with secret-looking names), and exact occurrences of values found in known .env files (passed in;
-the values are only held in memory and never printed). `scan` returns the names of the matching
-rules, never the matched text.
+DROP rules (an event that matches is not replayed): credential formats (provider API keys,
+GitHub/Slack tokens, cloud keys, private keys, bearer tokens) and exact occurrences of the values
+of secret-named keys (KEY/TOKEN/SECRET/PASSWORD/PRIVATE/CREDENTIAL) in known .env files. Values of
+other .env keys (model names, base URLs) are not secrets and do not match.
+REDACT rule: `secret_assignment` (`NAME=value` with a secret-looking NAME) keeps NAME and replaces
+the value with [REDACTED] wherever text is sent; it never drops an event.
+Functions report rule names only; values are held in memory and never printed.
 """
 
 from __future__ import annotations
@@ -19,14 +22,16 @@ PATTERNS = {
     "google_api_key": re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
     "private_key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"),
     "bearer_token": re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{24,}=*"),
-    "secret_assignment": re.compile(
-        r"(?im)^\s*(?:export\s+)?[A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*"
-        r"['\"]?[^\s'\"]{12,}"),
 }
+DROP_RULES = tuple(PATTERNS)
+ASSIGNMENT = re.compile(
+    r"(?im)(^\s*(?:export\s+)?[A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*['\"]?)"
+    r"([^\s'\"]{12,})")
+SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE|CREDENTIAL", re.I)
 
 
 def env_values(paths: list[str]) -> list[str]:
-    """Values of KEY=value lines in the given .env files (length >= 12), for exact matching."""
+    """Values of secret-named KEY=value lines in the given .env files (length >= 12)."""
     vals = []
     for p in paths:
         try:
@@ -34,8 +39,10 @@ def env_values(paths: list[str]) -> list[str]:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
-                v = line.split("=", 1)[1].strip().strip("'\"")
-                if len(v) >= 12:
+                k, v = line.split("=", 1)
+                k = k.strip().removeprefix("export ").strip()
+                v = v.strip().strip("'\"")
+                if len(v) >= 12 and SECRET_NAME.search(k):
                     vals.append(v)
         except OSError:
             continue
@@ -43,7 +50,7 @@ def env_values(paths: list[str]) -> list[str]:
 
 
 def scan(texts: list[str], known_values: list[str] | None = None) -> list[str]:
-    """Names of the rules that match any text (empty = clean)."""
+    """Names of the DROP rules that match any text (empty = the event may be replayed)."""
     hits = set()
     for t in texts:
         if not t:
@@ -57,9 +64,15 @@ def scan(texts: list[str], known_values: list[str] | None = None) -> list[str]:
     return sorted(hits)
 
 
+def redact_assignments(text: str) -> tuple[str, int]:
+    """Replace the value of every secret-looking NAME=value with [REDACTED]; returns (text, count)."""
+    return ASSIGNMENT.subn(lambda m: m.group(1) + "[REDACTED]", text)
+
+
 def redact(text: str, known_values: list[str] | None = None) -> tuple[str, list[str]]:
-    """Text with secret matches replaced, plus the rule names that fired."""
-    hits = []
+    """Text with every rule's matches replaced (used on tool outputs), plus the rule names that fired."""
+    text, n = redact_assignments(text)
+    hits = ["secret_assignment"] * n
     for name, rx in PATTERNS.items():
         if rx.search(text):
             hits.append(name)

@@ -80,30 +80,70 @@ def resolve_checkout(repo: str, cwd: str | None, branch: str | None, ts: str) ->
 class DisposableWorktree:
     """with DisposableWorktree(repo, commit, path) as wt: ... -> the worktree path; removed on exit."""
 
-    def __init__(self, repo: str, commit: str, path: str):
+    def __init__(self, repo: str, commit: str, path: str, with_submodules: bool = True):
         self.repo, self.commit, self.path = repo, commit, path
+        self.with_submodules = with_submodules
         self.tracked_env = False
+        self.submodules: list[dict] = []  # {path, repo, commit, how}
 
     def __enter__(self) -> str:
         if os.path.exists(self.path):
             raise RuntimeError(f"worktree path already exists: {self.path}")
         git(self.repo, "worktree", "add", "--detach", self.path, self.commit, check=True)
         self.tracked_env = bool(git(self.repo, "ls-tree", "-r", "--name-only", self.commit, "--", ".env"))
+        if self.with_submodules:
+            self._add_submodules()
         return self.path
+
+    def _add_submodules(self) -> None:
+        """Populate each submodule (gitlink) from the local submodule repository, as a nested detached
+        worktree at the recorded gitlink commit. Submodules whose repo or commit is missing locally are
+        left empty and recorded."""
+        for line in git(self.repo, "ls-tree", "-r", self.commit).splitlines():
+            if not line.startswith("160000 "):
+                continue
+            meta, sub_path = line.split("\t", 1)
+            sha = meta.split()[2]
+            sub_repo = os.path.join(self.repo, sub_path)
+            dest = os.path.join(self.path, sub_path)
+            entry = {"path": sub_path, "repo": sub_repo, "commit": sha}
+            if not os.path.isdir(sub_repo) or git(sub_repo, "cat-file", "-t", sha) != "commit":
+                entry["how"] = "not available locally; left empty"
+            else:
+                if os.path.isdir(dest) and not os.listdir(dest):
+                    os.rmdir(dest)
+                git(sub_repo, "worktree", "add", "--detach", dest, sha, check=True)
+                entry["how"] = "nested worktree at the recorded gitlink"
+            self.submodules.append(entry)
 
     def __exit__(self, *exc) -> None:
         self.remove()
 
     def remove(self) -> None:
+        for sm in reversed(self.submodules):
+            if sm.get("how", "").startswith("nested"):
+                git(sm["repo"], "worktree", "remove", "--force", os.path.join(self.path, sm["path"]))
+                git(sm["repo"], "worktree", "prune")
         git(self.repo, "worktree", "remove", "--force", self.path)
         if os.path.exists(self.path):
             shutil.rmtree(self.path, ignore_errors=True)
         git(self.repo, "worktree", "prune")
 
     def diff(self) -> str:
-        """Unified diff of the worktree against its commit, including new untracked files."""
+        """Unified diff of the worktree against its commit, including new untracked files and the
+        changes inside populated submodules (paths prefixed with the submodule path)."""
         git(self.path, "add", "-N", ".")
-        return git(self.path, "diff", "--no-ext-diff", self.commit)
+        out = git(self.path, "diff", "--no-ext-diff", "--ignore-submodules=all", self.commit)
+        for sm in self.submodules:
+            if not sm.get("how", "").startswith("nested"):
+                continue
+            sub = os.path.join(self.path, sm["path"])
+            git(sub, "add", "-N", ".")
+            d = git(sub, "diff", "--no-ext-diff", sm["commit"])
+            if d:
+                out += "\n" + re.sub(r"(?m)^diff --git a/(\S+) b/(\S+)",
+                                     lambda m: f"diff --git a/{sm['path']}/{m.group(1)} b/{sm['path']}/{m.group(2)}", d)
+        return out
 
 
 def diff_files(diff: str) -> set[str]:

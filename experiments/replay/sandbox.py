@@ -63,7 +63,9 @@ WRITE_TOOLS = [
      "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}},
                       "required": ["file_path", "content"]}},
 ]
-NO_NETWORK_PROFILE = "(version 1)(allow default)(deny network*)"
+NO_NETWORK_PROFILE = ("(version 1)(allow default)(deny network*)"
+                      "(allow network* (remote ip \"localhost:*\"))(allow network* (local ip \"localhost:*\"))"
+                      "(allow network* (remote unix-socket))")
 
 
 class SandboxError(ValueError):
@@ -203,7 +205,9 @@ class Sandbox:
 
     def run_tests(self, argv: list[str] | None = None) -> str:
         """Run a configured offline test command (network denied where sandbox-exec exists)."""
-        argv = argv or self.test_commands[0]
+        argv = list(argv or self.test_commands[0])
+        if argv[:2] == ["uv", "run"] and "--offline" not in argv:  # uv resolves from the lockfile, offline
+            argv = ["uv", "run", "--frozen", "--offline"] + argv[2:]
         cmd = (["sandbox-exec", "-p", NO_NETWORK_PROFILE] + argv) if os.path.exists("/usr/bin/sandbox-exec") else argv
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C", "HOME": self.root, "UV_OFFLINE": "1",
                "UV_NO_SYNC": "0", "PYTHONDONTWRITEBYTECODE": "1",

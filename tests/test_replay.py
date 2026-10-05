@@ -42,18 +42,28 @@ def test_cap_prefix_keeps_recent_turns_from_a_user_turn():
     assert [t.text[0] for t in loader.cap_prefix(turns, 25)] == ["c", "d"]
 
 
-def test_secret_filter(tmp_path):
+def test_secret_filter_drop_rules_and_env_values(tmp_path):
     env = tmp_path / ".env"
-    env.write_text("OPENAI_API_KEY=abcdefghijklmnopqrstuvwxyz123\n# c\nSHORT=x\n")
+    env.write_text("OPENAI_API_KEY=abcdefghijklmnopqrstuvwxyz123\n# c\nSHORT_KEY=x\n"
+                   "OPENAI_BASE_URL=https://api.example.com/v1\nBOT_MODEL=some-model-name-123\n")
     vals = secret_filter.env_values([str(env)])
-    assert vals == ["abcdefghijklmnopqrstuvwxyz123"]
+    assert vals == ["abcdefghijklmnopqrstuvwxyz123"]  # only secret-named keys
+    assert secret_filter.scan(["uses https://api.example.com/v1 and some-model-name-123"], vals) == []
     assert secret_filter.scan(["nothing to see"], vals) == []
     assert secret_filter.scan(["key sk-proj-" + "A" * 30], vals) == ["openai_key"]
     assert "env_value" in secret_filter.scan(["value abcdefghijklmnopqrstuvwxyz123 here"], vals)
-    assert "secret_assignment" in secret_filter.scan(["export GITHUB_TOKEN=zzzzzzzzzzzzzzzzzz"])
     assert "private_key" in secret_filter.scan(["-----BEGIN RSA PRIVATE KEY-----"])
     red, hits = secret_filter.redact("x ghp_" + "a" * 36 + " y")
     assert "[REDACTED]" in red and hits == ["github_token"]
+
+
+def test_secret_assignment_is_redacted_not_dropped():
+    text = "export GITHUB_TOKEN=zzzzzzzzzzzzzzzzzz\nAPI_KEY='abcdefghijkl1234'\nkeep this line"
+    assert secret_filter.scan([text]) == []  # never a drop rule
+    red, n = secret_filter.redact_assignments(text)
+    assert n == 2 and red == "export GITHUB_TOKEN=[REDACTED]\nAPI_KEY='[REDACTED]'\nkeep this line"
+    red2, hits = secret_filter.redact(text)
+    assert hits.count("secret_assignment") == 2 and "zzzz" not in red2
 
 
 @pytest.fixture
@@ -204,6 +214,12 @@ def test_resolve_checkout_superproject_and_submodule(tmp_path):
     assert r["how"].startswith("submodule lib: gitlink")
     r2 = worktree.resolve_checkout(str(sup), str(sup), "main", ts)
     assert r2["repo"] == str(sup) and r2["subdir"] == "" and r2["how"].startswith("superproject")
+    # a superproject worktree populates its submodule as a nested worktree, and removes both
+    path = str(tmp_path / "supwt")
+    with worktree.DisposableWorktree(str(sup), r2["commit"], path) as p:
+        assert os.path.exists(os.path.join(p, "lib", "a.py"))
+    assert not os.path.exists(path)
+    assert str(tmp_path / "supwt") not in worktree.git(os.path.join(str(sup), "lib"), "worktree", "list")
 
 
 def test_diff_similarity():
@@ -211,3 +227,76 @@ def test_diff_similarity():
     b = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n+foo\n"
     s = worktree.diff_similarity(a, b)
     assert s["files_jaccard"] == 1.0 and 0 < s["line_similarity"] < 1
+
+
+def test_run_helpers_reference_diff_redaction_and_summary():
+    import json as _json
+
+    from replay import run
+
+    e = loader.load_event(FIX)
+    e.recorded_turns += [
+        {"role": "assistant", "kind": "tool_use", "name": "Write",
+         "text": _json.dumps({"file_path": "/orig/repo/src/new.cpp", "content": "int a;\nint b;"})},
+        {"role": "assistant", "kind": "tool_use", "name": "Edit",
+         "text": _json.dumps({"file_path": "/orig/repo/src/parser.cpp", "old_string": "int parse_token();",
+                              "new_string": "long parse_token();"})}]
+    ref = run.reference_diff(e, "/orig/repo")
+    assert worktree.diff_files(ref) == {"src/new.cpp", "src/parser.cpp"} and "+long parse_token();" in ref
+    e.handoff += "\nexport GITHUB_TOKEN=zzzzzzzzzzzzzzzzzz"
+    assert run.redact_event(e) == {"secret_assignment": 1} and "GITHUB_TOKEN=[REDACTED]" in e.handoff
+    assert run.strip_subdir("diff --git a/pkg/x.py b/pkg/x.py", "pkg") == "diff --git a/x.py b/x.py"
+    s = run.test_summary("(exit 1)\n..F\n1 failed, 2 passed in 0.1s")
+    assert s == {"returncode": 1, "summary": "1 failed, 2 passed in 0.1s"}
+    assert run.is_editing(e) is False
+
+
+def test_recorded_test_paths():
+    import json as _json
+
+    from replay import run
+
+    e = loader.load_event(FIX)
+    for c in ("uv run pytest -q tests/devices -p no:cacheprovider 2>&1 | tail", "uv run pytest tests/bot/x.py::t -q",
+              "uv run pytest -q tests/devices"):
+        e.recorded_turns.append({"role": "assistant", "kind": "tool_use", "name": "Bash", "text": _json.dumps({"command": c})})
+    assert run.recorded_test_paths(e) == ["tests/devices", "tests/bot/x.py"]
+
+
+def test_edit_aliases_and_test_selection(tmp_path):
+    from replay import run
+
+    e = loader.load_event(FIX)
+    e.agent_id, e.cwd = "abc", "/rec/wt/sub"
+    al = run.edit_aliases(e, "/repo", {"repo": "/repo/sub", "subdir": ""}, "/repo/sub")
+    assert "/rec/wt/sub/.claude/worktrees/agent-abc" in al and "/repo/.claude/worktrees/agent-abc/sub" in al
+    (tmp_path / "tests" / "devices").mkdir(parents=True)
+    assert run.select_test_paths(["tests", "tests/devices", "tests/gone"], [], str(tmp_path)) == (["tests/devices"], [])
+    assert run.select_test_paths(["tests"], ["tests/devices/test_x.py"], str(tmp_path)) == (["tests/devices"], [])
+    assert run.select_test_paths(["tests"], [], str(tmp_path)) == (["tests"], ["--ignore=tests/examples", "-x"])
+
+
+def test_worktree_diff_includes_submodule_changes(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    (sub / "a.py").write_text("x = 1\n")
+    _commit(sub, "sub1")
+    sup = tmp_path / "sup"
+    sup.mkdir()
+    subprocess.run(["git", "init", "-q", str(sup)], check=True)
+    subprocess.run(["git", "-C", str(sup), "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "lib"],
+                   check=True)
+    _commit(sup, "add lib")
+    commit = worktree.git(str(sup), "rev-parse", "HEAD")
+    with worktree.DisposableWorktree(str(sup), commit, str(tmp_path / "w")) as p:
+        open(os.path.join(p, "lib", "a.py"), "w").write("x = 2\n")
+        w = None
+    # re-enter to inspect the diff before removal
+    w = worktree.DisposableWorktree(str(sup), commit, str(tmp_path / "w2"))
+    p = w.__enter__()
+    try:
+        open(os.path.join(p, "lib", "a.py"), "w").write("x = 2\n")
+        assert "lib/a.py" in worktree.diff_files(w.diff())
+    finally:
+        w.remove()
