@@ -22,6 +22,7 @@ module-root = ""
 
 [dependency-groups]
 dev = [
+    "cactus-needle>=3.0.2,<4.0.0",
     "pytest>=9.1.1",
     "typesafe-sdk>=0.6.0,<1.0.0",
 ]

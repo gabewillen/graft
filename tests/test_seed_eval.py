@@ -81,3 +81,12 @@ def test_run_scorer_caches_and_records_errors():
     cache = {}
     out = asyncio.run(se.run_scorer(Boom(), [event()], 2, cache))
     assert out[0]["error"].startswith("RuntimeError") and "boom|s.db" in cache
+
+
+def test_needle_prompt_truncates_deterministically():
+    e = event()
+    text, cut = se.needle_prompt(e, 2)
+    assert not cut and "CURRENT message: (user) We are Harbor Light Dental" in text and "Previous message" in text
+    e.candidates[2]["text"] = "x" * 5000
+    text2, cut2 = se.needle_prompt(e, 2)
+    assert cut2 and len(text2) <= se.NEEDLE_WINDOW_CHARS and text2 == se.needle_prompt(e, 2)[0]

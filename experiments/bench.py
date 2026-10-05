@@ -346,7 +346,7 @@ def report(recs: list[dict], pricing: cachestats.Pricing, scenarios: list[str], 
                 head = [x for k in c for x in k.get("kept_head", [])]
                 pre = [x for k in c for x in k.get("prefix_rows", [])]
                 ac, ai = [x for k in c for x in k.get("after_cached", [])], [x for k in c for x in k.get("after_input", [])]
-                if out:
+                if out and head and pre:
                     print(f"      compaction output tokens/event {statistics.mean(out):.0f}; kept head (rows before first "
                           f"window) {statistics.mean(head):.1f} of {statistics.mean(pre):.1f} prefix rows; first call "
                           f"after compaction: cached {sum(ac)}/{sum(ai)} input tokens ({sum(ac) / max(1, sum(ai)):.0%}); "
@@ -428,13 +428,14 @@ def main() -> int:
         if r["error"]:
             print(f"  ERROR {r['scenario']}/{r['arm']}#{r['run']}: {r['error'][:200]}")
     labels = [x if x != "graft" or a.compaction == "turns" else f"graft_{a.compaction}" for x in arms]
+    if a.out:  # write records before reporting, so a report bug cannot lose a paid run
+        with open(a.out, "w") as f:
+            json.dump(recs, f, indent=1, default=str)
     report(recs, pricing, names, labels)
     spend = [run_cost(pricing, r) for r in recs]
     if None not in spend:
         print(f"\ntotal spend this invocation: ${sum(spend):.4f}")
     if a.out:
-        with open(a.out, "w") as f:
-            json.dump(recs, f, indent=1, default=str)
         print(f"records: {a.out}")
     return 0
 

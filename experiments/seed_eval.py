@@ -238,6 +238,109 @@ class JevSeederScorer:
                           "model": d.model, "requests": d.requests, "truncated": d.truncated}
 
 
+NEEDLE_TOOL = {"name": "mark_message", "description": "Record whether the clone needs the CURRENT message.",
+               "parameters": {"type": "object", "properties": {"needed": {
+                   "type": "boolean", "description": "true if the clone needs the CURRENT message"}},
+                   "required": ["needed"]}}
+NEEDLE_WINDOW_CHARS = 3200  # ~800 tokens of text + system, under Needle 3's ~1024-token window
+
+
+def needle_prompt(e: Event, i: int) -> tuple[str, bool]:
+    """(text, truncated): trigger + one neighbour on each side + the row, deterministically cut to fit."""
+    c = e.candidates[i]
+    trig = next(x["text"] for x in e.candidates if x["row_id"] == e.trigger)
+    prev = e.candidates[i - 1] if i > 0 else None
+    nxt = e.candidates[i + 1] if i + 1 < len(e.candidates) else None
+    parts = [("Latest user request", trig, 300),
+             ("Previous message", f"({prev['role']}) {prev['text']}" if prev else "(none)", 300),
+             ("CURRENT message", f"({c['role']}) {c['text']}", 1800),
+             ("Next message", f"({nxt['role']}) {nxt['text']}" if nxt else "(none)", 300)]
+    truncated = any(len(t) > lim for _, t, lim in parts)
+    text = "\n".join(f"{label}: {t[:lim]}" for label, t, lim in parts)
+    if len(text) > NEEDLE_WINDOW_CHARS:
+        text, truncated = text[:NEEDLE_WINDOW_CHARS], True
+    return text, truncated
+
+
+class NeedleScorer:
+    """Cactus Compute Needle 3, local (cactus-needle SDK): one stateless completion per candidate row
+    with a single tool mark_message(needed). Score = the engine's calibrated confidence when it
+    calls the tool with needed=true (floored at 0.1), else 0."""
+
+    name = "needle3_reduced"
+
+    def __init__(self):
+        os.environ.setdefault("NEEDLE_TELEMETRY", "0")
+        os.environ.setdefault("DO_NOT_TRACK", "1")
+
+    def _score_sync(self, e: Event) -> tuple[dict[int, float], dict]:
+        import needle
+
+        system = (f"A clone will do this new task: {e.purpose[:300]}. It sees only the messages you mark needed. A "
+                  "message is needed if it carries facts, names, numbers, requirements or preferences the task "
+                  "should use, or it is the request for the task. Call mark_message once for the CURRENT message.")
+        t0 = time.perf_counter()
+        agent = needle.Needle(tools=[NEEDLE_TOOL], system=system, stateless=True)
+        scores, truncated, raw = {}, [], []
+        try:
+            for i, c in enumerate(e.candidates):
+                text, cut = needle_prompt(e, i)
+                if cut:
+                    truncated.append(c["row_id"])
+                r = agent.complete(text, max_new_tokens=32)
+                calls = r.get("function_calls") or []
+                needed = any((x.get("arguments") or {}).get("needed") is True for x in calls)
+                conf = r.get("confidence")
+                scores[c["row_id"]] = max(0.1, float(conf)) if needed and conf is not None else (0.1 if needed else 0.0)
+                raw.append(conf)
+        finally:
+            agent.close()
+        return scores, {"latency": time.perf_counter() - t0, "calls": len(e.candidates), "input_tokens": None,
+                        "cost": 0.0, "model": f"needle3 (cactus-needle {getattr(needle, '__version__', '?')})",
+                        "truncated": truncated}
+
+    async def score(self, e: Event) -> tuple[dict[int, float], dict]:
+        return await asyncio.to_thread(self._score_sync, e)
+
+
+NEEDLE_KEEP_TOOL = {"name": "keep_message",
+                    "description": "Keep this message for the clone: it carries facts, names, numbers, requirements "
+                                   "or preferences the task should use.",
+                    "parameters": {"type": "object", "properties": {}, "required": []}}
+
+
+class NeedleKeepScorer(NeedleScorer):
+    """Needle 3 variant: purpose and latest request in the system prompt, only the row (with role)
+    as the query, and a no-argument keep_message tool. Score = calibrated confidence when it calls
+    keep_message (floored at 0.1), else 0. (The variant with neighbours in the query and a boolean
+    argument never called the tool on these events.)"""
+
+    name = "needle3_keep"
+
+    def _score_sync(self, e: Event) -> tuple[dict[int, float], dict]:
+        import needle
+
+        trig = next(x["text"] for x in e.candidates if x["row_id"] == e.trigger)
+        system = (f"A clone will do this new task: {e.purpose[:300]}. The user's latest request: {trig[:300]}. It sees "
+                  "only the messages you keep. Messages with facts, names, numbers, requirements or preferences for "
+                  "the task are needed; chit-chat and tool noise are not.")
+        t0 = time.perf_counter()
+        agent = needle.Needle(tools=[NEEDLE_KEEP_TOOL], system=system, stateless=True)
+        scores, truncated = {}, []
+        try:
+            for c in e.candidates:
+                text = f"({c['role']}) {c['text']}"
+                if len(text) > 2400:
+                    text, _ = text[:2400], truncated.append(c["row_id"])
+                r = agent.complete(text, max_new_tokens=16)
+                conf = r.get("confidence")
+                scores[c["row_id"]] = max(0.1, float(conf or 0)) if (r.get("function_calls") or []) else 0.0
+        finally:
+            agent.close()
+        return scores, {"latency": time.perf_counter() - t0, "calls": len(e.candidates), "input_tokens": None,
+                        "cost": 0.0, "model": "needle3 base (cactus-needle 3.1.0)", "truncated": truncated}
+
+
 class LunaScorer:
     name = "luna_actor"
 
@@ -324,6 +427,8 @@ def sweep(events: list[Event], results: list[dict], name: str, model_union: bool
     rows = []
     params = [("k", k) for k in TOPK] if topk else []
     params += [("t", t) for t in THRESHOLDS]
+    if name.startswith("needle"):
+        params = [("t", t) for t in (0.01, 0.1, 0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7)]
     if name == "embeddings":
         params = [("k", k) for k in TOPK] + [("t", t) for t in (0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5)]
     for kind, v in params:
@@ -385,6 +490,10 @@ async def amain(a) -> int:
                 results["jev_chunked"] = await run_scorer(
                     JevSeederScorer(tc, f"jev_chunked@{a.chunk_budget}", a.chunk_budget), events, a.concurrency, cache)
                 results[f"jev_chunked@{a.chunk_budget}"] = results.pop("jev_chunked")
+    if "needle3_reduced" in strategies:  # local, single native engine: run one event at a time
+        results["needle3_reduced"] = await run_scorer(NeedleScorer(), events, 1, cache)
+    if "needle3_keep" in strategies:
+        results["needle3_keep"] = await run_scorer(NeedleKeepScorer(), events, 1, cache)
     if {"luna_actor", "embeddings"} & set(strategies):
         import openai
 
@@ -437,7 +546,7 @@ def report(events: list[Event], results: dict[str, list[dict]]) -> None:
             print(f"  {label:<7} {fmt(m)}")
         b = best(rows)
         print(f"  BEST {b[0]}: {fmt(b[1])}")
-        if name.startswith("jev") or name == "luna_actor":
+        if name.startswith(("jev", "needle")) or name == "luna_actor":
             urows = sweep(ev, rs, name, model_union=True)
             ub = best(urows)
             print(f"  model+{name} BEST {ub[0]}: {fmt(ub[1])}")

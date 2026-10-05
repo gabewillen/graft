@@ -357,3 +357,14 @@ def test_instruction_has_plain_keep_hint_and_no_rules():
                                     [{"op": "compress", "role": "user", "text": "Hi", "begin_row_id": 1, "end_row_id": 1},
                                      {"op": "keep", "row_id": 2}])
     assert not probs
+
+
+def test_report_handles_subagent_compaction_without_head_metrics(capsys):
+    from graft import cachestats
+
+    rec = {"scenario": "long_compaction", "arm": "subagent", "run": 0, "ok": True, "checks": {"x": True}, "error": None,
+           "roles": {}, "total": {"calls": 1, "input": 1, "uncached": 1, "cached": 0, "cache_write": 0, "output": 0},
+           "latency_s": 1.0, "handoffs": 1, "context_out": 0, "compactions": 1,
+           "compaction": {"ratios": [4.0], "kept": [0], "compressed_msgs": [1], "failures": 0, "output_tokens": [10]}}
+    bench.report([rec], cachestats.Pricing(), ["long_compaction"], ["subagent"])
+    assert "compaction (runs that compacted)" in capsys.readouterr().out
