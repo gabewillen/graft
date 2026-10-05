@@ -47,6 +47,9 @@ OFFICIAL_PRICES: dict[str, dict] = {
     "gpt-6-luna": {"in": 0.10, "cached": 0.01, "write": 0.125, "out": 0.50,
                    "source": "developers.openai.com/api/docs/pricing, standard tier, short context; "
                              "verified 2026-10-04"},
+    # TypeSafe Jev (the clone seed actor): input only; output tokens are free; no prompt cache.
+    "jev-1.13.0": {"in": 0.042, "cached": 0.042, "write": 0.042, "out": 0.0,
+                   "source": "docs.typesafe.ai/models; verified 2026-10-04"},
 }
 
 

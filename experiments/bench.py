@@ -46,7 +46,7 @@ from graft.sim import run_script  # noqa: E402
 from graft.skills import install  # noqa: E402
 from graft.subagent import SubagentRunner  # noqa: E402
 
-ROLES = ("parent/original", "handoff/clone-tx", "subagent/clone", "summary", "compaction")
+ROLES = ("parent/original", "handoff/clone-tx", "subagent/clone", "summary", "compaction", "seeder")
 
 
 def role_of(arm: str, tag: str) -> str:
@@ -126,6 +126,27 @@ async def run_one(sc: Scenario, arm: str, i: int, fake: bool, compact: int | Non
         role_cost[role] = None if cc is None or (role in role_cost and role_cost[role] is None) \
             else role_cost.get(role, 0.0) + cc
     rec["call_sites"], rec["role_cost"] = dict(sites), role_cost
+    # seed actor (graft/seeder.py): its own role, priced per model; not part of the OpenAI usage
+    slog = list(getattr(agent, "seeder_log", []) or []) if agent is not None else []
+    if slog:
+        su = empty_usage()
+        su.update(calls=sum(x.get("requests") or 0 for x in slog),
+                  uncached=sum(x.get("input_tokens") or 0 for x in slog), output=0)
+        su["input"] = su["uncached"]
+        model = slog[0].get("model") or "jev"
+        rec["roles"]["seeder"] = su
+        rec["by_model"][model] = add_usage(dict(rec["by_model"].get(model, empty_usage())), su)
+        rec["role_cost"]["seeder"] = pricing.cost_model(model, su)
+    rec["seeder"] = [{k: x.get(k) for k in ("latency", "input_tokens", "requests", "fallback", "error",
+                                              "truncated", "threshold")} | {"selected": len(x.get("selected", [])),
+                                                                            "candidates": len(x.get("candidates", []))}
+                     for x in slog]
+    if arm == "graft" and agent is not None:
+        seeds = []
+        for (scr,) in agent.store.con.execute("SELECT scratch FROM transactions WHERE kind='clone' AND status='committed'"):
+            ids = json.loads(scr).get("seed", []) if scr else []
+            seeds.append((len(ids), sum(len(agent.store.turn(i)["content"]) // 4 for i in ids)))
+        rec["seed_sizes"] = seeds
     if arm == "graft" and agent is not None:
         rec["handoffs"] = agent.store.con.execute(
             "SELECT count(*) FROM timelines WHERE source_id IS NOT NULL").fetchone()[0]
@@ -273,6 +294,16 @@ def report(recs: list[dict], pricing: cachestats.Pricing, scenarios: list[str], 
                 sites.update(r.get("call_sites", {}))
             for k, n in sorted(sites.items()):
                 print(f"      calls: {k}: {n}")
+            sl = [x for r in rs for x in r.get("seeder", [])]
+            if sl:
+                print(f"      seeder: {len(sl)} decisions; latency {statistics.mean(x['latency'] for x in sl):.2f}s mean / "
+                      f"{max(x['latency'] for x in sl):.2f}s max; requests/decision "
+                      f"{statistics.mean(x['requests'] or 0 for x in sl):.1f}; selected {statistics.mean(x['selected'] for x in sl):.1f}"
+                      f" of {statistics.mean(x['candidates'] for x in sl):.1f} candidates; fallbacks "
+                      f"{sum(1 for x in sl if x['fallback'])}; truncated rows {sum(len(x['truncated'] or []) for x in sl)}")
+            ss = [x for r in rs for x in r.get("seed_sizes", [])]
+            if ss:
+                print(f"      clone seeds: {statistics.mean(x[0] for x in ss):.1f} rows / {statistics.mean(x[1] for x in ss):.0f} tokens mean")
 
     pairs = [(a, b) for a in ("graft", "graft_summary") for b in ("subagent", "subagent_batched")
              if a in arms and b in arms] + [("graft", b) for b in ("graft_summary",)
@@ -360,11 +391,15 @@ def main() -> int:
     ap.add_argument("--compact-tokens", type=int, default=None,
                     help="override every scenario's compaction threshold (estimated tokens); 0 = off")
     ap.add_argument("--out", default=None, help="write per-run records as JSON")
+    ap.add_argument("--seeder", choices=("model", "jev"), default=None,
+                    help="clone seed actor (sets GRAFT_SEEDER; jev needs TYPESAFE_API_KEY)")
     ap.add_argument("--effort", action="append", default=[], metavar="SITE=LEVEL",
                     help="per-call-site effort, e.g. clone_call=high (sets GRAFT_EFFORT_<SITE>; see graft/callsites.py)")
     ap.add_argument("--model", action="append", default=[], metavar="SITE=MODEL",
                     help="per-call-site model, e.g. clone_call=gpt-6-luna (sets GRAFT_MODEL_<SITE>)")
     a = ap.parse_args()
+    if a.seeder:
+        os.environ["GRAFT_SEEDER"] = a.seeder
     for what, pairs in (("EFFORT", a.effort), ("MODEL", a.model)):
         for kv in pairs:
             site, _, val = kv.partition("=")

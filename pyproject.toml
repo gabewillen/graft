@@ -28,3 +28,8 @@ dev = [
 
 [project.scripts]
 graft = "graft.cli:main"
+
+[project.optional-dependencies]
+jev = [
+    "typesafe-sdk>=0.6.0,<1.0.0",
+]

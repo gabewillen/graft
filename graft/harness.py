@@ -20,6 +20,7 @@ import re
 from typing import Callable
 
 from . import callsites, compaction
+from . import seeder as seeder_mod
 from .db import NESTING_ENABLED, Store, render, validate
 from .machine import Machines
 from .providers import Provider, prefix_nonce
@@ -54,7 +55,7 @@ class Harness:
     def __init__(self, store: Store, provider: Provider, world: World | None = None,
                  trace: Callable[[str], None] | None = None, max_steps: int = 10,
                  persona: str = BASE_SYSTEM, nonce: str | None = None,
-                 compact_tokens: int | None = None, compaction_mode: str = "turns"):
+                 compact_tokens: int | None = None, compaction_mode: str = "turns", seeder=...):
         self.store = store
         self.persona = persona  # user-provided; identical, verbatim, on every timeline
         self.provider = provider
@@ -63,6 +64,9 @@ class Harness:
         self.trace = trace or (lambda s: None)
         self.max_steps = max_steps
         self.silent_done_refusals: list[str] = []  # clones whose join(done) was refused
+        # Seed actor (graft/seeder.py): None = the original names the seed itself (GRAFT_SEEDER=model)
+        self.seeder = seeder_mod.make_seeder() if seeder is ... else seeder
+        self.seeder_log: list[dict] = []  # per clone: Jev latency, tokens, scores, selection, fallback
         self.out: list[str] = []
         # Per-run conversation nonce, prefixed to the first message of every request at render
         # time (never stored). None = no nonce (cache experiments: --cache-scope global).
@@ -452,6 +456,51 @@ class Harness:
                 lines.append(f"  {r['row_id']} {r['role']}: {r['content'].replace(chr(10), ' ')[:100]}")
         return "\n".join(lines)
 
+    async def seed_with_actor(self, src: str, purpose: str, model_seed: list[int],
+                              model_problems: list[str]) -> tuple[list[int], list[str], dict]:
+        """GRAFT_SEEDER=jev: the seed actor picks the seed (graft/seeder.py); the original's own seed
+        fields are ignored except as the fallback. Candidates are the text rows of the source's
+        working view (harness notes excluded); rows scoring >= the threshold are seeded in view
+        order, the trigger (latest user message) always. If the seed would start with an assistant
+        row, the nearest earlier user text row is added so the clone's view starts with a user turn.
+        On a seeder error: the original's own seed if it resolved, else every candidate row."""
+        view = self.store.working_view(src)
+        cands = [{"row_id": r["row_id"], "role": r["role"], "text": r["content"]}
+                 for r in view if seeder_mod.is_candidate(r)]
+        users = [c for c in cands if c["role"] == "user"]
+        trigger = users[-1]["row_id"] if users else None
+        trig_text = users[-1]["text"] if users else ""
+        threshold = seeder_mod.seed_threshold()
+        d = await self.seeder.score(purpose, cands, trig_text) if cands else seeder_mod.SeedDecision(error="no candidates")
+        record = {"seeder": getattr(self.seeder, "name", "jev"), "model": d.model, "threshold": threshold,
+                  "scores": {str(k): round(v, 4) for k, v in d.scores.items()}, "latency": d.latency,
+                  "input_tokens": d.input_tokens, "requests": d.requests, "truncated": d.truncated,
+                  "error": d.error, "candidates": [c["row_id"] for c in cands]}
+        problems: list[str] = []
+        if d.error:
+            if model_seed and not model_problems:
+                seed, record["fallback"] = list(model_seed), "model_seed"
+            else:
+                seed, record["fallback"] = [c["row_id"] for c in cands], "all_candidates"
+        else:
+            chosen = {rid for rid, p in d.scores.items() if p >= threshold}
+            if trigger is not None:
+                chosen.add(trigger)
+            order = [c["row_id"] for c in cands]
+            seed = [rid for rid in order if rid in chosen]
+            if seed and self.store.turn(seed[0])["role"] != "user":
+                first = order.index(seed[0])
+                lead = next((c["row_id"] for c in reversed(cands[:first]) if c["role"] == "user"), None)
+                if lead is not None:
+                    seed.insert(0, lead)
+                    record["added_lead_user_row"] = lead
+            record["fallback"] = None
+        record["selected"] = seed
+        self.seeder_log.append(record)
+        self.trace(f"[{src}] seeder {record['seeder']}: {len(seed)}/{len(cands)} rows, "
+                   f"{d.latency:.2f}s{', fallback ' + record['fallback'] if record['fallback'] else ''}")
+        return seed, problems, record
+
     async def clone_once(self, src: str, use: dict, retry_left: bool) -> tuple[str | None, str]:
         """One-shot clone: resolve, validate, commit. No model call of its own."""
         args = use["input"]
@@ -460,11 +509,16 @@ class Harness:
         skills = [str(x) for x in (args.get("skills") or [])]
         seed, problems = self.resolve_seed(src, list(args.get("seed_quotes") or []),
                                            list(args.get("seed_row_ids") or []))
+        decision = None
+        if self.seeder is not None:
+            seed, problems, decision = await self.seed_with_actor(src, str(args.get("purpose", "")), seed, problems)
         v = problems + check_skill_link(self.store, src, skills)
         rows = [t for t in (self.store.turn(r) for r in seed) if t]
         v += validate(rows, child) if rows else ["the seed is empty: seed at least the user message "
                                                  "that asks for the task"]
         scratch = {"args": args, "seed": seed, "violations": v}
+        if decision is not None:
+            scratch["seeder"] = decision
         if v:
             self.store.end_tx(tx, "rolled_back", None, scratch)
             self.trace(f"[{src}] clone refused: {v}")

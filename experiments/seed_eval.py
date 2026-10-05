@@ -205,6 +205,39 @@ LUNA_SYSTEM = ("You choose which messages of a conversation a focused clone need
                "Return one entry per row_id with needed and your confidence (0 to 1) in that judgment.")
 
 
+class _Shared:
+    """Async context manager wrapping an already-open client (one SDK client for all events)."""
+
+    def __init__(self, client):
+        self.client = client
+
+    async def __aenter__(self):
+        return self.client
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class JevSeederScorer:
+    """The harness seeder's own request design (graft.seeder.JevSeeder: reduced state, row plus
+    neighbours per question, chunked under a token budget)."""
+
+    def __init__(self, client, name: str, budget: int | None = None):
+        from graft.seeder import JevSeeder
+
+        self.name = name
+        self.seeder = JevSeeder(client_factory=lambda: _Shared(client), budget=budget)
+
+    async def score(self, e: Event) -> tuple[dict[int, float], dict]:
+        trig = next(c["text"] for c in e.candidates if c["row_id"] == e.trigger)
+        d = await self.seeder.score(e.purpose, e.candidates, trig)
+        if d.error:
+            raise RuntimeError(d.error)
+        return d.scores, {"latency": d.latency, "calls": d.requests, "input_tokens": d.input_tokens,
+                          "cost": None if d.input_tokens is None else d.input_tokens * PRICE["jev_in"] / 1e6,
+                          "model": d.model, "requests": d.requests, "truncated": d.truncated}
+
+
 class LunaScorer:
     name = "luna_actor"
 
@@ -339,11 +372,19 @@ async def amain(a) -> int:
     cache = json.load(open(a.cache)) if a.cache and os.path.exists(a.cache) else {}
     strategies = a.strategies.split(",")
     results: dict[str, list[dict]] = {}
-    if "jev" in strategies:
+    if {"jev", "jev_reduced", "jev_chunked"} & set(strategies):
         import typesafe_sdk
 
         async with typesafe_sdk.AsyncTypeSafeClient(model=JEV_MODEL, timeout=60) as tc:
-            results["jev"] = await run_scorer(JevScorer(tc), events, a.concurrency, cache)
+            if "jev" in strategies:
+                results["jev"] = await run_scorer(JevScorer(tc), events, a.concurrency, cache)
+            if "jev_reduced" in strategies:  # default budget: one request per event when it fits
+                results["jev_reduced"] = await run_scorer(JevSeederScorer(tc, "jev_reduced"), events,
+                                                          a.concurrency, cache)
+            if "jev_chunked" in strategies:  # small budget forces several parallel requests per event
+                results["jev_chunked"] = await run_scorer(
+                    JevSeederScorer(tc, f"jev_chunked@{a.chunk_budget}", a.chunk_budget), events, a.concurrency, cache)
+                results[f"jev_chunked@{a.chunk_budget}"] = results.pop("jev_chunked")
     if {"luna_actor", "embeddings"} & set(strategies):
         import openai
 
@@ -360,6 +401,22 @@ async def amain(a) -> int:
 
 def report(events: list[Event], results: dict[str, list[dict]]) -> None:
     print("\n================ SEED SELECTION REPLAY ================")
+    chunked = next((k for k in results if k.startswith("jev_chunked")), None)
+    if "jev_reduced" in results and chunked:
+        diffs, flips, n = [], 0, 0
+        for a, b in zip(results["jev_reduced"], results[chunked]):
+            if a["error"] or b["error"]:
+                continue
+            for k, x in a["scores"].items():
+                if k in b["scores"]:
+                    n += 1
+                    diffs.append(abs(x - b["scores"][k]))
+                    flips += (x >= 0.7) != (b["scores"][k] >= 0.7)
+        reqs = [r["meta"].get("requests", 1) for r in results[chunked] if not r["error"]]
+        print(f"chunked vs single request: {n} row scores compared; max |diff| {max(diffs, default=0):.4f}, mean "
+              f"{statistics.mean(diffs) if diffs else 0:.4f}; selection flips at t=0.7: {flips}; requests/event "
+              f"single {statistics.mean(r['meta'].get('requests', 1) for r in results['jev_reduced'] if not r['error']):.1f}"
+              f" vs chunked {statistics.mean(reqs) if reqs else 0:.1f}")
     print(f"model (what the run seeded): {fmt(metrics(events, [e.model_seed for e in events]))}")
     fails = [e for e in events if e.failed_run]
     if fails:
@@ -373,11 +430,14 @@ def report(events: list[Event], results: dict[str, list[dict]]) -> None:
         ev = [events[i] for i in ok_idx]
         rs = [res[i] for i in ok_idx]
         rows = sweep(ev, rs, name, topk=name != "embeddings")
+        tr = sum(len(r["meta"].get("truncated") or []) for r in rs)
+        if tr:
+            print(f"  truncated rows: {tr}")
         for label, m in rows:
             print(f"  {label:<7} {fmt(m)}")
         b = best(rows)
         print(f"  BEST {b[0]}: {fmt(b[1])}")
-        if name in ("jev", "luna_actor"):
+        if name.startswith("jev") or name == "luna_actor":
             urows = sweep(ev, rs, name, model_union=True)
             ub = best(urows)
             print(f"  model+{name} BEST {ub[0]}: {fmt(ub[1])}")
@@ -399,6 +459,8 @@ def main() -> int:
     ap.add_argument("--cache", default=None, help="JSON cache of per-event scores (re-runs skip API calls)")
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--luna-effort", default="low")
+    ap.add_argument("--chunk-budget", type=int, default=800,
+                    help="token budget for the jev_chunked variant (small, to force several requests)")
     return asyncio.run(amain(ap.parse_args()))
 
 
