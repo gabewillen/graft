@@ -23,6 +23,7 @@ module-root = ""
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "typesafe-sdk>=0.6.0,<1.0.0",
 ]
 
 [project.scripts]
