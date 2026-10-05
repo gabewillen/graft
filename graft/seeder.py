@@ -40,7 +40,9 @@ NOUL_FALSE = "The clone can do the new task well without this message."
 
 
 def seeder_name() -> str:
-    name = os.environ.get("GRAFT_SEEDER", "model")
+    # Default: jev when a TypeSafe key is available, else the original seeds itself.
+    default = "jev" if os.environ.get("TYPESAFE_API_KEY") else "model"
+    name = os.environ.get("GRAFT_SEEDER", default)
     if name not in ("model", "jev"):
         raise ValueError(f"GRAFT_SEEDER must be model or jev, got {name!r}")
     return name

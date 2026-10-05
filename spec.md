@@ -164,11 +164,12 @@ The original has only `clone`. It converses, routes and clones; every other capa
 
 ### Clone
 
-1. The source makes **one `clone` call** choosing the skills to link (from the catalog in its system prompt) and the seed rows. Seed rows are given as row ids, or as exact quotes that must each match exactly one text row in the source's view; either way they resolve to pointers, never copies or paraphrases.
-2. The harness validates the resulting view (see [Validated views](#validated-views)). On violations it returns them to the source for one retry.
-3. On success the harness inserts the `timelines` row, the seed pointers into `context`, and the `timeline_skills` links. The `clone` call's result confirms it ("cloned → c7, active"), so the source knows what it did.
-4. The source enters the **cloned** state: suspended, its timeline does not grow.
-5. The clone becomes the active leaf and talks to the user.
+1. The source makes **one `clone` call** naming the clone's `purpose` and the skills to link (from the catalog in its system prompt).
+2. A **seeder actor** picks the seed rows: for each text row in the source's working view it answers one yes/no question ("does a clone doing *purpose* need this message?") with a confidence score, using a small decision model (v1: TypeSafe Jev). Rows at or above a threshold are seeded in view order, and the triggering user message is always seeded. Each question carries only its row and its immediate neighbours plus the purpose and trigger, so the decision model's context limit never binds, and large views are split into parallel batches. The full decision (model, threshold, per-row scores, selection) is recorded with the clone, so seeds stay replayable. If the seeder fails, the source's own seed (row ids or exact quotes, optional in the `clone` call) is the fallback. Either way the seed resolves to pointers, never copies or paraphrases.
+3. The harness validates the resulting view (see [Validated views](#validated-views)). On violations it returns them to the source for one retry.
+4. On success the harness inserts the `timelines` row, the seed pointers into `context`, and the `timeline_skills` links. The `clone` call's result confirms it ("cloned → c7, active"), so the source knows what it did.
+5. The source enters the **cloned** state: suspended, its timeline does not grow.
+6. The clone becomes the active leaf and talks to the user.
 
 A clone inherits the source's stable configuration (persona, model, global policies). It does **not** inherit conversation history except the rows explicitly seeded.
 
@@ -276,7 +277,7 @@ What appears new as a whole: single-use clones that take over the user conversat
 ## Future Ideas
 
 - **`absorb(clone)`:** an on-demand recall where the source pulls detail the default join left out (a tool result, a pre-compaction turn) from a frozen descendant, via a read-only SQL transaction with validated commit. Dropped from v1 because no run needed it; add it back only if an experiment shows the source needs detail it cannot get otherwise.
-- **Cloner and joiner actors:** dedicated actors running cheaper models perform seed selection and any non-default joins on the source's behalf, instead of the source's own model.
+- **Other seeder models:** v1 uses Jev. Alternatives (other decision APIs, a fine-tuned local model such as Needle 3) are worth revisiting once real-trace replays provide varied training and evaluation data. Needle 3 zero-shot did not qualify: its confidence did not separate needed rows from the rest.
 
 ## Non-goals
 
