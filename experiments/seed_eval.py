@@ -341,6 +341,108 @@ class NeedleKeepScorer(NeedleScorer):
                         "cost": 0.0, "model": "needle3 base (cactus-needle 3.1.0)", "truncated": truncated}
 
 
+def needle_context(e: Event) -> tuple[str, str]:
+    trig = next(x["text"] for x in e.candidates if x["row_id"] == e.trigger)
+    return e.purpose[:300], trig[:300]
+
+
+def needle_row_text(e: Event, i: int, with_context: bool) -> tuple[str, bool]:
+    """Row plus neighbours (and optionally purpose + trigger), cut deterministically to the window."""
+    c = e.candidates[i]
+    prev = e.candidates[i - 1] if i > 0 else None
+    nxt = e.candidates[i + 1] if i + 1 < len(e.candidates) else None
+    parts = []
+    if with_context:
+        purpose, trig = needle_context(e)
+        parts += [("New task", purpose, 300), ("Latest user request", trig, 300)]
+    parts += [("Previous message", f"({prev['role']}) {prev['text']}" if prev else "(none)", 250),
+              ("This message", f"({c['role']}) {c['text']}", 1500),
+              ("Next message", f"({nxt['role']}) {nxt['text']}" if nxt else "(none)", 250)]
+    cut = any(len(t) > lim for _, t, lim in parts)
+    return "\n".join(f"{label}: {t[:lim]}" for label, t, lim in parts), cut
+
+
+def _decision_model(default: bool):
+    from typing import Literal
+
+    from pydantic import BaseModel
+
+    if default:
+        class MessageDecision(BaseModel):
+            """Decide whether the new task needs this message: keep it or skip it."""
+            decision: Literal["keep", "skip"] = "skip"
+    else:
+        class MessageDecision(BaseModel):  # noqa: F811
+            """Decide whether the new task needs this message: keep it or skip it."""
+            decision: Literal["keep", "skip"]
+    return MessageDecision
+
+
+NEEDLE_PAIR = [
+    {"name": "keep_message", "description": "Keep this message: the new task needs a fact, request or decision in it.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"name": "skip_message", "description": "Skip this message: the new task does not need it.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
+]
+
+
+class NeedleRetestScorer:
+    """Needle 3 retest following the official docs (cactus-needle 3.1.0):
+    - extract*: the Pydantic MessageDecision{decision: Literal['keep','skip']} bound as the tool, as
+      needle.extract does internally; complete() is used because extract() returns only the typed
+      object and not the calibrated confidence. Context (purpose + trigger) in the system prompt, or
+      also in the text (_ctxtext); _default gives the field a default of 'skip'.
+    - pair: two narrow tools keep_message / skip_message.
+    Score = estimated P(keep): keep -> confidence, skip -> 1 - confidence, read from function_calls or,
+    when withheld, from suppressed_calls (counted); no call at all -> 0.5 (uncertain)."""
+
+    def __init__(self, variant: str):
+        self.variant = variant
+        self.name = f"needle3_{variant}"
+        os.environ.setdefault("NEEDLE_TELEMETRY", "0")
+        os.environ.setdefault("DO_NOT_TRACK", "1")
+
+    def _score_sync(self, e: Event) -> tuple[dict[int, float], dict]:
+        import needle
+
+        purpose, trig = needle_context(e)
+        system = f"New task for a clone: {purpose}. The user's latest request: {trig}."
+        if self.variant == "pair":
+            tools, ctx_in_text = NEEDLE_PAIR, False
+        else:
+            tools, ctx_in_text = [_decision_model("default" in self.variant)], "ctxtext" in self.variant
+        t0 = time.perf_counter()
+        agent = needle.Needle(tools=tools, system=system, stateless=True)
+        scores, truncated, counts = {}, [], {"called": 0, "suppressed": 0, "none": 0}
+        try:
+            for i, c in enumerate(e.candidates):
+                text, cut = needle_row_text(e, i, ctx_in_text)
+                if cut:
+                    truncated.append(c["row_id"])
+                r = agent.complete(text, max_new_tokens=24)
+                conf = float(r.get("confidence") or 0.0)
+                calls, src = r.get("function_calls") or [], "called"
+                if not calls:
+                    calls, src = r.get("suppressed_calls") or [], "suppressed"
+                if not calls:
+                    counts["none"] += 1
+                    scores[c["row_id"]] = 0.5
+                    continue
+                counts[src] += 1
+                call = calls[0]
+                keep = (call.get("name") == "keep_message" if self.variant == "pair"
+                        else (call.get("arguments") or {}).get("decision") == "keep")
+                scores[c["row_id"]] = conf if keep else 1.0 - conf
+        finally:
+            agent.close()
+        return scores, {"latency": time.perf_counter() - t0, "calls": len(e.candidates), "input_tokens": None,
+                        "cost": 0.0, "model": "needle3 base (cactus-needle 3.1.0)", "truncated": truncated,
+                        "counts": counts}
+
+    async def score(self, e: Event) -> tuple[dict[int, float], dict]:
+        return await asyncio.to_thread(self._score_sync, e)
+
+
 class LunaScorer:
     name = "luna_actor"
 
@@ -428,7 +530,7 @@ def sweep(events: list[Event], results: list[dict], name: str, model_union: bool
     params = [("k", k) for k in TOPK] if topk else []
     params += [("t", t) for t in THRESHOLDS]
     if name.startswith("needle"):
-        params = [("t", t) for t in (0.01, 0.1, 0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7)]
+        params = [("t", t) for t in (0.01, 0.1, 0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9, 0.95)]
     if name == "embeddings":
         params = [("k", k) for k in TOPK] + [("t", t) for t in (0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5)]
     for kind, v in params:
@@ -494,6 +596,9 @@ async def amain(a) -> int:
         results["needle3_reduced"] = await run_scorer(NeedleScorer(), events, 1, cache)
     if "needle3_keep" in strategies:
         results["needle3_keep"] = await run_scorer(NeedleKeepScorer(), events, 1, cache)
+    for v in ("extract", "extract_ctxtext", "extract_default", "pair"):
+        if f"needle3_{v}" in strategies:
+            results[f"needle3_{v}"] = await run_scorer(NeedleRetestScorer(v), events, 1, cache)
     if {"luna_actor", "embeddings"} & set(strategies):
         import openai
 
@@ -542,6 +647,9 @@ def report(events: list[Event], results: dict[str, list[dict]]) -> None:
         tr = sum(len(r["meta"].get("truncated") or []) for r in rs)
         if tr:
             print(f"  truncated rows: {tr}")
+        cnt = [r["meta"].get("counts") for r in rs if r["meta"].get("counts")]
+        if cnt:
+            print("  needle turns: " + ", ".join(f"{k} {sum(c[k] for c in cnt)}" for k in ("called", "suppressed", "none")))
         for label, m in rows:
             print(f"  {label:<7} {fmt(m)}")
         b = best(rows)

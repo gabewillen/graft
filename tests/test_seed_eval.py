@@ -90,3 +90,15 @@ def test_needle_prompt_truncates_deterministically():
     e.candidates[2]["text"] = "x" * 5000
     text2, cut2 = se.needle_prompt(e, 2)
     assert cut2 and len(text2) <= se.NEEDLE_WINDOW_CHARS and text2 == se.needle_prompt(e, 2)[0]
+
+
+def test_needle_retest_text_and_decision_schema():
+    e = event()
+    t1, _ = se.needle_row_text(e, 2, with_context=False)
+    t2, _ = se.needle_row_text(e, 2, with_context=True)
+    assert "This message: (user) We are Harbor Light Dental" in t1 and "New task" not in t1
+    assert t2.startswith("New task: build slides") and "Latest user request: Make slides instead." in t2
+    m = se._decision_model(default=True)
+    assert m().decision == "skip" and m(decision="keep").decision == "keep"
+    assert "decision" in se._decision_model(default=False).model_fields
+    assert [t["name"] for t in se.NEEDLE_PAIR] == ["keep_message", "skip_message"]
