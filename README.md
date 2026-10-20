@@ -106,7 +106,7 @@ All experiments accept `--fake` (scripted provider, offline) unless noted; witho
 | `experiments/bench.py` | Five scripted scenarios (`pivot`, `revisions`, `failure`, `long_compaction`, `multi_part`) for the graft and subagent arms, with pass rate, tokens by cache bucket, cost, latency and significance tests. Example: `uv run python experiments/bench.py --scenario all --arm both -n 10 --fake`. |
 | `experiments/seed_eval.py` | Offline seed-selection evaluation over stored bench runs (Jev, a model actor, embeddings, Needle 3). Needs stored runs and the relevant keys. |
 | `experiments/api_probe.py` | Whether providers accept historical tool calls for undeclared tools, and spliced Anthropic thinking blocks. Skips providers without keys. |
-| `experiments/replay/run.py` | Real-trace replay: re-runs recorded Claude Code subagent delegations as a subagent (S) and as a graft clone (G) against the repository checked out at the spawn-time commit, and compares both with the recorded subagent (R). Needs local transcripts, a checkout of the traced repository, `OPENAI_API_KEY` and `TYPESAFE_API_KEY`; not runnable offline. |
+| `experiments/replay/run.py` | Real-trace replay: re-runs recorded Claude Code subagent delegations as a subagent (S) and as a graft clone (G) against the repository checked out at the spawn-time commit, and compares both with the recorded subagent (R). Needs local transcripts, a checkout of the traced repository, [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`), `OPENAI_API_KEY` and `TYPESAFE_API_KEY`; not runnable offline. |
 
 Every run records uncached input, cached reads, cache writes and output per call and per role. Costs are printed only when prices are set.
 
