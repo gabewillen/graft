@@ -1,107 +1,146 @@
 # graft
 
-The smallest working version of [Agent Grafts](spec.md): v1, depth 1, written to find out whether the idea holds up. Clones share the agent's identity but get their own timelines. Everything is stored in SQLite as append-only turns plus pointer contexts. Cloning, joining and compaction are validated pointer selections; the default join is deterministic.
+graft is an experimental alternative to subagents for delegating work inside an LLM agent. Instead of starting a fresh subagent from a handoff prompt the parent writes, the agent **clones** itself: the clone's context is seeded with rows picked from the parent's real conversation, the clone does the task, and when it finishes the conversation it had is **joined** back into the parent's memory by pointer. No model call is needed for the join. All state lives in SQLite as append-only turns plus per-agent pointer lists.
 
-## Setup
+The design is written up in [spec.md](spec.md) ("Agent Grafts"). This repository is the smallest working version of it (v1, depth 1), plus the experiments used to compare it against a subagent baseline.
 
-```bash
-uv sync                      # Python 3.13+ (stateforward.hsm needs >=3.13)
-uv run pytest -q             # offline; no API key needed
+**Status:** experimental, pre-1.0. The APIs, schema and CLI may change. The experiments so far do not show graft to be better or worse than subagents (see [Results so far](#results-so-far)).
+
+## How it differs from subagents
+
+```text
+subagent                                    graft
+--------                                    -----
+parent ── writes handoff prompt ──▶ worker  parent ── clone(purpose, skills) ──▶ clone
+          (paraphrase of context)                     seed = pointers to the parent's own rows,
+                                                      picked by a seeder
+worker works in a fresh context             clone works in its own timeline
+worker ── writes summary ──▶ parent         clone ── join ──▶ parent
+          (paraphrase of its work)                    pointers to the clone's conversation rows,
+                                                      appended deterministically
 ```
 
-Providers (set `GRAFT_PROVIDER`; if unset, it uses `openai` when `OPENAI_API_KEY` is set, otherwise `anthropic`):
+- **Down:** a subagent sees only what the parent wrote for it. A clone sees verbatim rows from the parent's timeline, chosen by a seeder (a small decision model, or the parent model itself).
+- **Up:** a subagent returns a summary in its own words. A clone returns nothing; the harness appends pointers to the text rows of its conversation to the parent's context.
+- **Same:** both isolate the delegated work from the parent's loaded skills and tool history, and both cost extra calls.
 
-| provider | key | default model | notes |
-|---|---|---|---|
-| `openai` | `OPENAI_API_KEY` | the first listed by the Models API from `gpt-5.4-mini, gpt-5-mini, gpt-4.1-mini, gpt-4o-mini` | Responses API by default (`GRAFT_OPENAI_API=responses\|chat`), reasoning effort `GRAFT_REASONING_EFFORT` (default `low`); the chat path uses `reasoning_effort="none"` |
-| `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` | Messages API, `thinking: between_tools` (no extended thinking) |
+## Install
 
-Set `GRAFT_MODEL` to override the model. Keys are only read from the environment at runtime. Never put a key in this repo (`.env` is gitignored). One way to load a key without copying it:
+Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-set -a; source /path/to/.env; set +a
+# as a dependency
+uv add git+https://github.com/gabewillen/graft
+
+# or from a clone
+git clone https://github.com/gabewillen/graft
+cd graft
+uv sync
+uv run pytest -q          # offline; no API keys needed
 ```
+
+The optional `jev` extra installs the TypeSafe SDK used by the Jev seeder: `uv add "graft[jev] @ git+https://github.com/gabewillen/graft"` or `uv sync --extra jev`.
+
+## Quickstart
+
+The CLI has two commands:
+
+```bash
+export OPENAI_API_KEY=...            # or ANTHROPIC_API_KEY
+uv run graft chat --trace            # interactive chat; --trace shows clone/join internals
+uv run graft chat --db chat.db       # keep the SQLite store (default: a temp file)
+uv run graft dump chat.db            # print every timeline's context and the transactions
+```
+
+Inside `chat`, `/dump` prints the store and `/quit` exits. Without a key, `chat` exits with an error naming the missing variable.
+
+The chat agent uses the simulated skills in `graft/skills.py` (`website`, `slides`, `calendar`), so you can watch it clone for a task, hand the conversation to the clone, and join back when you change topic.
+
+To see a full clone/join cycle offline, run the scripted pivot experiment and inspect its store:
+
+```bash
+uv run python experiments/pivot.py --fake --quiet --db pivot.db
+uv run graft dump pivot.db
+```
+
+## Configuration
+
+Everything is read from environment variables at runtime. Keys are never read from files by the library; keep them out of the repository (`.env` is gitignored).
+
+| Variable | Effect |
+|---|---|
+| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Provider keys. |
+| `GRAFT_PROVIDER` | `openai` or `anthropic`. Default: `openai` if `OPENAI_API_KEY` is set, else `anthropic`. |
+| `GRAFT_MODEL` | Model override. Defaults: OpenAI uses the first available of `gpt-5.4-mini`, `gpt-5-mini`, `gpt-4.1-mini`, `gpt-4o-mini`; Anthropic uses `claude-sonnet-5-5`. |
+| `GRAFT_OPENAI_API` | `responses` (default) or `chat`. |
+| `GRAFT_REASONING_EFFORT` | Global reasoning effort (default `low`). |
+| `GRAFT_EFFORT_<SITE>`, `GRAFT_MODEL_<SITE>` | Per-call-site effort and model. Sites: `ORIGINAL`, `CLONE_CALL`, `CLONE`, `COMPACTION`, `SUBAGENT_PARENT`, `SUBAGENT` (see `graft/callsites.py`). |
+| `GRAFT_PROMPT_CACHE_KEY` | `0` disables the OpenAI `prompt_cache_key`. |
+| `GRAFT_SEEDER` | `jev` or `model`. Default: `jev` if `TYPESAFE_API_KEY` is set, else `model` (the parent names its own seed rows). |
+| `TYPESAFE_API_KEY` | Key for the Jev seeder (needs the `jev` extra). |
+| `GRAFT_SEED_THRESHOLD`, `GRAFT_SEED_TOKEN_BUDGET` | Jev seeder score threshold (default 0.4) and per-request token budget (default 24000). |
+| `GRAFT_PRICE_IN_PER_M`, `GRAFT_PRICE_OUT_PER_M`, `GRAFT_PRICE_CACHED_IN_PER_M`, `GRAFT_PRICE_CACHE_WRITE_PER_M` | USD per 1M tokens, for cost reports. Per-model overrides use the suffix `__<MODEL>` (upper-cased, non-alphanumerics as `_`). |
+| `GRAFT_CACHED_READ_MULT`, `GRAFT_CACHE_WRITE_MULT`, `GRAFT_OUTPUT_MULT` | Assumed multipliers for the "effective tokens" metric (defaults 0.1, 1.25, 4.0). |
 
 ## Layout
 
-- `graft/db.py` creates the schema and enforces append-only `turns`/`context` with triggers. It also holds the context view, pointer append with dedup, `render` and `validate`, and `working_view` (compaction-aware join selection).
-- `graft/machine.py` holds the stateforward.hsm models: the per-timeline lifecycle and the global single-running `Slot`.
-- `graft/harness.py` runs the loop, the one-shot clone, the join event and the deterministic default join.
-- `graft/providers.py` has the provider interface: the Anthropic and OpenAI adapters and a `FakeProvider`.
-- `graft/skills.py` holds the skill catalog (built-in `clone`/`join`, plus simulated `website`, `slides`, `calendar`) and the in-memory `World`.
-- `graft/sim.py` is the scripted user simulator. `graft/fake.py` is a deterministic policy for offline runs.
-- `graft/cli.py` provides `uv run graft chat [--trace] [--db PATH]` and `uv run graft dump DB`.
+- `graft/db.py`: SQLite schema with append-only `turns` and `context` (enforced by triggers), context views, pointer append with dedup, rendering and validation.
+- `graft/machine.py`: per-timeline lifecycle and the single-running-timeline slot, as [stateforward-hsm](https://pypi.org/project/stateforward-hsm/) state machines.
+- `graft/harness.py`: the agent loop, the one-shot `clone` call, the join event and the deterministic default join.
+- `graft/seeder.py`: seed selection (`model` or `jev`).
+- `graft/compaction.py`: turn-based compaction with window provenance, and a summary compaction used by the subagent baseline.
+- `graft/subagent.py`: the subagent baseline (parent writes a handoff, subagent returns a summary).
+- `graft/providers.py`: OpenAI and Anthropic adapters with per-call cache accounting, and a scripted `FakeProvider`.
+- `graft/skills.py`, `graft/sim.py`, `graft/fake.py`: simulated skills and world, a scripted user, and a deterministic offline policy.
+- `graft/cli.py`: the `graft` command.
+- `experiments/`: benchmarks and evaluations (not part of the installed package).
 
 ## Experiments
 
-```bash
-uv run python experiments/pivot.py            # live
-uv run python experiments/pivot.py --fake     # offline dry run (scripted provider)
-uv run python experiments/isolation.py -n 5   # live; --fake for offline
-uv run python experiments/api_probe.py        # each provider is skipped if its key is missing
-```
+All experiments accept `--fake` (scripted provider, offline) unless noted; without it they call the configured provider.
 
-**pivot.py**: the user describes a website ("dentists in Ohio", "formal", 3 services) over several turns, then says "Instead of a website let's just build a slide show". **PASS** means all of these hold:
-1. the facts were told to the website clone, not to the original
-2. the website clone joined with `out_of_scope`, triggered by the pivot message
-3. the original's default join (deterministic, no model call) committed, and its context now points at the fact rows
-4. the slides clone's seed contains the same `row_id`s as the user's audience and tone messages. That makes them verbatim by construction (pointers, not paraphrase).
-5. the deck mentions Ohio and dentists, uses a formal tone, and covers at least 2 of the services
+| Script | What it measures |
+|---|---|
+| `experiments/pivot.py` | A user describes a website over several turns, then pivots to a slide show. Checks that the facts reach the slides clone verbatim and the join is deterministic. `--arm graft\|subagent\|both`. |
+| `experiments/isolation.py` | The same slides task as a clone, inside a shared agent with conflicting skills loaded, and as a subagent. Scores compliance and style leakage. `-n 20 --parallel 8` by default. |
+| `experiments/bench.py` | Five scripted scenarios (`pivot`, `revisions`, `failure`, `long_compaction`, `multi_part`) for the graft and subagent arms, with pass rate, tokens by cache bucket, cost, latency and significance tests. Example: `uv run python experiments/bench.py --scenario all --arm both -n 10 --fake`. |
+| `experiments/seed_eval.py` | Offline seed-selection evaluation over stored bench runs (Jev, a model actor, embeddings, Needle 3). Needs stored runs and the relevant keys. |
+| `experiments/api_probe.py` | Whether providers accept historical tool calls for undeclared tools, and spliced Anthropic thinking blocks. Skips providers without keys. |
+| `experiments/replay/run.py` | Real-trace replay: re-runs recorded Claude Code subagent delegations as a subagent (S) and as a graft clone (G) against the repository checked out at the spawn-time commit, and compares both with the recorded subagent (R). Needs local transcripts, a checkout of the traced repository, `OPENAI_API_KEY` and `TYPESAFE_API_KEY`; not runnable offline. |
 
-The script prints the report and dumps the database (every timeline's context view plus the transactions).
+Every run records uncached input, cached reads, cache writes and output per call and per role. Costs are printed only when prices are set.
 
-**isolation.py** (`-n 20 --parallel 8` are the defaults) runs the same slides task in two arms at once:
-- **shared**: a realistic single agent with progressive disclosure. The system prompt is the catalog only, every capability tool is declared, and the history shows it calling `load_skill` for website, calendar, newsletter, social and recipes and doing real work in each skill's conflicting house style.
-- **clone**: a graft clone seeded only with the task row, linked to `slides`+`join`.
+## Results so far
 
-Both arms must call `load_skill('slides')` themselves. The scorer checks two things:
-- **compliance**: one deck, a slide per service, 3 bullets each, the audience facts, Title Case
-- **leakage**: emoji, `!`, #hashtags, ALL-CAPS words, slang, questions to the reader, lowercase titles, bakery-history bleed, foreign tool calls. Each type is reported separately.
+These are small samples. They are reported as measured, not as evidence that either approach wins.
 
-It also reports correct/N, stdev, distinct structures, tokens per arm split by cache bucket (and cost if prices are set), Fisher's exact test on pass and leak rates, and a permutation test on scores.
+- **Isolation** (`isolation.py`, gpt-6-luna): both the clone and the shared-context arm scored 20/20 with zero leakage; the clone arm used about 3x fewer input tokens. Isolation alone does not separate the approaches on a frontier model.
+- **Seeder threshold** (`seed_eval.py`, 140 stored `long_compaction` events): the Jev seeder at threshold 0.4 kept full fact recall on 140/140 events (139 at 0.5, 136 at 0.7). Needle 3 zero-shot did not qualify: its confidence did not separate needed rows from the rest.
+- **Real-trace replay** (`replay/run.py`, 14 delegation events from a public Claude Code session on the mosfet project; S and G both run on gpt-6-luna; R is the recorded Claude subagent):
+  - probe accuracy (the parent answering questions about the delegated work): subagent 0.17, graft 0.13, recorded Claude subagent 0.60
+  - on the Explore (read-only search) event: S 0.85, G 0.75, R 1.00
+  - delegation cost: graft $0.64 vs subagent $0.26 in total; average latency: graft 295 s vs subagent 427 s
+  - reading: the weaker delegate model dominates the outcome; there is no evidence here that graft is better or worse than a subagent. An earlier 5-event pilot on another project showed the same pattern.
 
-**Subagent baseline** (`graft/subagent.py`; `pivot.py --arm graft|subagent|both`, default both; also a third `subagent` arm in `isolation.py`): the parent (same persona) talks to the user and calls `delegate(skill, task_prompt)`; the subagent gets the persona, that skill's listing and `load_skill`, and only the parent-written prompt, and returns a summary as the tool result. pivot.py reports per-role cache/cost tables for both arms (parent/original, handoff/clone-tx, subagent/clone, summary/join-tx), the output tokens spent on handoffs and summaries vs the one-shot clone calls (the default join makes no call), and, as a diagnostic only, which user facts appear in the handoff/seed and the deck. In isolation.py the clone arm is pre-seeded (no clone call is run or billed), while the subagent arm includes the parent's handoff call.
+## Limitations
 
-**Prompt caching** (both experiments): every call records uncached input, cached input reads, cache writes and output, per run and per role (`graft/providers.py` `UsageMixin`; `graft/cachestats.py`).
-- OpenAI: `usage.input_tokens_details.cached_tokens` / `cache_write_tokens` (Responses) or `prompt_tokens_details.cached_tokens` (Chat); uncached = input - cached - writes. `prompt_cache_key` (a hash of system prompt + tool names, i.e. persona + skill set) is sent when the installed SDK accepts it; `GRAFT_PROMPT_CACHE_KEY=0` turns it off.
-- Anthropic: an explicit `cache_control` breakpoint on the system block (caches tools + system) plus top-level automatic caching for the conversation tail; reads `cache_read_input_tokens` / `cache_creation_input_tokens`.
-- `--cache-scope run` (default) puts a unique nonce at the start of the first message of each run, so separate runs share only tools + system; `global` drops it (an upper bound). The reports print each arm/timeline's system and tools+system token length against the provider's minimum cacheable prefix.
-- "Effective input" = uncached + 0.1 x cached + 1.25 x writes. These multipliers are assumptions (`GRAFT_CACHED_READ_MULT`, `GRAFT_CACHE_WRITE_MULT`). Cost is printed when `GRAFT_PRICE_IN_PER_M` and `GRAFT_PRICE_OUT_PER_M` are set (optional `GRAFT_PRICE_CACHED_IN_PER_M`, `GRAFT_PRICE_CACHE_WRITE_PER_M`).
+- Depth 1 only: clones cannot clone. One clone runs at a time; parallel delegation is out of scope for v1.
+- The chat skills are simulated; there is no plugin interface for real tools yet.
+- The Jev seeder depends on a hosted TypeSafe API; without it the parent model picks its own seed.
+- The benchmarks are scripted scenarios and a small number of replayed traces. Results may not transfer to other tasks or models.
+- The replay counterfactual is approximate: the recorded handoff stands in for the user message that would have triggered the clone.
 
-**Seed actor** (`graft/seeder.py`, `GRAFT_SEEDER=model|jev`, default `jev` when `TYPESAFE_API_KEY` is set, else `model`; bench `--seeder`; install the `jev` extra): with `jev`, a TypeSafe Jev decision model picks the clone's seed. The `clone` tool schema is unchanged: `seed_quotes`/`seed_row_ids` stay optional and are ignored (used only as the fallback). Candidates are the text rows of the original's working view, harness notes excluded. One Noul per candidate. The request state holds only the purpose and the latest user request; each question carries its row plus one neighbour row on each side. Questions are packed into requests under `GRAFT_SEED_TOKEN_BUDGET` (default 24000 estimated tokens; the documented limits are 64k per request and 32k for state + longest question), and the requests run in parallel. An oversized row is truncated deterministically and recorded. Rows scoring at or above `GRAFT_SEED_THRESHOLD` (default 0.4, chosen offline with `experiments/seed_eval.py`) are seeded in view order, and the trigger is always seeded. If the seed would start with an assistant row, the nearest earlier user row is added. Validation and commit follow as usual. The decision (model, threshold, per-row scores, selection, latency, input tokens, requests, truncations, fallback) is stored in the clone transaction's `scratch`. On a Jev error the seeder falls back to the original's own seed if it resolved, else to every candidate. Jev cost is its own `seeder` role, priced at the official $0.042 / 1M input tokens with free output. `TYPESAFE_API_KEY` is read from the environment.
+## Design notes
 
-**Per-call-site effort and model** (`graft/callsites.py`): each call is mapped to a site — `original`, `clone_call` (an original call answering a fresh user message, i.e. the call that may route with `clone`), `clone`, `compaction`, `subagent_parent`, `subagent`. Effort resolves `GRAFT_EFFORT_<SITE>` → (for `clone_call`: `GRAFT_EFFORT_ORIGINAL`) → `GRAFT_REASONING_EFFORT` (default `low`); model resolves `GRAFT_MODEL_<SITE>` the same way → the provider default. bench flags mirror them (`--effort clone_call=high`, `--model clone_call=...`). Every call log entry records site, model and effort, and the bench prints them per role. Cost is priced per model: `GRAFT_PRICE_*_PER_M__<MODEL>`, then the global `GRAFT_PRICE_*` for `GRAFT_MODEL`, then a small table of verified official prices (`cachestats.OFFICIAL_PRICES`); a run that used any unpriced model shows $ n/a.
+Implementation choices that go beyond, or differ from, the spec:
 
-**bench.py** (`--arm graft,subagent,subagent_batched | both | all`, `--compaction turns|summary` for the graft arm) runs scenarios (data in `experiments/scenarios.py`: scripted user turns plus a deterministic scorer of the final World and transcript) for both arms: `uv run python experiments/bench.py --scenario all|pivot,revisions,... --arm both -n 10 --parallel 6 [--fake] [--compact-tokens N] [--out runs.json]`. Scenarios:
-- `pivot`: as in pivot.py; pass = the deck uses the facts.
-- `revisions`: a deck, then five revisions (reorder, retitle, tone, added slide with an email, a typo fix); pass = the final deck reflects all of them. `slides_read` exists in both arms so a subagent can see the current deck.
-- `failure`: `calendar_book` always returns an error; pass = it was attempted, no success was claimed, and the last reply says it failed. Graft diagnostics: join reasons and the `failed` error record.
-- `long_compaction`: 16 detail turns to a website task, then a pivot to slides, with compaction on (threshold 3000 estimated tokens, the same trigger for every arm). Pass = a scored subset of facts reaches the deck; the other facts are diagnostic. Reports compression ratio (working-view tokens before/after), kept rows and compressed messages per compaction, and per fact whether it survived compaction verbatim (its original row kept), paraphrased (only inside a compressed window or summary) or was lost.
-- `multi_part`: one message asks for a booking and a deck.
+- **Rendering:** consecutive rows with the same role become one message. Validation runs on those messages: the view starts with a user turn, every `tool_use` has its `tool_result` in the next user turn, tool results come before text in a user turn, the view ends on a user turn, a trigger is the last row, and thinking rows stay in the timeline that produced them.
+- **Clone is one call:** `clone(purpose, skills, seed_quotes, seed_row_ids)`. The harness resolves the seed to pointers, validates and commits; on violations the parent gets them back with one retry. With the Jev seeder, the seed fields are only a fallback.
+- **Default join is deterministic:** pointers to the text rows of the clone's working view that the parent does not already have; `out_of_scope` ends with the trigger, `failed` adds a harness error record.
+- **No silent `done`:** `join(reason='done')` is refused unless the clone has replied to the user since the last user message.
+- **Progressive disclosure:** a timeline's system prompt lists only the names and descriptions of its linked skills; `load_skill(name)` loads the instructions as ordinary tool rows.
+- **Nesting:** linking `clone` to a clone is refused while `NESTING_ENABLED = False`, but skill linking already goes through one check that contains the subset rule.
 
-Arms: `graft`; `subagent` (delegates as it sees fit, summary compaction); `subagent_batched` (the same runner with a delegation policy in the parent's system prompt: gather requirements first, delegate only when it can act, pass the full current requirements every time). Compaction: graft `turns` (default) is one `compact` call returning an ordered list of items that partitions the working view before the fresh message: `{keep: row_id}` or a compressed message `{role, text, begin_row_id, end_row_id}` over a contiguous window. Compressed messages are new rows owned by the timeline, placed at their window, with provenance in the `compressions` table. The harness checks the partition (in order, no gaps, no overlap) and the turn structure, allows one retry, and records the new working view in `compactions` as a pointer list. `summary` (ablation) is one user-role summary row over the whole prefix. The subagent arms always use summary compaction.
+## License
 
-Each run gets its own provider (per-run usage), store, World and nonce, and reports pass, effective total, $ cost (when prices are set), calls, wall-clock latency, clones or delegations, output spent on context passing, and compactions. The summary adds Welch's t-test and a permutation test on effective total, and Fisher's exact test on pass rates.
-
-**api_probe.py** answers Open Question 1:
-- (a) Are historical tool calls for undeclared tools accepted? This is checked on both Anthropic and OpenAI.
-- (b) Are spliced Anthropic thinking blocks accepted? This is checked on Anthropic only.
-
-## Design decisions and deviations
-
-- **Rendering:** consecutive rows with the same role become one message. That is the only mapping from rows to messages. Validation runs on the grouped messages:
-  - the view starts with a user turn
-  - each `tool_use` is paired with a `tool_result` in the next user turn
-  - in a user turn, tool results come before text
-  - the view ends on a user turn
-  - if there is a trigger, it is the last row
-  - thinking rows are allowed only in the timeline that produced them
-- **Clone is one call.** `clone(purpose, skills, seed_quotes, seed_row_ids)`: the source names its seed by short verbatim quotes of its own messages (each must match exactly one text row) or by row ids (join records list them). The harness resolves the seed to pointers, validates and commits; on violations the tool result lists them plus an index of the source's messages, and one retry is allowed per user message. The call that emitted `clone` is accounted under `original:clone_tx`. (The model cannot see row ids in its own conversation, which is why quotes exist.)
-- **Default join is deterministic (no model call).** On a join event the harness appends pointers to the text rows (user and assistant) of the clone's working view that the source does not already have; `out_of_scope` ends with the trigger, `failed` adds a harness error record before it. The pending view is validated like any commit, then the source returns to `active`. `Store.working_view(tl)` is the single selection point: it returns the full view, or, once a `compactions` marker exists (the MVP never writes one), the summary row plus the turns after it.
-- **No explicit join transaction in v1.** The SQL join transaction (spec Future Ideas: `absorb(clone)`) was removed: no run needed it. The `clone` skill's tools are just `load_skill` and `clone`. The read-only agent SQL connection and the `summarize()` UDF went with it.
-- **No silent `done`.** `join(reason='done')` is refused with a tool error unless the clone has written user-facing text since the user's last message (`Harness.replied`). The join skill says details about the current task are always in scope; `out_of_scope` is only for a different kind of deliverable or a missing capability.
-- **Join record:** a user-role text turn owned by the source, `(harness note: clone cN joined, reason=...; remembered rows ... follow)`. It is placed before the remembered rows.
-- **Trigger:** the clone's last user message. It is set when the reason is `out_of_scope`, or when no assistant text came after that message. The harness computes it; the clone never writes it.
-- **Progressive disclosure (spec):** `Harness.system()` lists only the name and description of the linked skills; the original also gets the catalog. The built-in `load_skill(name)` tool belongs to both `clone` and `join`, so every timeline has it, and it only loads skills linked to that timeline. Its result is stored as ordinary tool_use/tool_result rows. Linked skills' tools are declared from the start.
-- **Skills:** `join` is linked automatically. Linking `clone` to a clone is refused while `NESTING_ENABLED = False`. All skill checks go through `check_skill_link`, which already contains the subset rule for nested sources.
-- **No OpenTelemetry:** the delegation scoped this as an experiment, not a product.
+MIT. See [LICENSE](LICENSE).

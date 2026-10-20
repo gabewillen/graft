@@ -1,6 +1,6 @@
 # RFC: Agent Grafts
 
-Status: draft, under review. Decisions below are locked unless listed in [Open Questions](#open-questions).
+Status: draft. v1 (depth 1) is implemented in this repository; decisions below are fixed for v1 unless listed in [Open Questions](#open-questions).
 
 ## Summary
 
@@ -8,7 +8,7 @@ Agent Grafts is an architecture for isolating specialized work without giving up
 
 > **An agent is a timeline. Cloning suspends it; joining resumes it with the clone's timeline available as its own memory. Context is isolated on the way down and lossless on the way up.**
 
-The name comes from horticulture: a cutting is taken from a plant and later grafted back so both grow as one organism. Here an agent clones itself into a single-use timeline, and that timeline is grafted back onto its source as memory. (Earlier drafts called this "Agent Mitosis"; cells that divide never rejoin, so the name no longer fit.)
+The name comes from horticulture: a cutting is taken from a plant and later grafted back so both grow as one organism. Here an agent clones itself into a single-use timeline, and that timeline is grafted back onto its source as memory.
 
 The core principle is:
 
@@ -298,9 +298,11 @@ The baseline is **subagents**, not a single shared agent.
 1. **Isolation (done, MVP):** the same skill as a clone vs inside a shared context with conflicting skills loaded. On gpt-6-luna both arms scored 20/20 with zero leakage; clones used about 3x fewer input tokens. Isolation alone does not distinguish the architecture on frontier models.
 2. **Cost and caching vs subagents (in progress):** subagents diverge from the parent's cache and pay output tokens for the handoff prompt and the summary, plus prefill of each. Grafts replace both with pointer selection. Measured per role: uncached/cached input, cache writes, output.
 3. **Fact loss vs selection recall (planned):** subagents lose facts by paraphrase (summary caps, compaction, nested delegation); grafts lose them only by selection (the source failing to seed or join a relevant row). Compare on tasks with many specific facts, a sweep of summary caps, and delegation depth 1-3.
-4. **Replay on real traces (planned):** take existing Claude Code / Codex transcripts with subagents. At each point where a subagent finished, emulate a join: replace the summary tool_result with the default join over the subagent's actual transcript, then compare how the parent continues (next action, answers to probe questions about the subagent's work, tokens) against the recorded trace. This tests the join on real work without building a full runtime first.
+4. **Replay on real traces (pilot run, `experiments/replay/`):** take existing Claude Code / Codex transcripts with subagents. At each point where a subagent finished, emulate a join: replace the summary tool_result with the default join over the subagent's actual transcript, then compare how the parent continues (next action, answers to probe questions about the subagent's work, tokens) against the recorded trace. This tests the join on real work without building a full runtime first.
 
    Also force the handoff: at the point where the parent invoked the subagent, cut the parent and make a `clone` call instead of letting it write a handoff prompt, then run a fresh clone from that seed and join it back. Compare that full counterfactual branch (seed → clone run → join → parent continuation) against the recorded branch (handoff prompt → subagent → summary → parent continuation). Clone runs need the environment as it was at that point, so start with read-only subagents (code search and research) replayed against the repository checked out at the trace's commit; subagents with side effects come later, if at all.
+
+   Pilot results are in the README under "Results so far": with both arms on the same delegate model, neither the clone nor the subagent was clearly better, and the delegate model dominated the outcome.
 
 ## Principle
 
