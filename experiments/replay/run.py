@@ -130,7 +130,10 @@ def worktree_for(repo: str, e: loader.Event, root: str) -> tuple[str, str, str]:
 
 
 def aliases_for(e: loader.Event, repo: str) -> list[str]:
-    found = set(re.findall(r"/Users/[^\s'\"`]*?/emel\.cpp(?:/\.claude/worktrees/[A-Za-z0-9._-]+)?", e.handoff))
+    """Absolute paths in the handoff that name the recorded repo (by its directory name), including Claude Code
+    worktrees under it; they are rewritten to the replay checkout."""
+    name = re.escape(os.path.basename(os.path.normpath(repo)))
+    found = set(re.findall(rf"/[^\s'\"`]*?/{name}(?:/\.claude/worktrees/[A-Za-z0-9._-]+)?(?![A-Za-z0-9._-])", e.handoff))
     return sorted(found | {repo} | ({e.cwd} if e.cwd else set()), key=len, reverse=True)
 
 
@@ -334,7 +337,13 @@ def score(probes: list[dict], answers: list[str], verdicts: list[str]) -> dict:
 
 
 # ------------------------------------------------------------------ main
-def find_subagent(projects: str, prefix: str, project_glob: str = "-Users-gabrielwillen-VSCode-stateforward-emel-emel-cpp*") -> str:
+def project_glob_for(repo: str) -> str:
+    """Claude Code stores a project's transcripts under ~/.claude/projects/<cwd with every non-alphanumeric
+    character replaced by '-'>; the trailing * also matches worktrees and subdirectories of the repo."""
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(os.path.expanduser(repo))) + "*"
+
+
+def find_subagent(projects: str, prefix: str, project_glob: str) -> str:
     hits = glob.glob(f"{projects}/{project_glob}/*/subagents/agent-{prefix}*.jsonl")
     if len(hits) != 1:
         raise SystemExit(f"expected one transcript for {prefix}, found {len(hits)}")
@@ -697,7 +706,7 @@ async def amain(a) -> int:
     skipped: list[dict] = []
     os.makedirs(a.out, exist_ok=True)
     for prefix in a.events.split(","):
-        e = loader.load_event(find_subagent(a.projects, prefix, a.project_glob), a.max_prefix_chars)
+        e = loader.load_event(find_subagent(a.projects, prefix, a.project_glob or project_glob_for(a.repo)), a.max_prefix_chars)
         hits = secret_filter.scan(loader.event_texts(e), known)
         redacted = redact_event(e)
         redaction_totals.update(redacted)
@@ -764,7 +773,8 @@ def main() -> int:
     ap.add_argument("--max-prefix-chars", type=int, default=40000)
     ap.add_argument("--budget", type=float, default=5.0)
     ap.add_argument("--probes-from", default=None, help="reuse the probes of an earlier replay.json (same questions)")
-    ap.add_argument("--project-glob", default="-Users-gabrielwillen-VSCode-stateforward-emel-emel-cpp*")
+    ap.add_argument("--project-glob", default=None,
+                    help="transcript directory glob under --projects (default: derived from --repo)")
     ap.add_argument("--mode", choices=("readonly", "auto"), default="readonly",
                     help="auto: Explore events read-only (probes only); other events writable (tests, diff, probes)")
     ap.add_argument("--stop-on-error", action="store_true")
