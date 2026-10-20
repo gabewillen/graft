@@ -116,7 +116,7 @@ These are small samples. They are reported as measured, not as evidence that eit
 
 - **Isolation** (`isolation.py`, gpt-6-luna): both the clone and the shared-context arm scored 20/20 with zero leakage; the clone arm used about 3x fewer input tokens. Isolation alone does not separate the approaches on a frontier model.
 - **Seeder threshold** (`seed_eval.py`, 140 stored `long_compaction` events): the Jev seeder at threshold 0.4 kept full fact recall on 140/140 events (139 at 0.5, 136 at 0.7). Needle 3 zero-shot did not qualify: its confidence did not separate needed rows from the rest.
-- **Real-trace replay** (`replay/run.py`, 14 delegation events from a public Claude Code session on the mosfet project; S and G both run on gpt-6-luna; R is the recorded Claude subagent):
+- **Real-trace replay** (`replay/run.py`, 14 delegation events from a public Claude Code session on the [mosfet](https://github.com/stateforward/mosfet) project; S and G both run on gpt-6-luna; R is the recorded Claude subagent):
   - probe accuracy (the parent answering questions about the delegated work): subagent 0.17, graft 0.13, recorded Claude subagent 0.60
   - on the Explore (read-only search) event: S 0.85, G 0.75, R 1.00
   - delegation cost: graft $0.64 vs subagent $0.26 in total; average latency: graft 295 s vs subagent 427 s
