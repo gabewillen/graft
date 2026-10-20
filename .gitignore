@@ -1,7 +1,26 @@
+# secrets
 .env
-.venv/
+.env.*
+
+# Python
 __pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# experiment outputs (SQLite stores, run records)
 *.db
 *.db-wal
 *.db-shm
-.pytest_cache/
+runs/
+
+# local tool state
+.claude/
+.DS_Store
