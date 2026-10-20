@@ -8,7 +8,7 @@ estimated size (state + questions, characters / 4) stays under GRAFT_SEED_TOKEN_
 24000), and batches run in parallel. A question that alone would exceed the budget has its message
 truncated deterministically (recorded in the decision).
 
-With `model` (default) the original names the seed itself (seed_quotes / seed_row_ids). With
+With `model` (the default when TYPESAFE_API_KEY is unset) the original names the seed itself (seed_quotes / seed_row_ids). With
 `jev`, a TypeSafe Jev decision model picks the seed: one `system_one` request per clone with one
 Noul ("does a clone doing <purpose> need this message?") per candidate row. Candidates are the
 text rows of the source's working view, excluding harness notes. Rows scoring at or above
