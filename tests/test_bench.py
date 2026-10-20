@@ -45,7 +45,7 @@ def test_revisions_scorer():
                         {"title": "Welcome To The Book Fair", "bullets": ["a", "b", "c"]},
                         {"title": "Volunteers", "bullets": ["a", "b", "c"]},
                         {"title": "Schedule", "bullets": ["a", "b", "c"]},
-                        {"title": "Contact Us", "bullets": ["Email fair@riversidelib.org", "b", "c"]}]})
+                        {"title": "Contact Us", "bullets": ["Email fair@riversidelib.example.org", "b", "c"]}]})
     ok, checks, _ = score_revisions(_ctx(w))
     assert ok, checks
     w.decks[-1]["slides"][0]["title"] = "Welcome To Riversde"

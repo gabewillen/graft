@@ -71,7 +71,7 @@ REVISIONS = [
     "Please move the Volunteers slide so it comes before the Schedule slide.",
     "Retitle the Welcome slide to 'Welcome To The Book Fair'.",
     "For the tone, make it warm but still professional.",
-    "Add a final slide titled 'Contact Us' that includes our email, fair@riversidelib.org.",
+    "Add a final slide titled 'Contact Us' that includes our email, fair@riversidelib.example.org.",
     "One more thing: I misspelled the library's name. It is 'Riverside', not 'Riversde'. Please fix it "
     "everywhere in the deck.",
 ]
@@ -94,7 +94,7 @@ def score_revisions(ctx: RunContext) -> tuple[bool, dict, dict]:
         "volunteers_before_schedule": vol >= 0 and sch >= 0 and vol < sch,
         "tone_warm": "warm" in str(d.get("tone", "")).lower(),
         "contact_slide_last_with_email": "contact" in last["title"].lower()
-        and "fair@riversidelib.org" in json.dumps(last).lower(),
+        and "fair@riversidelib.example.org" in json.dumps(last).lower(),
         "audience_kept": "famil" in str(d.get("audience", "")).lower(),
     }
     return all(checks.values()), checks, {"titles": titles, "decks_built": len(ctx.world.decks)}
