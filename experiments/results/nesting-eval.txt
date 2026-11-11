@@ -1,0 +1,63 @@
+bench: scenarios=['nested_project', 'multi_part', 'pivot'] arms=['graft', 'graft_nested'] n=10 parallel=6 fake=False cache_scope=run wall=224s
+
+================ BENCH SUMMARY ================
+effective input = uncached + 0.1 x cached + 1.25 x cache writes; effective total = effective input + 4 x output (ASSUMED multipliers, in full-price input-token units; set GRAFT_CACHED_READ_MULT / GRAFT_CACHE_WRITE_MULT / GRAFT_OUTPUT_MULT); cost n/a (set GRAFT_PRICE_IN_PER_M and GRAFT_PRICE_OUT_PER_M)
+  scenario        arm           pass   eff. total    $ / run  latency s   calls       handoffs   ctx-pass out  compactions
+  nested_project  graft         9/10   16612 ± 2459  n/a      23.1 ± 3.2  16.0 ± 3.1  2.8 ± 0.6  374 ± 117     0.0 ± 0.0  
+  nested_project  graft_nested  5/10   17696 ± 2511  n/a      24.3 ± 3.3  16.3 ± 1.9  2.9 ± 0.3  365 ± 60      0.0 ± 0.0  
+  multi_part      graft         10/10  6486 ± 1144   n/a      8.7 ± 1.4   5.7 ± 1.3   1.0 ± 0.0  113 ± 33      0.0 ± 0.0  
+  multi_part      graft_nested  10/10  7280 ± 1697   n/a      9.4 ± 2.3   6.4 ± 2.0   1.0 ± 0.0  120 ± 38      0.0 ± 0.0  
+  pivot           graft         10/10  17717 ± 1882  n/a      23.6 ± 2.8  17.3 ± 1.7  2.1 ± 0.3  310 ± 179     0.0 ± 0.0  
+  pivot           graft_nested  10/10  20343 ± 1293  n/a      23.3 ± 1.5  17.7 ± 0.8  2.0 ± 0.0  263 ± 118     0.0 ± 0.0  
+
+per-role means (calls / effective total) by scenario and arm:
+  nested_project   graft     hit rate 26%; parent/original 1.1/856; handoff/clone-tx 2.8/3736; subagent/clone 12.1/12020
+      calls: handoff/clone-tx | site=clone_call model=gpt-5.4-mini effort=low: 17
+      calls: handoff/clone-tx | site=original model=gpt-5.4-mini effort=low: 11
+      calls: parent/original | site=clone_call model=gpt-5.4-mini effort=low: 11
+      calls: subagent/clone | site=clone model=gpt-5.4-mini effort=low: 121
+      clone seeds: 1.4 rows / 54 tokens mean
+  nested_project   graft_nested hit rate 26%; parent/original 1.6/1217; handoff/clone-tx 3.1/3983; subagent/clone 11.6/12496
+      calls: handoff/clone-tx | site=clone_call model=gpt-5.4-mini effort=low: 16
+      calls: handoff/clone-tx | site=original model=gpt-5.4-mini effort=low: 15
+      calls: parent/original | site=clone_call model=gpt-5.4-mini effort=low: 16
+      calls: subagent/clone | site=clone model=gpt-5.4-mini effort=low: 116
+      clone seeds: 1.3 rows / 52 tokens mean
+  multi_part       graft     hit rate 4%; parent/original 1.0/676; handoff/clone-tx 1.1/1370; subagent/clone 3.6/4440
+      calls: handoff/clone-tx | site=original model=gpt-5.4-mini effort=low: 11
+      calls: parent/original | site=clone_call model=gpt-5.4-mini effort=low: 10
+      calls: subagent/clone | site=clone model=gpt-5.4-mini effort=low: 36
+      clone seeds: 1.0 rows / 46 tokens mean
+  multi_part       graft_nested hit rate 5%; parent/original 0.9/579; handoff/clone-tx 1.1/1450; subagent/clone 4.4/5251
+      calls: handoff/clone-tx | site=clone_call model=gpt-5.4-mini effort=low: 1
+      calls: handoff/clone-tx | site=original model=gpt-5.4-mini effort=low: 10
+      calls: parent/original | site=clone_call model=gpt-5.4-mini effort=low: 9
+      calls: subagent/clone | site=clone model=gpt-5.4-mini effort=low: 44
+      clone seeds: 1.0 rows / 46 tokens mean
+  pivot            graft     hit rate 5%; parent/original 1.2/854; handoff/clone-tx 2.7/3667; subagent/clone 13.4/13195
+      calls: handoff/clone-tx | site=clone_call model=gpt-5.4-mini effort=low: 10
+      calls: handoff/clone-tx | site=original model=gpt-5.4-mini effort=low: 17
+      calls: parent/original | site=clone_call model=gpt-5.4-mini effort=low: 12
+      calls: subagent/clone | site=clone model=gpt-5.4-mini effort=low: 134
+      clone seeds: 3.0 rows / 46 tokens mean
+  pivot            graft_nested hit rate 3%; parent/original 1.1/700; handoff/clone-tx 2.7/4110; subagent/clone 13.9/15533
+      calls: handoff/clone-tx | site=clone_call model=gpt-5.4-mini effort=low: 10
+      calls: handoff/clone-tx | site=original model=gpt-5.4-mini effort=low: 17
+      calls: parent/original | site=clone_call model=gpt-5.4-mini effort=low: 10
+      calls: parent/original | site=original model=gpt-5.4-mini effort=low: 1
+      calls: subagent/clone | site=clone model=gpt-5.4-mini effort=low: 139
+      clone seeds: 2.9 rows / 36 tokens mean
+
+significance (effective total and pass; two-sided):
+  graft_nested vs graft            nested_project   cost ratio 1.07; Welch t=0.98 df=18.0 p=0.3424; permutation p=0.36; pass 5/10 vs 9/10 Fisher p=0.1409
+  graft_nested vs graft            multi_part       cost ratio 1.12; Welch t=1.23 df=15.8 p=0.2380; permutation p=0.24; pass 10/10 vs 10/10 Fisher p=1.0000
+  graft_nested vs graft            pivot            cost ratio 1.15; Welch t=3.64 df=16.0 p=0.0022; permutation p=0.0016; pass 10/10 vs 10/10 Fisher p=1.0000
+
+failure modes (failed checks and errors per scenario/arm):
+  nested_project   graft     failed checks {'booked_2026-11-12_09:30': 1}; errors {}; joins {'out_of_scope': 18, None: 10}; silent-done refusals 2; max depth 1; rollups 0; clone refusals 0
+  nested_project   graft_nested failed checks {'site_says_saturday': 5}; errors {}; joins {'out_of_scope': 22, None: 7}; silent-done refusals 0; max depth 1; rollups 0; clone refusals 2
+  multi_part       graft     failed checks {}; errors {}; joins {None: 10}; silent-done refusals 1; max depth 1; rollups 0; clone refusals 1
+  multi_part       graft_nested failed checks {}; errors {}; joins {None: 10}; silent-done refusals 0; max depth 1; rollups 0; clone refusals 1
+  pivot            graft     failed checks {}; errors {}; joins {'out_of_scope': 11, None: 10}; silent-done refusals 0; max depth 1; rollups 0; clone refusals 6
+  pivot            graft_nested failed checks {}; errors {}; joins {'out_of_scope': 10, None: 10}; silent-done refusals 0; max depth 1; rollups 0; clone refusals 7
+records: experiments/results/nesting-eval.json

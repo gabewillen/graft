@@ -124,7 +124,7 @@ These are small samples. They are reported as measured, not as evidence that eit
 
 ## Limitations
 
-- Depth 1 only: clones cannot clone. One clone runs at a time; parallel delegation is out of scope for v1.
+- One level deep: only the original clones. Nesting (clones that clone) was implemented, evaluated and removed because it does not fit grafting; see spec: Depth. One clone runs at a time; parallel delegation is out of scope for v1.
 - The chat skills are simulated; there is no plugin interface for real tools yet.
 - The Jev seeder depends on a hosted TypeSafe API; without it the parent model picks its own seed.
 - The benchmarks are scripted scenarios and a small number of replayed traces. Results may not transfer to other tasks or models.
@@ -139,7 +139,6 @@ Implementation choices that go beyond, or differ from, the spec:
 - **Default join is deterministic:** pointers to the text rows of the clone's working view that the parent does not already have; `out_of_scope` ends with the trigger, `failed` adds a harness error record.
 - **No silent `done`:** `join(reason='done')` is refused unless the clone has replied to the user since the last user message.
 - **Progressive disclosure:** a timeline's system prompt lists only the names and descriptions of its linked skills; `load_skill(name)` loads the instructions as ordinary tool rows.
-- **Nesting:** linking `clone` to a clone is refused while `NESTING_ENABLED = False`, but skill linking already goes through one check that contains the subset rule.
 
 ## License
 

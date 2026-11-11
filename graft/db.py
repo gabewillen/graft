@@ -81,7 +81,6 @@ CREATE TRIGGER IF NOT EXISTS context_no_delete BEFORE DELETE ON context
 """
 
 TURN_COLS = "row_id, owner_timeline, role, kind, tool_name, content, tokens, ts"
-NESTING_ENABLED = False  # v1 is depth 1 (spec: Depth)
 BUILTIN_SKILLS = ("clone", "join")
 
 

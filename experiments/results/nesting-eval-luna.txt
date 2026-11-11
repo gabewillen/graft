@@ -1,0 +1,33 @@
+bench: scenarios=['nested_project'] arms=['graft', 'graft_nested'] n=20 parallel=6 fake=False cache_scope=run wall=303s
+
+================ BENCH SUMMARY ================
+effective input = uncached + 0.1 x cached + 1.25 x cache writes; effective total = effective input + 4 x output (ASSUMED multipliers, in full-price input-token units; set GRAFT_CACHED_READ_MULT / GRAFT_CACHE_WRITE_MULT / GRAFT_OUTPUT_MULT); cost n/a (set GRAFT_PRICE_IN_PER_M and GRAFT_PRICE_OUT_PER_M)
+  scenario        arm           pass   eff. total    $ / run            latency s   calls       handoffs   ctx-pass out  compactions
+  nested_project  graft         16/20  21560 ± 3329  0.00232 ± 0.00036  46.2 ± 9.7  24.3 ± 2.6  3.0 ± 0.2  315 ± 97      0.0 ± 0.0  
+  nested_project  graft_nested  20/20  20298 ± 1593  0.00219 ± 0.00017  37.0 ± 2.7  22.9 ± 1.5  3.0 ± 0.0  309 ± 24      0.0 ± 0.0  
+
+per-role means (calls / effective total) by scenario and arm:
+  nested_project   graft     hit rate 39%; parent/original 2.1/1708; handoff/clone-tx 3.1/3540; subagent/clone 19.1/16312
+      clone-call / handoff $ share 16.6%
+      calls: handoff/clone-tx | site=clone_call model=gpt-6-luna effort=low: 21
+      calls: handoff/clone-tx | site=original model=gpt-6-luna effort=low: 41
+      calls: parent/original | site=clone_call model=gpt-6-luna effort=low: 43
+      calls: subagent/clone | site=clone model=gpt-6-luna effort=low: 381
+      clone seeds: 1.6 rows / 68 tokens mean
+  nested_project   graft_nested hit rate 40%; parent/original 1.6/1296; handoff/clone-tx 3.1/3815; subagent/clone 18.1/15187
+      clone-call / handoff $ share 18.9%
+      calls: handoff/clone-tx | site=clone_call model=gpt-6-luna effort=low: 28
+      calls: handoff/clone-tx | site=original model=gpt-6-luna effort=low: 34
+      calls: parent/original | site=clone_call model=gpt-6-luna effort=low: 32
+      calls: subagent/clone | site=clone model=gpt-6-luna effort=low: 363
+      clone seeds: 1.6 rows / 63 tokens mean
+
+significance (effective total and pass; two-sided):
+  graft_nested vs graft            nested_project   cost ratio 0.94; Welch t=-1.53 df=27.3 p=0.1377; permutation p=0.14; pass 20/20 vs 16/20 Fisher p=0.1060
+
+failure modes (failed checks and errors per scenario/arm):
+  nested_project   graft     failed checks {'site_says_saturday': 4}; errors {}; joins {'out_of_scope': 41, None: 18, 'done': 2}; silent-done refusals 3; max depth 1; rollups 0; clone refusals 1
+  nested_project   graft_nested failed checks {}; errors {}; joins {'out_of_scope': 39, None: 20, 'done': 1}; silent-done refusals 3; max depth 1; rollups 0; clone refusals 2
+
+total spend this invocation: $0.0901
+records: experiments/results/nesting-eval-luna.json

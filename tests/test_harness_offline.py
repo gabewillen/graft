@@ -67,7 +67,7 @@ def test_one_shot_clone_refused_with_violations_then_retry(harness):
                                                        "seed_quotes": ["hello", "hi", "nope"]}}
         child, text = await h.clone_once("o", use, retry_left=True)
         assert child is None
-        assert "cannot be linked to a clone in v1" in text and "matches no message" in text
+        assert "cannot be linked to a clone" in text and "matches no message" in text
         assert "end on a user turn" in text and "Your messages (row_id role: text):" in text
         child, text = await h.clone_once("o", dict(use, input={"purpose": "p", "skills": ["website"],
                                                                "seed_quotes": ["hello"]}), retry_left=False)
@@ -195,13 +195,11 @@ def test_clone_skill_has_only_load_skill_and_clone(harness):
     assert [t["name"] for t in s.tools_for("o")] == ["load_skill", "clone"]
 
 
-def test_skill_subset_rule_for_nested_sources(harness):
+def test_clone_is_never_linked_to_a_clone(harness):
     s = harness.store
     s.create_timeline("o", None, ["clone"])
-    rid = s.add_turn("o", "user", "text", "x")
-    s.commit_clone("o", "c1", [rid], ["website", "join"])
     assert check_skill_link(s, "o", ["slides"]) == []
-    assert any("subset" in v for v in check_skill_link(s, "c1", ["slides"]))
+    assert any("cannot be linked" in v for v in check_skill_link(s, "o", ["clone", "slides"]))
 
 
 def test_progressive_disclosure_system_prompt(harness):
@@ -250,3 +248,145 @@ def test_load_skill_result_is_an_ordinary_row(tmp_path):
     assert [r["kind"] for r in rows] == ["tool_use", "tool_result"]
     assert "Website skill" in rows[1]["content"] and rows[1]["owner_timeline"] == "c1"
     assert not [r for r in store.view("o") if r["tool_name"] == "load_skill"]
+
+
+def _no_compact_policy(system, messages, tools):
+    """Refuses every compaction (answers in text, never calls compact); otherwise replies."""
+    return [{"type": "text", "text": "ok"}]
+
+
+def test_oversized_join_falls_back_to_last_reply_and_survives_refused_compaction(tmp_path):
+    from graft import compaction
+    from graft.db import render
+    from graft.harness import JOIN_WINDOW_FRACTION
+    store = Store(str(tmp_path / "w.db"))
+    install(store)
+    h = Harness(store, FakeProvider(_no_compact_policy), compact_tokens=50, window_tokens=400)
+    limit = int(400 * JOIN_WINDOW_FRACTION)
+
+    async def go():
+        await h.start()
+        s = h.store
+        seed = s.add_turn("o", "user", "text", "Write a long report.")
+        child, _ = await h.clone_once("o", {"id": "t", "name": "clone", "input": {
+            "purpose": "p", "skills": ["website"], "seed_row_ids": [seed]}}, retry_left=False)
+        big = []
+        for i in range(3):
+            big.append(s.add_turn(child, "assistant", "text", f"Section {i}: " + "x" * 1000))
+            big.append(s.add_turn(child, "user", "text", f"More on {i}."))
+        last = s.add_turn(child, "assistant", "text", "Report finished.")
+        trig = s.add_turn(child, "user", "text", "Now make slides instead.")
+        await h.do_join(child, "out_of_scope")
+        view = [r["row_id"] for r in s.working_view("o")]
+        assert view[-3:-1] == [last, trig]  # tier 1: the clone's last reply, then the trigger
+        assert s.turn(view[-1])["content"] == "ok"  # the source then answered
+        assert not set(big) & set(view)  # oversized rows stay only in the clone's frozen timeline
+        assert all(r in [x["row_id"] for x in s.view(child)] for r in big)
+        assert h.join_fallbacks == [{"clone": child, "tier": 1, "before": h.join_fallbacks[0]["before"],
+                                     "after": h.join_fallbacks[0]["after"]}]
+        assert h.join_fallbacks[0]["before"] > limit >= h.join_fallbacks[0]["after"]
+        assert h.compaction_failures == ["o"]  # compaction refused twice ...
+        source_call = h.provider.calls[-1]  # ... and the source's next call still fits the window
+        assert compaction.estimate_tokens(source_call["messages"]) <= limit
+        assert compaction.estimate_tokens(render(s.working_view("o"))) <= limit
+        await h.machines.stop()
+
+    asyncio.run(go())
+
+
+def test_join_without_window_is_not_size_checked(harness):
+    h = harness
+
+    async def go():
+        await h.start()
+        s = h.store
+        seed = s.add_turn("o", "user", "text", "Write.")
+        child, _ = await h.clone_once("o", {"id": "t", "name": "clone", "input": {
+            "purpose": "p", "skills": ["website"], "seed_row_ids": [seed]}}, retry_left=False)
+        a = s.add_turn(child, "assistant", "text", "y" * 50000)
+        rows, record = h.fit_join("o", child, "done", [a], None, None)
+        assert rows == [a] and "follow" in record and h.join_fallbacks == []
+        await h.machines.stop()
+
+    asyncio.run(go())
+
+
+def test_window_defaults_per_model(tmp_path, monkeypatch):
+    from graft.providers import context_window, window_tokens_for
+    assert context_window("claude-sonnet-5-5") == 1_000_000
+    assert context_window("anthropic.claude-opus-5-5") == 1_000_000
+    assert context_window("claude-haiku-4-5") == 200_000 and context_window("claude-haiku-5-5") == 1_000_000
+    assert context_window("gpt-5-mini") is None and context_window(None) is None
+    monkeypatch.delenv("GRAFT_WINDOW_TOKENS", raising=False)
+    fp = FakeProvider(_no_compact_policy)
+    assert window_tokens_for(fp) is None  # unknown model: off
+    fp.model = "claude-sonnet-5-5"
+    store = Store(str(tmp_path / "m.db"))
+    assert Harness(store, fp).window_tokens == 1_000_000  # on by default for a known model
+    monkeypatch.setenv("GRAFT_WINDOW_TOKENS", "5000")
+    assert Harness(store, fp).window_tokens == 5000
+    monkeypatch.setenv("GRAFT_WINDOW_TOKENS", "0")
+    assert Harness(store, fp).window_tokens is None
+    assert Harness(store, fp, window_tokens=123).window_tokens == 123  # explicit wins
+
+
+def _always_fails_policy(system, messages, tools):
+    """The original clones for every message unless told a clone already failed; the clone
+    loops on a tool until its step budget runs out (join failed)."""
+    names = {t["name"] for t in tools}
+    last = messages[-1]["content"]
+    if "clone" in names:
+        if any(b["type"] == "tool_result" and "already failed" in str(b["content"]) for b in last):
+            return [{"type": "text", "text": "Sorry, I could not build that."}]
+        user = [b["text"] for m in messages if m["role"] == "user" for b in m["content"] if b["type"] == "text"][-1]
+        return [{"type": "tool_use", "id": f"c{len(messages)}", "name": "clone",
+                 "input": {"purpose": "p", "skills": ["website"], "seed_quotes": [user]}}]
+    return [{"type": "tool_use", "id": f"r{len(messages)}", "name": "site_read", "input": {"page": "home"}}]
+
+
+def test_failed_clone_is_not_recloned_for_the_same_message(tmp_path):
+    store = Store(str(tmp_path / "f.db"))
+    install(store)
+    h = Harness(store, FakeProvider(_always_fails_policy), seeder=None)
+
+    async def go():
+        await h.start()
+        out = await h.user_says("Build my site.")
+        assert out == ["Sorry, I could not build that."]
+        assert [t for t in h.machines.timelines if t != "o"] == ["c1"]  # cloned once, not again
+        assert store.timeline("c1")["join_reason"] == "failed"
+        assert store.running_leaf() == "o"
+        out = await h.user_says("Try a different page.")  # a new message may clone again
+        assert "c2" in h.machines.timelines
+        await h.machines.stop()
+
+    asyncio.run(go())
+
+
+def test_a_request_that_bounces_back_twice_is_not_recloned(harness):
+    h = harness
+
+    async def go():
+        await h.start()
+        s = h.store
+        trig = s.add_turn("o", "user", "text", "Make a site.")
+        c1, _ = await h.clone_once("o", {"id": "a", "name": "clone", "input": {
+            "purpose": "p", "skills": ["website"], "seed_row_ids": [trig]}}, retry_left=False)
+        s.add_turn(c1, "assistant", "text", "Hm.")
+        s.add_turn(c1, "user", "text", "Make a site.")  # stands in for the same request coming back
+        s.set_join(c1, "out_of_scope", trig)
+        await h.machines.join(c1)
+        h.default_join("o", c1, "out_of_scope", trig)
+        await h.machines.finish_join("o", True)
+        h.join_arrivals[("o", trig)] = 1  # first arrival, recorded as do_join would
+        assert h.clone_blocked("o", 0) is None
+        s.add_turn("o", "assistant", "tool_use", {"id": "b", "input": {}}, "clone")
+        s.add_turn("o", "user", "tool_result", {"tool_use_id": "b", "content": "ok"}, "clone")
+        c2, _ = await h.clone_once("o", {"id": "b", "name": "clone", "input": {
+            "purpose": "p", "skills": ["website"], "seed_row_ids": [trig]}}, retry_left=False)
+        h.provider.policy = lambda *a: [{"type": "text", "text": "I could not do that."}]
+        await h.do_join(c2, "out_of_scope")  # the same request comes back a second time
+        assert h.reclone_block.get("o") == trig and h.clone_blocked("o", 0)
+        await h.machines.stop()
+
+    asyncio.run(go())

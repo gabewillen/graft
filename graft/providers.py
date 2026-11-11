@@ -23,6 +23,30 @@ ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-5-5"
 # Preference order for OpenAI; the first id that the Models API lists wins.
 OPENAI_PREFERENCE = ("gpt-5.4-mini", "gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini")
 
+# Context windows (input tokens) by model id prefix, longest prefix wins. Source: the Claude
+# API model table (2026-11). Models not listed have no known window: joins are not size-checked.
+CONTEXT_WINDOWS = {
+    "claude-fable-5": 1_000_000, "claude-mythos-5": 1_000_000,
+    "claude-opus-5": 1_000_000, "claude-opus-4-8": 1_000_000, "claude-opus-4-7": 1_000_000,
+    "claude-opus-4-6": 1_000_000, "claude-sonnet-5": 1_000_000, "claude-sonnet-4-6": 1_000_000,
+    "claude-haiku-5": 1_000_000, "claude-haiku-4-5": 200_000,
+}
+
+
+def context_window(model: str | None) -> int | None:
+    """Known context window for a model id (Bedrock 'anthropic.' prefix allowed), else None."""
+    mid = (model or "").removeprefix("anthropic.")
+    hits = [k for k in CONTEXT_WINDOWS if mid.startswith(k)]
+    return CONTEXT_WINDOWS[max(hits, key=len)] if hits else None
+
+
+def window_tokens_for(provider) -> int | None:
+    """GRAFT_WINDOW_TOKENS overrides (0 = off); otherwise the provider model's known window."""
+    env = os.environ.get("GRAFT_WINDOW_TOKENS")
+    if env is not None and env.strip():
+        return int(env) or None
+    return context_window(getattr(provider, "model", None))
+
 
 class Provider(Protocol):
     name: str

@@ -390,6 +390,9 @@ def main() -> int:
     ap.add_argument("--cache-scope", choices=("run", "global"), default="run")
     ap.add_argument("--compact-tokens", type=int, default=None,
                     help="override every scenario's compaction threshold (estimated tokens); 0 = off")
+    ap.add_argument("--window-tokens", type=int, default=None,
+                    help="model window for the join size check (sets GRAFT_WINDOW_TOKENS); "
+                         "default: the model's known window; 0 = off")
     ap.add_argument("--out", default=None, help="write per-run records as JSON")
     ap.add_argument("--seeder", choices=("model", "jev"), default=None,
                     help="clone seed actor (sets GRAFT_SEEDER; jev needs TYPESAFE_API_KEY)")
@@ -400,6 +403,8 @@ def main() -> int:
     a = ap.parse_args()
     if a.seeder:
         os.environ["GRAFT_SEEDER"] = a.seeder
+    if a.window_tokens is not None:
+        os.environ["GRAFT_WINDOW_TOKENS"] = str(a.window_tokens)
     for what, pairs in (("EFFORT", a.effort), ("MODEL", a.model)):
         for kv in pairs:
             site, _, val = kv.partition("=")

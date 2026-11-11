@@ -142,23 +142,18 @@ Two built-in skills define the architecture itself:
 
 | Skill | Linked to | Provides |
 |---|---|---|
-| **clone** | original (and clones, once nesting is enabled) | Routing rules and the `clone` call (choose skills and seed rows). |
+| **clone** | the original only | Routing rules and the `clone` call (choose skills and seed rows). |
 | **join** | every clone, never the original | Instructions for when to end: done, out of scope, or failed. Using it raises the join event. |
 
 The original has only `clone`. It converses, routes and clones; every other capability requires a clone.
 
 ### Depth
 
-**v1 is depth 1:** only the original clones. Clones are linked to `join` but not `clone`, so the chain is at most `original → c7`.
+**Grafts are one level deep:** only the original clones. Clones are linked to `join` but never `clone`, so the chain is at most `original → c7`.
 
-**Nesting is a planned extension, and v1 must not preclude it.** The intended rule: a clone linked to `clone` may clone itself, and its child's skills must be a subset of its own (capability only narrows down the chain). Enabling it should require only linking `clone` to clones and adding the subset check, not a rewrite. Implementation constraints for v1:
+**Nesting was tried and removed; it does not fit grafting.** Letting clones clone was implemented (strict skill narrowing, per-timeline context budgets, and rollup of out-of-scope joins past levels that lacked the skills), evaluated, and removed. A graft hands one continuous conversation to a clone that holds the whole task; splitting that task into sub-clones breaks the continuity grafting exists to keep. In the evals, models left to choose never nested. When pushed to (`clone` linked automatically to multi-skill clones), quality fell: `nested_project` 5/20 against 19/20 without nesting, `multi_part` 2/10 against 10/10, at 22–78% more cost. Part clones lost context, handed back parts they held, and sources waited on the user between parts. Records: `experiments/results/nesting-*`.
 
-- `timelines.source_id` is a real parent pointer, and nothing assumes the source is the original.
-- Cloning and joining are written against "this timeline and its source", never against "the original" by name or special case.
-- The per-timeline state machine (`active → cloned → joining → active`, `active → joined`) is the same for every timeline; the original is just a timeline with no source and no `join` skill.
-- Read access is defined as "descendants of this timeline" (a recursive query over `source_id`), even though v1 descendants are one level deep.
-- "Which timeline talks to the user" is computed as the deepest active leaf, not hard-coded to the clone.
-- Skill linking goes through one check function, so the subset rule is added in one place.
+**Re-cloning is bounded.** A request that comes back to the original from a failed clone, or comes back out of scope a second time, is not cloned for again; the original answers the user. Within one turn, the original gets one retry after a refused clone call.
 
 ## Lifecycle
 
@@ -222,11 +217,11 @@ source:  active ──clone commit──▶ cloned ──child joins──▶ jo
 clone:   active ──join skill──▶ joined (frozen)
 ```
 
-**Invariant: exactly one timeline is running at any moment, at any depth**, meaning in `active` or `joining`. Every other timeline is `cloned` (suspended) or `joined` (frozen). A join hands the single running slot from the clone straight to its source. The harness enforces this as a single global state, not per source.
+**Invariant: exactly one timeline is running at any moment**, meaning in `active` or `joining`. Every other timeline is `cloned` (suspended) or `joined` (frozen). A join hands the single running slot from the clone straight to its source. The harness enforces this as a single global state, not per source.
 
 **Shared resources follow from this.** With one active timeline, there are never concurrent writers to external state, so v1 has no ownership or locking model. Continuity across clones (c7 books an appointment, c8 later reschedules it) comes only through the seed: the source points c8 at the joined rows that record c7's actions, or c8 inspects the external state itself.
 
-**A source has at most one clone at a time.** Multi-part requests ("book the dentist and pay the invoice") run sequentially: clone, join, clone, join. Because each source has a single child, the system is always a single path with exactly one leaf talking to the user: `original → c7` in v1, `original → c7 → c12` once nesting is enabled. Parallel work is a non-goal for now; it could later return as *background clones* that never talk to the user.
+**A source has at most one clone at a time.** Multi-part requests ("book the dentist and pay the invoice") run sequentially: clone, join, clone, join. Because the original has a single child at a time, exactly one timeline talks to the user: the original, or its live clone (`original → c7`). Parallel work is a non-goal for now; it could later return as *background clones* that never talk to the user.
 
 ### Single use
 
@@ -289,7 +284,7 @@ What appears new as a whole: single-use clones that take over the user conversat
 ## Open Questions
 
 1. **API verification.** Can spliced `thinking` blocks keep valid signatures? Do historical `tool_use` blocks require those tools to be declared on the source? If either fails, joins drop thinking blocks or declare the tools disabled.
-2. **Nesting limits** (future). When nesting is enabled: strict-subset skills (depth bounded by skill count, no clean-context re-clones) or subset-or-equal plus an explicit depth/token budget.
+2. **Join size** (implemented as a backstop). When the harness knows the model window (`window_tokens`), a join must leave the source's working view under 85% of it (the estimate is characters ÷ 4, and the reply needs room). The check runs at join time, not after compaction: compaction's own request carries the whole prefix, so it cannot rescue a view that is already over the window. The first of these that fits is committed: (0) every remembered row; (1) the clone's last assistant reply, then the trigger; (2) the trigger only. The join record says which rows were left out. They stay in the clone's frozen timeline, reachable by pointer. The window defaults per model (`providers.CONTEXT_WINDOWS`, by model-id prefix); `GRAFT_WINDOW_TOKENS` or bench `--window-tokens` overrides it (0 = off), and models with no known window are not checked.
 
 ## Validation Experiments
 

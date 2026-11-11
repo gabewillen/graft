@@ -1,0 +1,35 @@
+bench: scenarios=['nested_project'] arms=['graft', 'graft_nested'] n=20 parallel=6 fake=False cache_scope=run wall=339s
+
+================ BENCH SUMMARY ================
+effective input = uncached + 0.1 x cached + 1.25 x cache writes; effective total = effective input + 4 x output (ASSUMED multipliers, in full-price input-token units; set GRAFT_CACHED_READ_MULT / GRAFT_CACHE_WRITE_MULT / GRAFT_OUTPUT_MULT); cost n/a (set GRAFT_PRICE_IN_PER_M and GRAFT_PRICE_OUT_PER_M)
+  scenario        arm           pass   eff. total    $ / run            latency s    calls       handoffs   ctx-pass out  compactions
+  nested_project  graft         19/20  23012 ± 4710  0.00249 ± 0.00051  46.4 ± 10.3  25.4 ± 4.5  3.2 ± 0.6  360 ± 134     0.0 ± 0.0  
+  nested_project  graft_nested  5/20   27963 ± 5150  0.00301 ± 0.00057  47.1 ± 9.8   26.9 ± 4.3  4.5 ± 0.8  614 ± 287     0.0 ± 0.0  
+
+per-role means (calls / effective total) by scenario and arm:
+  nested_project   graft     hit rate 40%; parent/original 1.7/1287; handoff/clone-tx 3.5/4020; subagent/clone 20.3/17705
+      clone-call / handoff $ share 17.6%
+      calls: handoff/clone-tx | site=clone_call model=gpt-6-luna effort=low: 35
+      calls: handoff/clone-tx | site=original model=gpt-6-luna effort=low: 34
+      calls: parent/original | site=clone_call model=gpt-6-luna effort=low: 34
+      calls: subagent/clone | site=clone model=gpt-6-luna effort=low: 406
+      clone seeds: 1.7 rows / 70 tokens mean
+  nested_project   graft_nested hit rate 39%; parent/original 1.9/1391; handoff/clone-tx 5.3/7848; subagent/clone 19.7/18724
+      clone-call / handoff $ share 28.1%
+      calls: handoff/clone-tx | site=clone model=gpt-6-luna effort=low: 23
+      calls: handoff/clone-tx | site=clone_call model=gpt-6-luna effort=low: 46
+      calls: handoff/clone-tx | site=original model=gpt-6-luna effort=low: 37
+      calls: parent/original | site=clone_call model=gpt-6-luna effort=low: 33
+      calls: parent/original | site=original model=gpt-6-luna effort=low: 5
+      calls: subagent/clone | site=clone model=gpt-6-luna effort=low: 394
+      clone seeds: 1.7 rows / 86 tokens mean
+
+significance (effective total and pass; two-sided):
+  graft_nested vs graft            nested_project   cost ratio 1.22; Welch t=3.17 df=37.7 p=0.0030; permutation p=0.0028; pass 5/20 vs 19/20 Fisher p=0.0000
+
+failure modes (failed checks and errors per scenario/arm):
+  nested_project   graft     failed checks {'site_says_saturday': 1}; errors {}; joins {'out_of_scope': 45, None: 18, 'done': 2}; silent-done refusals 8; max depth 1; rollups 0; clone refusals 4
+  nested_project   graft_nested failed checks {'deck_for_seniors': 14, 'deck_has_details': 14, 'booked_2026-11-12_09:30': 2, 'site_has_details': 1, 'site_says_saturday': 1}; errors {}; joins {'out_of_scope': 68, None: 21}; silent-done refusals 20; max depth 2; rollups 0; clone refusals 16
+
+total spend this invocation: $0.1100
+records: experiments/results/nesting-on-luna-project.json

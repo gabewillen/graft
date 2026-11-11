@@ -21,17 +21,21 @@ from typing import Callable
 
 from . import callsites, compaction
 from . import seeder as seeder_mod
-from .db import NESTING_ENABLED, Store, render, validate
+from .db import Store, render, validate
 from .machine import Machines
-from .providers import Provider, prefix_nonce
+from .providers import Provider, prefix_nonce, window_tokens_for
 from .skills import BASE_SYSTEM, World, load_skill, skill_listing
 
 CLONE_ATTEMPTS = 2  # the first clone call plus one retry after violations
+# A join must leave the source's working view under this fraction of the model window:
+# estimate_tokens is chars / 4 (rough), and the reply needs room too.
+JOIN_WINDOW_FRACTION = 0.85
 _NONCE_TAG = re.compile(r"^\[conversation [^\]]*\]\s*")
 
 
 def check_skill_link(store: Store, source: str, skills: list[str]) -> list[str]:
-    """The one place skill linking is checked (nesting adds the subset rule here)."""
+    """The one place skill linking is checked. Grafts are one level deep: only the original
+    clones, so `clone` is never linked to a clone."""
     v = []
     known = set(store.skill_names())
     if not skills:
@@ -41,13 +45,8 @@ def check_skill_link(store: Store, source: str, skills: list[str]) -> list[str]:
             v.append(f"unknown skill '{s}'")
         elif s == "join":
             v.append("'join' is linked to every clone automatically; do not select it")
-        elif s == "clone" and not NESTING_ENABLED:
-            v.append("'clone' cannot be linked to a clone in v1 (depth 1)")
-    if store.timeline(source)["source_id"] is not None:  # a clone cloning: capability narrows
-        own = {r["name"] for r in store.skills_for(source)}
-        for s in skills:
-            if s not in own:
-                v.append(f"skill '{s}' is not held by {source} (child skills must be a subset)")
+        elif s == "clone":
+            v.append("'clone' cannot be linked to a clone (only the original clones)")
     return v
 
 
@@ -55,7 +54,8 @@ class Harness:
     def __init__(self, store: Store, provider: Provider, world: World | None = None,
                  trace: Callable[[str], None] | None = None, max_steps: int = 10,
                  persona: str = BASE_SYSTEM, nonce: str | None = None,
-                 compact_tokens: int | None = None, compaction_mode: str = "turns", seeder=...):
+                 compact_tokens: int | None = None, compaction_mode: str = "turns", seeder=...,
+                 window_tokens: int | None = ...):
         self.store = store
         self.persona = persona  # user-provided; identical, verbatim, on every timeline
         self.provider = provider
@@ -82,6 +82,14 @@ class Harness:
         self.compaction_failures: list[str] = []  # timelines whose selection was refused twice
         self.compaction_failure_calls: list[dict] = []  # cost of refused-twice compactions
         self._after_compaction: dict[str, dict] = {}  # tl -> log event awaiting its next model call
+        # Model context window (tokens); None = joins are not size-checked. Default (...): the
+        # GRAFT_WINDOW_TOKENS override, else the provider model's known window (providers.CONTEXT_WINDOWS).
+        self.window_tokens = window_tokens_for(provider) if window_tokens is ... else window_tokens
+        self.join_fallbacks: list[dict] = []  # joins reduced to fit: {clone, tier, before, after}
+        # timeline -> the user message that came back to it failed or twice: no re-clone for it.
+        # Cleared when a new request reaches that timeline (a user message, or another join's trigger).
+        self.reclone_block: dict[str, int] = {}
+        self.join_arrivals: dict[tuple[str, int], int] = {}  # (target, trigger) -> joins that brought it
 
     def complete(self, tag: str, system: str, messages: list[dict], tools: list[dict], **kw) -> list[dict]:
         """Every model call goes through here: applies the run nonce, the usage-role tag, and the
@@ -130,6 +138,7 @@ class Harness:
             raise RuntimeError(f"leaf {leaf} is {self.machines.state(leaf)}, not active")
         start = len(self.out)
         rid = self.store.add_turn(leaf, "user", "text", text)
+        self.reclone_block.pop(leaf, None)  # a new request may clone again
         self.trace(f"[{leaf}] user (row {rid}): {text}")
         await self.run(leaf)
         return self.out[start:]
@@ -293,6 +302,11 @@ class Harness:
                 if retag:
                     retag(f"{self.role(tl)}:clone_tx")
                 others = [(u, "not executed: call clone on its own", True) for u in uses if u is not clone_use]
+                blocked = self.clone_blocked(tl, clone_attempts)
+                if blocked:
+                    self.trace(f"[{tl}] clone not executed: {blocked}")
+                    self._store_results(tl, others + [(clone_use, f"clone not executed: {blocked}", True)])
+                    continue
                 clone_attempts += 1
                 child, text = await self.clone_once(tl, clone_use, retry_left=clone_attempts < CLONE_ATTEMPTS)
                 self._store_results(tl, others + [(clone_use, text, child is None)])
@@ -333,6 +347,18 @@ class Harness:
                 answered = True
         return answered
 
+    def clone_blocked(self, tl: str, attempts: int) -> str | None:
+        """Why a clone call must not run, or None. Bounds re-cloning: the request that woke this
+        timeline came back from a clone that failed, or came back twice; or this message's clone
+        retries are used up. Without this, a source whose clone keeps failing or handing the same
+        request back re-clones it forever."""
+        if tl in self.reclone_block:
+            return ("a clone for this message already failed or handed it back. Do not clone for it "
+                    "again: answer the user yourself, briefly saying what could not be done.")
+        if attempts >= CLONE_ATTEMPTS:
+            return "no clone retries left for this message; answer the user instead."
+        return None
+
     def compute_trigger(self, child: str, reason: str) -> int | None:
         rows = self.store.working_view(child)
         last_user = None
@@ -354,6 +380,12 @@ class Harness:
         trigger = self.compute_trigger(child, reason)
         self.store.set_join(child, reason, trigger)
         src = await self.machines.join(child)  # deterministic, no model call
+        if trigger is not None:  # a request reaches the source: block a re-clone if it failed or bounced
+            n = self.join_arrivals[(src, trigger)] = self.join_arrivals.get((src, trigger), 0) + 1
+            if reason == "failed" or n >= 2:
+                self.reclone_block[src] = trigger
+            else:
+                self.reclone_block.pop(src, None)
         self._mirror()
         self.trace(f"JOIN EVENT {{clone: {child}, reason: {reason}, trigger: {trigger}}} -> {src} joining")
         committed = self.default_join(src, child, reason, trigger)
@@ -377,16 +409,54 @@ class Harness:
             rows.append(trigger)
         return rows, error
 
+    def _join_tail(self, src: str, record: str, rows: list[int], error: str | None,
+                   trigger: int | None) -> list[dict]:
+        """The rows a join appends to src, in order: record, remembered rows, error, trigger."""
+        tail = [self._virtual(src, "user", "text", record)]
+        tail += [self.store.turn(r) for r in rows if trigger is None or r != trigger]
+        if error:
+            tail.append(self._virtual(src, "user", "text", error))
+        if trigger is not None and trigger in rows:
+            tail.append(self.store.turn(trigger))
+        return tail
+
+    def fit_join(self, src: str, child: str, reason: str, rows: list[int], error: str | None,
+                 trigger: int | None) -> tuple[list[int], str]:
+        """Join size check (spec: Open Questions, join size). The joined working view of src must
+        stay under JOIN_WINDOW_FRACTION of the window: compaction cannot rescue an over-window
+        view, since its own request carries the whole prefix. Tiers, first that fits: (0) every
+        remembered row; (1) the clone's last assistant reply + trigger; (2) trigger only. The
+        dropped rows stay in the clone's frozen timeline. Returns (rows to append, record)."""
+        listed = ", ".join(map(str, rows)) or "none"
+        full = (rows, f"(harness note: clone {child} joined, reason={reason}; remembered rows {listed} follow)")
+        if self.window_tokens is None:
+            return full
+        limit = int(self.window_tokens * JOIN_WINDOW_FRACTION)
+        base = self.store.working_view(src)
+        trig = [trigger] if trigger is not None and trigger in rows else []
+        last = next((r for r in reversed(rows) if r != trigger and self.store.turn(r)["role"] == "assistant"), None)
+        frozen = (f"(harness note: clone {child} joined, reason={reason}; its rows {listed} are too large "
+                  f"for this context, so only {{kept}} follow; the rest stay in {child}'s frozen timeline)")
+        tiers = [full]
+        if last is not None:
+            tiers.append(([last] + trig, frozen.format(kept=f"its last reply (row {last})"
+                                                       + (" and the trigger" if trig else ""))))
+        tiers.append((trig, frozen.format(kept="the trigger" if trig else "this note")))
+        before = compaction.estimate_tokens(render(base + self._join_tail(src, full[1], rows, error, trigger)))
+        for tier, (kept, record) in enumerate(tiers):
+            size = compaction.estimate_tokens(render(base + self._join_tail(src, record, kept, error, trigger)))
+            if size <= limit or tier == len(tiers) - 1:
+                if tier:
+                    self.join_fallbacks.append({"clone": child, "tier": tier, "before": before, "after": size})
+                    self.trace(f"[{src}] join of {child} is about {before} tokens, over {limit}: "
+                               f"tier {tier} keeps rows {kept} ({size} tokens)")
+                return kept, record
+        raise AssertionError("unreachable")
+
     def default_join(self, src: str, child: str, reason: str, trigger: int | None) -> bool:
         rows, error = self.default_join_rows(src, child, reason, trigger)
-        record = (f"(harness note: clone {child} joined, reason={reason}; remembered rows "
-                  f"{', '.join(map(str, rows)) or 'none'} follow)")
-        pending = self.store.view(src) + [self._virtual(src, "user", "text", record)]
-        pending += [self.store.turn(r) for r in rows if trigger is None or r != trigger]
-        if error:
-            pending.append(self._virtual(src, "user", "text", error))
-        if trigger is not None and trigger in rows:
-            pending.append(self.store.turn(trigger))
+        rows, record = self.fit_join(src, child, reason, rows, error, trigger)
+        pending = self.store.view(src) + self._join_tail(src, record, rows, error, trigger)
         trig = trigger if trigger is not None and trigger not in self.store.pointed(src) else None
         v = validate(pending, src, trigger=trig, require_user_end=trig is not None)
         tx = self.store.begin_tx(src, "join", target=child)
