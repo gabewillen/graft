@@ -23,4 +23,9 @@ async def run_script(h: Harness, steps: list[Step], echo: bool = True) -> list[t
             transcript.append(("assistant", reply))
             if echo:
                 print(f"ASSISTANT: {reply}")
+    settle = getattr(h, "settle", None)  # graft harness: let background clones join before scoring
+    for reply in (await settle()) if settle else []:
+        transcript.append(("assistant", reply))
+        if echo:
+            print(f"ASSISTANT: {reply}")
     return transcript

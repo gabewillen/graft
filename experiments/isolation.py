@@ -51,7 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from graft import cachestats  # noqa: E402
-from graft.db import Store, render  # noqa: E402
+from graft.db import Graft, Store, render  # noqa: E402
 from graft.harness import Harness  # noqa: E402
 from graft.providers import FakeProvider, add_usage, empty_usage, make_provider, prefix_nonce  # noqa: E402
 from graft.skills import (BASE_SYSTEM, LOAD_SKILL_TOOL, World, install, load_skill,  # noqa: E402
@@ -130,7 +130,7 @@ def build(path: str, provider):
     build_history(store, "o")
     task_row = store.add_turn("o", "user", "text", TASK)
     # clone arm: graft clone seeded only with the task-relevant user row
-    store.commit_clone("o", "c1", [task_row], ["slides", "join"])
+    store.commit_clone("o", [Graft(child="c1", seed=[task_row], skills=["slides", "join"], focus=True)])
     # shared arm: one timeline with every capability skill linked and the same history
     store.create_timeline("shared", None, CAPABILITY)
     for r in store.view("o"):

@@ -20,7 +20,7 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS skills(
@@ -81,7 +81,6 @@ CREATE TRIGGER IF NOT EXISTS context_no_delete BEFORE DELETE ON context
 """
 
 TURN_COLS = "row_id, owner_timeline, role, kind, tool_name, content, tokens, ts"
-BUILTIN_SKILLS = ("clone", "join")
 
 
 @dataclass
@@ -90,6 +89,16 @@ class Skill:
     description: str
     instructions: str
     tools: list[dict]  # {"name", "description", "input_schema"}
+
+
+@dataclass
+class Graft:
+    """One entry of a committed clone call: the new timeline, its seed pointers and skills.
+    A focus graft takes the conversation; the others run in the background."""
+    child: str
+    seed: list[int]
+    skills: list[str]
+    focus: bool = True
 
 
 class Store:
@@ -142,10 +151,11 @@ class Store:
         return out
 
     # ---------- timelines ----------
-    def create_timeline(self, tl: str, source: str | None, skills: Iterable[str]) -> None:
+    def create_timeline(self, tl: str, source: str | None, skills: Iterable[str],
+                        status: str = "active") -> None:
         self.con.execute(
             "INSERT INTO timelines(timeline_id, source_id, status, created_at) VALUES (?,?,?,?)",
-            (tl, source, "active", time.time()),
+            (tl, source, status, time.time()),
         )
         self._link(tl, skills)
 
@@ -167,9 +177,10 @@ class Store:
             "UPDATE timelines SET join_reason=?, join_trigger=? WHERE timeline_id=?",
             (reason, trigger, tl))
 
-    def next_clone_id(self) -> str:
-        n = self.con.execute("SELECT count(*) FROM timelines").fetchone()[0]
-        return f"c{n}"
+    def next_clone_ids(self, n: int) -> list[str]:
+        """Distinct ids for the n grafts of one clone call (none is committed yet)."""
+        first = self.con.execute("SELECT count(*) FROM timelines").fetchone()[0]
+        return [f"c{first + i}" for i in range(n)]
 
     def children(self, tl: str) -> list[str]:
         return [r[0] for r in self.con.execute(
@@ -188,10 +199,13 @@ class Store:
         ).fetchone()[0]
 
     def running_leaf(self) -> str:
-        """Deepest non-joined leaf, walking down from the root (never hard-coded)."""
+        """The branch holding the conversation: the deepest live focus graft, walking down from
+        the root (never hard-coded). Joined grafts and background grafts (running, or `queued`
+        with their join waiting) are skipped."""
         cur = self.root()
         while True:
-            nxt = [c for c in self.children(cur) if self.timeline(c)["status"] != "joined"]
+            nxt = [c for c in self.children(cur)
+                   if self.timeline(c)["status"] not in ("joined", "background", "queued")]
             if not nxt:
                 return cur
             cur = nxt[-1]
@@ -288,18 +302,24 @@ class Store:
             "INSERT INTO transactions(timeline_id, kind, status, target) VALUES (?,?,?,?)",
             (tl, kind, "open", target)).lastrowid
 
+    def tx_status(self, tx_id: int) -> str:
+        return self.con.execute("SELECT status FROM transactions WHERE tx_id=?", (tx_id,)).fetchone()[0]
+
     def end_tx(self, tx_id: int, status: str, committed_sql: str | None, scratch: Any) -> None:
         self.con.execute(
             "UPDATE transactions SET status=?, committed_sql=?, scratch=? WHERE tx_id=?",
             (status, committed_sql, json.dumps(scratch, default=str), tx_id))
 
-    def commit_clone(self, source: str, child: str, seed: list[int], skills: list[str]) -> None:
-        """One SQL transaction: timelines row, seed pointers, timeline_skills links."""
+    def commit_clone(self, source: str, grafts: Sequence[Graft]) -> None:
+        """One SQL transaction for the whole clone call: every graft's timelines row, seed
+        pointers and timeline_skills links, or none of them."""
         self.con.execute("BEGIN")
         try:
-            self.create_timeline(child, source, skills)
-            for rid in seed:
-                self.append(child, rid)
+            for g in grafts:
+                self.create_timeline(g.child, source, g.skills,
+                                     status="active" if g.focus else "background")
+                for rid in g.seed:
+                    self.append(g.child, rid)
             self.con.execute("COMMIT")
         except Exception:
             self.con.execute("ROLLBACK")

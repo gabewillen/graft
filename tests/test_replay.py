@@ -300,3 +300,38 @@ def test_worktree_diff_includes_submodule_changes(tmp_path):
         assert "lib/a.py" in worktree.diff_files(w.diff())
     finally:
         w.remove()
+
+
+def test_arm_g_clones_runs_and_joins_offline(tmp_path, monkeypatch):
+    """The graft arm of the replay, with a scripted provider and a fake seeder: one focus clone
+    for the recorded subtask, run to the end of its turn, joined `done` by the harness."""
+    import asyncio
+
+    from graft import seeder as sd
+    from graft.providers import FakeProvider
+    from replay import run as replay_run
+
+    class Seeder:
+        name = "fake"
+
+        async def score(self, purpose, cands, trigger):
+            assert "Audit parser" in purpose
+            return sd.SeedDecision(scores={c["row_id"]: 0.9 for c in cands}, model="fake-1", requests=1,
+                                   input_tokens=50)
+
+    def policy(system, messages, tools):
+        assert "clone" not in {t["name"] for t in tools}  # only the clone is ever called
+        return [{"type": "text", "text": "Report: parse_token lacks bounds checks."}]
+
+    monkeypatch.setattr(replay_run, "OpenAIProvider", lambda model: FakeProvider(policy))
+    monkeypatch.setattr(replay_run, "JevSeeder", Seeder)
+    e = loader.load_event(FIX)
+    (tmp_path / "repo").mkdir()
+    sb = sandbox.Sandbox(str(tmp_path / "repo"))
+    res = asyncio.run(replay_run.arm_g(e, sb, max_steps=4, workdir=str(tmp_path)))
+    assert res["clone"] == "c1" and res["clone_text"].startswith("cloned -> c1 (focus, active")
+    assert res["forced_join"] is True  # the clone answered and stopped: no live user, so the harness joins it
+    assert res["returned"] == "Report: parse_token lacks bounds checks." and res["joined_rows"] == 1
+    assert res["seed_rows"] == 3 and res["candidates"] == 3 and res["seeder"]["fallback"] is None
+    assert res["usage"]["calls"] == 1 and res["by_model"]["fake-1"]["input"] == 50
+    assert res["parent_messages"][-1]["role"] == "assistant"

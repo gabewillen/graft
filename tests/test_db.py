@@ -3,7 +3,7 @@ import sqlite3
 
 import pytest
 
-from graft.db import Store, render, validate
+from graft.db import Graft, Store, render, validate
 from graft.skills import install
 
 
@@ -40,7 +40,7 @@ def test_turns_and_context_are_append_only(store):
 
 def test_pointer_dedup_and_stored_once(store):
     rid = store.add_turn("o", "user", "text", "hi")
-    store.commit_clone("o", "c1", [rid], ["website", "join"])
+    store.commit_clone("o", [Graft(child="c1", seed=[rid], skills=["website", "join"], focus=True)])
     assert store.append("c1", rid) is None  # already pointed: skipped
     assert [r["row_id"] for r in store.view("c1")] == [rid]
     assert store.con.execute("SELECT count(*) FROM turns").fetchone()[0] == 1
@@ -88,7 +88,7 @@ def test_trigger_must_be_last():
 def test_running_leaf_and_descendants(store):
     rid = store.add_turn("o", "user", "text", "hi")
     assert store.running_leaf() == "o"
-    store.commit_clone("o", "c1", [rid], ["website", "join"])
+    store.commit_clone("o", [Graft(child="c1", seed=[rid], skills=["website", "join"], focus=True)])
     assert store.running_leaf() == "c1"
     assert store.descendants("o") == ["c1"] and store.descendants("c1") == []
     store.set_status("c1", "joined")
@@ -97,6 +97,6 @@ def test_running_leaf_and_descendants(store):
 
 def test_tools_only_through_skills(store):
     rid = store.add_turn("o", "user", "text", "hi")
-    store.commit_clone("o", "c1", [rid], ["website", "join"])
+    store.commit_clone("o", [Graft(child="c1", seed=[rid], skills=["website", "join"], focus=True)])
     assert {t["name"] for t in store.tools_for("c1")} == {"site_write", "site_read", "join", "load_skill"}
     assert "site_write" not in {t["name"] for t in store.tools_for("o")}

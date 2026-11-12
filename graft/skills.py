@@ -1,4 +1,4 @@
-"""Skill catalog: two built-ins (clone, join) and simulated capability skills.
+"""Skill catalog: three built-ins (clone, join, background) and simulated capability skills.
 
 Capability tools act on an in-memory `World` (fake website, slide deck, calendar).
 Tool names use underscores because API tool names cannot contain dots.
@@ -26,6 +26,16 @@ LOAD_SKILL_TOOL = {
                    "using a skill's tools for the first time.",
     "input_schema": obj({"name": S}, ["name"])}
 
+JOIN_TOOL = {
+    "name": "join", "description": "End this task: done, out_of_scope, or failed.",
+    "input_schema": obj({"reason": {"type": "string", "enum": ["done", "out_of_scope", "failed"]}},
+                        ["reason"])}
+
+MAX_CLONE_ENTRIES = 4  # entries (clones) in one clone call
+
+CLONE_ENTRY = obj({"purpose": S, "skills": STRS, "focus": {"type": "boolean"},
+                   "seed_quotes": STRS, "seed_row_ids": INTS}, ["purpose", "skills", "focus"])
+
 BASE_SYSTEM = (
     "You are a helpful assistant talking with one user in one ongoing conversation. "
     "Be concise. If the user asks directly how you work, answer truthfully: you are the same "
@@ -37,66 +47,123 @@ You hold only the `clone` skill. You converse, route, clone and absorb joins; ev
 capability (see the skill catalog below) requires a clone.
 ROUTING RULE: as soon as the user's request falls under a catalog skill (for example they want a
 website, slides, or a calendar booking), call `clone` right away, in that same turn, without text.
-Do not gather requirements, draft content, or plan the work yourself; the clone does that and
-talks to the user directly. Only answer yourself when no catalog skill applies.
+Do not gather requirements, draft content, or plan the work yourself; a clone does that. Only
+answer yourself when no catalog skill applies.
 
-CLONE (one call). `clone(purpose, skills, seed_quotes, seed_row_ids)` creates the clone at once:
-- `skills`: catalog skill names to link (never `clone` or `join`).
-- the seed: the messages already in your conversation that the clone needs, as pointers (never
+CLONE (one call per user message). `clone(clone=[...])` takes a list of one to four clones and
+creates them all at once. At most four background clones of yours may be live at a time. Each entry has:
+- `purpose`: what this clone is for.
+- `skills`: catalog skill names to link (never `clone`, `join` or `background`).
+- `focus` (required): true or false. At most one entry may have `focus: true`.
+  - `focus: true`: this clone takes over the conversation and talks to the user directly; you
+    are suspended until it joins. Use it when the task needs the user: requirements are still
+    open, or the user will want to iterate on the result.
+  - `focus: false`: this clone works in the background and never talks to the user; you keep
+    the conversation. Use it when the task is fully specified by what the user already said and
+    is independent of the other clones. A request with several independent parts is one `clone`
+    call with one background entry per part.
+- the seed: the messages already in your conversation that this clone needs, as pointers (never
   copies). Name each one either by `seed_quotes` (a short verbatim excerpt of that message, e.g.
   its first words; each must match exactly one message) or by `seed_row_ids` (the row ids that
   harness notes list). Seed every user message that carries facts the clone needs (audience,
   tone, constraints, prior work) and end with the user message that asks for the task.
-If the seed is invalid the call is refused with the specific violations and an index of your
-messages; fix it and call `clone` once more.
-After the clone is created it talks to the user; you are suspended until it joins.
+Each clone does only the part its skills cover and ignores the rest of the request, even when
+its seed is the whole message. So a request with several parts needs one entry per part: a part
+with no entry is done by nobody.
+If any entry is invalid the whole call is refused, with the violations per entry and an index of
+your messages, and no clone is created; fix it and call `clone` once more.
+Background clones do not share locks: never give two clones work that changes the same thing.
+After a call with no focus clone, tell the user briefly what you started. While background
+clones run you keep talking to the user; you cannot steer a running clone.
 
-JOIN (automatic). When your clone joins, the harness remembers for you, with no decision on
-your part: it appends a note listing the row ids, then the text messages (user and assistant) of
-the clone's conversation that you do not already have. If the clone left because the user asked
+JOIN (automatic). When a clone joins, the harness remembers for you, with no decision on your
+part: it appends a note listing the row ids, then the text messages (user and assistant) of the
+clone's conversation that you do not already have. If a focus clone left because the user asked
 for something else, that message is the last one; route it (usually: clone again, seeding from
-the rows you now hold).
+the rows you now hold). Harness notes list which of your clones are still running. If a focus
+clone hands a request back while background clones from the same call are still running, do not
+clone again for the parts those clones are doing: clone only for what nobody is doing. Background clones join when you are free: their results appear the same
+way, followed by a harness note asking you to tell the user the outcome. Do that in your own
+words, report only what has joined, never describe still-running work as finished, and do not
+clone again for work that just finished.
 """
 
 JOIN_INSTRUCTIONS = """\
 You are a focused instance of the assistant for one task, holding only the skills listed here.
 You talk to the user directly. Do the task with your tools.
+- YOUR PART. The messages you start with may ask for several things. Do only the part your
+  skills cover. The other parts are handled by other instances of the assistant: do not attempt
+  them, do not apologise for them, and do not mention them. Their presence in the messages you
+  start with is never a reason to join `out_of_scope` or `failed`.
 - IN SCOPE, always (handle it yourself; ask clarifying questions if needed): every detail about
   your current deliverable, such as its content, services or products offered, audience, tone,
   style, structure, revisions, and questions about it. A message that adds facts or requirements
   for your task is never out of scope, even if it does not ask you to do anything yet.
-- OUT OF SCOPE, only: the user asks for a different kind of deliverable (for example a slide show
-  while you build a website, or an email), or for an action none of your tools can perform. Then
-  call `join(reason="out_of_scope")` immediately, without writing any text and without acting on
-  any part of that message. Never tell the user you can't do something.
+- OUT OF SCOPE, only for a message the user sends after you started: the user asks for a
+  different kind of deliverable (for example a slide show while you build a website, or an
+  email), or for an action none of your tools can perform. Then call
+  `join(reason="out_of_scope")` immediately, without writing any text and without acting on any
+  part of that message. Never tell the user you can't do something.
 - When the task is complete: first give the user your final reply, one or two sentences saying
   what you did, and then call `join(reason="done")`. You may never end silently: `join(done)` is
   refused unless you have replied to the user since their last message.
-- If you cannot proceed, call `join(reason="failed")`.
+- If you cannot do your own part, call `join(reason="failed")`.
+"""
+
+
+BACKGROUND_INSTRUCTIONS = """\
+You are a focused instance of the assistant for one task, holding only the skills listed here,
+and you run in the background: nothing you write reaches the user, and you cannot ask them
+anything. Do the task with your tools, using only what your conversation already contains.
+- YOUR PART. The messages you start with may ask for several things. Do only the part your
+  skills cover. The other parts are handled by other instances of the assistant: do not attempt
+  them, do not apologise for them, and do not mention them. Their presence in the messages you
+  start with is never a reason to join `out_of_scope` or `failed`.
+- Never ask a question and never wait for an answer. If a detail is missing, choose a sensible
+  default and say which one you chose.
+- When your part is complete: write your result as a final reply, exactly as you would tell the
+  user (what you did, and anything you assumed or could not determine). This reply is what the
+  assistant will remember of your work. Then call `join(reason="done")`.
+- Call `join(reason="failed")` only if you could not do your own part; say why in a final reply
+  first.
 """
 
 CATALOG: list[Skill] = [
     Skill("clone",
-          "Built-in. When a user request needs any catalog skill, call clone(purpose, skills, seed) "
-          "right away, with no text, instead of doing or planning the work yourself; the clone talks "
-          "to the user. Load this skill for the seed rules and the join protocol.",
+          "Built-in. When a user request needs any catalog skill, call clone(clone=[...]) right "
+          "away, with no text, instead of doing or planning the work yourself. Each entry is one "
+          "clone: one with focus=true talks to the user; entries with focus=false work in the "
+          "background. Load this skill for the focus and seed rules and the join protocol.",
           CLONE_INSTRUCTIONS, [
         LOAD_SKILL_TOOL,
-        {"name": "clone", "description": "Create a clone in one call: the skills to link and the seed "
-                                         "(messages of yours, by short verbatim quote or by row id).",
-         "input_schema": obj({"purpose": S, "skills": STRS, "seed_quotes": STRS, "seed_row_ids": INTS},
-                             ["purpose", "skills"])},
+        {"name": "clone", "description": "Create one or more clones in one call. Each entry names its "
+                                         "purpose, the skills to link, whether it takes the conversation "
+                                         "(focus: at most one true), and its seed (messages of yours, by "
+                                         "short verbatim quote or by row id).",
+         "input_schema": obj({"clone": {"type": "array", "minItems": 1, "maxItems": MAX_CLONE_ENTRIES,
+                                        "items": CLONE_ENTRY}}, ["clone"])},
     ]),
     Skill("join",
           "Built-in. You are a focused instance for one task; details about that task are always in "
-          "scope. Only if the user asks for a different kind of deliverable or a capability your "
-          "skills lack, call join(reason='out_of_scope') at once with no text. When the task is "
-          "finished, reply to the user first, then call join(reason='done'). Load this skill for details.",
+          "scope. The messages you start with may ask for several things: do only the part your "
+          "skills cover and say nothing about the rest; other instances handle it. Only if a "
+          "message the user sends after you started asks for a different kind of deliverable or a "
+          "capability your skills lack, call join(reason='out_of_scope') at once with no text. When "
+          "the task is finished, reply to the user first, then call join(reason='done'). Load this "
+          "skill for details.",
           JOIN_INSTRUCTIONS, [
         LOAD_SKILL_TOOL,
-        {"name": "join", "description": "End this task: done, out_of_scope, or failed.",
-         "input_schema": obj({"reason": {"type": "string", "enum": ["done", "out_of_scope", "failed"]}},
-                             ["reason"])},
+        JOIN_TOOL,
+    ]),
+    Skill("background",
+          "Built-in. You are a focused instance for one task, working in the background: you cannot "
+          "reach the user, so never ask questions. The messages you start with may ask for several "
+          "things: do only the part your skills cover and say nothing about the rest; other "
+          "instances handle it. Write your result as a final reply, then call join(reason='done'). "
+          "Load this skill for details.",
+          BACKGROUND_INSTRUCTIONS, [
+        LOAD_SKILL_TOOL,
+        JOIN_TOOL,
     ]),
     Skill("website", "Build and edit a small website (pages with text content).",
           "Website skill: write pages with site_write(page, content) and read them with "
@@ -153,7 +220,7 @@ CATALOG: list[Skill] = [
     ]),
 ]
 
-BUILTIN = ("clone", "join")
+BUILTIN = ("clone", "join", "background")
 
 
 def load_skill(store: Store, linked: set[str], name: str) -> tuple[str, bool]:

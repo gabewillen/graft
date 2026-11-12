@@ -99,7 +99,11 @@ def prefix_nonce(messages: list[dict], nonce: str | None) -> list[dict]:
 
 
 class UsageMixin:
-    """Thread-safe totals, per-thread counters (concurrent runs), per-tag buckets and a call log.
+    """Thread-safe totals, per-tag buckets and a call log; a per-thread tag, counter and last call.
+
+    The per-thread state belongs to the thread that set it. A caller that runs a call in another
+    thread carries its state over with `thread_state` and `adopt`: the counter dict is then
+    shared between the two threads, and every update to it happens under the instance lock.
 
     Each call is recorded as disjoint buckets: uncached input (full price), cached input reads,
     cache writes, and output. Tags (see `usage_tag`) attribute calls to roles such as the
@@ -135,10 +139,12 @@ class UsageMixin:
             add_usage(self.by_model.setdefault(str(meta.get("model") or getattr(self, "model", "?")),
                                                empty_usage()), call)
             self.call_log.append(entry)
+            # The per-thread counter may be shared with a worker thread (`adopt`), so it is
+            # updated under the same lock as the totals.
+            t = getattr(self._local, "usage", None)
+            if t is not None:
+                add_usage(t, call)
         self._local.last_call = entry
-        t = getattr(self._local, "usage", None)
-        if t is not None:
-            add_usage(t, call)
         return call
 
     def last_call(self) -> dict | None:
@@ -148,7 +154,10 @@ class UsageMixin:
     def retag_last(self, tag: str) -> None:
         """Move this thread's most recent call to another tag (a call's role is sometimes only
         known from its output, e.g. a parent call that turned out to write a handoff)."""
-        entry = getattr(self._local, "last_call", None)
+        self.retag(getattr(self._local, "last_call", None), tag)
+
+    def retag(self, entry: dict | None, tag: str) -> None:
+        """Move one call-log entry to another tag, from any thread."""
         if entry is None or entry["tag"] == tag:
             return
         u = {k: entry[k] for k in USAGE_KEYS}
@@ -158,6 +167,21 @@ class UsageMixin:
                 old[k] -= u[k]
             add_usage(self.by_tag.setdefault(tag, empty_usage()), u)
             entry["tag"] = tag
+
+    def thread_state(self) -> dict:
+        """This thread's tag and usage counter, to carry into a worker thread (`adopt`)."""
+        return {"tag": getattr(self._local, "tag", None), "usage": getattr(self._local, "usage", None)}
+
+    @contextlib.contextmanager
+    def adopt(self, state: dict) -> Iterator[None]:
+        """Run a call in a worker thread as if it ran in the thread `state` came from: same tag,
+        same per-thread usage counter (the dict is shared, so the caller's counter grows)."""
+        prev = (getattr(self._local, "tag", None), getattr(self._local, "usage", None))
+        self._local.tag, self._local.usage, self._local.last_call = state["tag"], state["usage"], None
+        try:
+            yield
+        finally:
+            self._local.tag, self._local.usage = prev
 
     def thread_usage_reset(self) -> dict:
         self._local.usage = empty_usage()

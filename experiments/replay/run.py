@@ -187,12 +187,14 @@ async def arm_g(e, sb: sandbox.Sandbox, max_steps: int, workdir: str) -> dict:
         store.add_turn("o", t.role, "text", t.text)
     store.add_turn("o", "user", "text", subtask_text(e))
     t0 = time.perf_counter()
-    child, text = await h.clone_once("o", {"id": "replay", "name": "clone", "input": {
-        "purpose": f"{e.description}: {e.handoff[:1500]}", "skills": [skill.name]}}, retry_left=False)
+    # one focus graft: the replay hands the recorded subtask to a single clone and joins it back
+    await h.machines.begin_turn("o")  # a clone call belongs to a turn of the source
+    _, child, text = await h.clone_call("o", {"id": "replay", "name": "clone", "input": {"clone": [{
+        "purpose": f"{e.description}: {e.handoff[:1500]}", "skills": [skill.name], "focus": True}]}},
+        retry_left=False)
     forced = False
     if child:
-        await h.run(child)
-        if h.machines.state(child) == "active":  # no live user: end the task if it stopped without joining
+        if await h.run(child) == "ended":  # no live user: end the task if it stopped without joining
             forced = True
             await h.do_join(child, "done")
     lat = time.perf_counter() - t0
@@ -205,7 +207,7 @@ async def arm_g(e, sb: sandbox.Sandbox, max_steps: int, workdir: str) -> dict:
         su = empty_usage()
         su.update(calls=slog.get("requests") or 1, uncached=slog["input_tokens"], input=slog["input_tokens"])
         by_model[slog.get("model") or "jev-1.13.0"] = su
-    await h.machines.stop()
+    await h.close()
     return {"returned": "\n\n".join(r["content"] for r in joined), "latency": lat, "clone": child, "clone_text": text,
             "forced_join": forced, "seed_rows": len(seed), "seed_tokens": sum(len(r["content"]) // 4 for r in seed),
             "candidates": len(slog.get("candidates") or []), "seeder": {k: slog.get(k) for k in

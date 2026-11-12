@@ -11,7 +11,7 @@ The design is written up in [spec.md](spec.md) ("Agent Grafts"). This repository
 ```text
 subagent                                    graft
 --------                                    -----
-parent ── writes handoff prompt ──▶ worker  parent ── clone(purpose, skills) ──▶ clone
+parent ── writes handoff prompt ──▶ worker  parent ── clone([purpose, skills]) ──▶ clone
           (paraphrase of context)                     seed = pointers to the parent's own rows,
                                                       picked by a seeder
 worker works in a fresh context             clone works in its own timeline
@@ -54,7 +54,7 @@ uv run graft dump chat.db            # print every timeline's context and the tr
 
 Inside `chat`, `/dump` prints the store and `/quit` exits. Without a key, `chat` exits with an error naming the missing variable.
 
-The chat agent uses the simulated skills in `graft/skills.py` (`website`, `slides`, `calendar`), so you can watch it clone for a task, hand the conversation to the clone, and join back when you change topic.
+The chat agent uses the simulated skills in `graft/skills.py` (`website`, `slides`, `calendar`), so you can watch it clone for a task, hand the conversation to the clone, and join back when you change topic. Ask for several independent things at once and it can start them as background clones: it keeps talking to you, and tells you the outcome when they join.
 
 To see a full clone/join cycle offline, run the scripted pivot experiment and inspect its store:
 
@@ -85,8 +85,8 @@ Everything is read from environment variables at runtime. Keys are never read fr
 ## Layout
 
 - `graft/db.py`: SQLite schema with append-only `turns` and `context` (enforced by triggers), context views, pointer append with dedup, rendering and validation.
-- `graft/machine.py`: per-timeline lifecycle and the single-running-timeline slot, as [stateforward-hsm](https://pypi.org/project/stateforward-hsm/) state machines.
-- `graft/harness.py`: the agent loop, the one-shot `clone` call, the join event and the deterministic default join.
+- `graft/machine.py`: per-timeline lifecycle (turn, report, suspended, joining; background grafts and their join queue) and the single conversation slot, as [stateforward-hsm](https://pypi.org/project/stateforward-hsm/) state machines.
+- `graft/harness.py`: the agent loop, the one-shot `clone` call (one or more grafts), background grafts and their join queue, the join event and the deterministic default join.
 - `graft/seeder.py`: seed selection (`model` or `jev`).
 - `graft/compaction.py`: turn-based compaction with window provenance, and a summary compaction used by the subagent baseline.
 - `graft/subagent.py`: the subagent baseline (parent writes a handoff, subagent returns a summary).
@@ -97,12 +97,13 @@ Everything is read from environment variables at runtime. Keys are never read fr
 
 ## Experiments
 
-All experiments accept `--fake` (scripted provider, offline) unless noted; without it they call the configured provider.
+All experiments accept `--fake` (scripted provider, offline) unless noted; without it they call the configured provider. `parallel.py` is the reverse: offline unless `--live` is given.
 
 | Script | What it measures |
 |---|---|
 | `experiments/pivot.py` | A user describes a website over several turns, then pivots to a slide show. Checks that the facts reach the slides clone verbatim and the join is deterministic. `--arm graft\|subagent\|both`. |
 | `experiments/isolation.py` | The same slides task as a clone, inside a shared agent with conflicting skills loaded, and as a subagent. Scores compliance and style leakage. `-n 20 --parallel 8` by default. |
+| `experiments/parallel.py` | One multi-part request as sequential clone-join (one focus clone per part) and as one clone call with background grafts. Reports world-state checks, model calls and wall-clock. Offline by default (scripted provider with an artificial per-call delay, which shows the mechanics only); `--live` uses the configured provider. |
 | `experiments/bench.py` | Five scripted scenarios (`pivot`, `revisions`, `failure`, `long_compaction`, `multi_part`) for the graft and subagent arms, with pass rate, tokens by cache bucket, cost, latency and significance tests. Example: `uv run python experiments/bench.py --scenario all --arm both -n 10 --fake`. |
 | `experiments/seed_eval.py` | Offline seed-selection evaluation over stored bench runs (Jev, a model actor, embeddings, Needle 3). Needs stored runs and the relevant keys. |
 | `experiments/api_probe.py` | Whether providers accept historical tool calls for undeclared tools, and spliced Anthropic thinking blocks. Skips providers without keys. |
@@ -124,7 +125,9 @@ These are small samples. They are reported as measured, not as evidence that eit
 
 ## Limitations
 
-- One level deep: only the original clones. Nesting (clones that clone) was implemented, evaluated and removed because it does not fit grafting; see spec: Depth. One clone runs at a time; parallel delegation is out of scope for v1.
+- One level deep: only the original clones. Nesting (clones that clone) was implemented, evaluated and removed because it does not fit grafting; see spec: Depth.
+- Parallel grafts are implemented but only their mechanics are tested, offline. There is no measurement yet of how a real model uses background clones, or of quality and speed against sequential clone-join.
+- Background clones share external state without locking, and a running clone cannot be steered or cancelled; see spec: Parallel grafts.
 - The chat skills are simulated; there is no plugin interface for real tools yet.
 - The Jev seeder depends on a hosted TypeSafe API; without it the parent model picks its own seed.
 - The benchmarks are scripted scenarios and a small number of replayed traces. Results may not transfer to other tasks or models.
@@ -135,9 +138,12 @@ These are small samples. They are reported as measured, not as evidence that eit
 Implementation choices that go beyond, or differ from, the spec:
 
 - **Rendering:** consecutive rows with the same role become one message. Validation runs on those messages: the view starts with a user turn, every `tool_use` has its `tool_result` in the next user turn, tool results come before text in a user turn, the view ends on a user turn, a trigger is the last row, and thinking rows stay in the timeline that produced them.
-- **Clone is one call:** `clone(purpose, skills, seed_quotes, seed_row_ids)`. The harness resolves the seed to pointers, validates and commits; on violations the parent gets them back with one retry. With the Jev seeder, the seed fields are only a fallback.
+- **Clone is one call:** `clone(clone=[{purpose, skills, focus, seed_quotes, seed_row_ids}, ...])`, one entry per clone, at most one with `focus: true`. The harness resolves every seed to pointers, validates, and commits all entries or none; on violations the parent gets them back per entry with one retry. With the Jev seeder, the seed fields are only a fallback.
+- **Background grafts:** entries with `focus: false` run as asyncio tasks, with each model call in a daemon worker thread and all store and world access on the event-loop thread. Only the conversation holder's text is emitted. A finished background graft is `queued`; its join commits only when the state machine accepts a drain (its source holds the conversation and is idle), and the source is then woken once with a closing harness note. The state machine owns the lifecycle, the queue and what is allowed; the harness's conversation lock only serialises user turns and wake runs.
+- **Limits and failure handling:** at most 4 entries per clone call and 4 live background grafts per source. Any error inside clone handling is a refused tool result with the call's transactions rolled back. A failed wake run or join commit is shown to the user at once as a harness error line and raised by `Harness.settle()` (one error, or an `ExceptionGroup`). `Harness.settle()` waits for background grafts and returns what was said meanwhile; `Harness.close()` cancels them (they join `failed`) and stops the machines.
+- **A background graft always joins:** a text-only turn joins it `done`; an empty response, an error or an exhausted step budget joins it `failed`.
 - **Default join is deterministic:** pointers to the text rows of the clone's working view that the parent does not already have; `out_of_scope` ends with the trigger, `failed` adds a harness error record.
-- **No silent `done`:** `join(reason='done')` is refused unless the clone has replied to the user since the last user message.
+- **No silent `done`:** `join(reason='done')` is refused unless the clone has replied since the last user message (a background graft: unless it has written its result).
 - **Progressive disclosure:** a timeline's system prompt lists only the names and descriptions of its linked skills; `load_skill(name)` loads the instructions as ordinary tool rows.
 
 ## License
