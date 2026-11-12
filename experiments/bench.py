@@ -154,7 +154,7 @@ async def run_one(sc: Scenario, arm: str, i: int, fake: bool, compact: int | Non
             "SELECT timeline_id, join_reason FROM timelines WHERE source_id IS NOT NULL ORDER BY created_at")]
         rec["silent_done_refusals"] = len(agent.silent_done_refusals)
         rec["context_out"] = roles.get("handoff/clone-tx", {}).get("output", 0)
-        await agent.machines.stop()
+        await agent.close()
     elif agent is not None:
         rec["handoffs"] = len(agent.delegations)
         rec["delegations"] = [(d.skill, len(d.task_prompt), d.steps) for d in agent.delegations]

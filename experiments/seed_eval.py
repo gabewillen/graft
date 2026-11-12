@@ -83,7 +83,8 @@ def load_event(path: str) -> Event | None:
     own = [r["row_id"] for r in s.view(sl) if r["owner_timeline"] == sl]
     first = min(own) if own else 10 ** 9
     o_wv = [r for r in s.working_view("o") if r["row_id"] < first]
-    cands = [{"row_id": r["row_id"], "role": r["role"], "text": r["content"], "tokens": max(1, len(r["content"]) // 4)}
+    cands = [{"row_id": r["row_id"], "role": r["role"], "text": r["content"], "tokens": max(1, len(r["content"]) // 4),
+              "harness": bool(r["harness"])}
              for r in o_wv if r["kind"] == "text"]
     if not cands:
         return None
@@ -96,11 +97,11 @@ def load_event(path: str) -> Event | None:
             purpose = str(json.loads(tx[0]).get("args", {}).get("purpose", ""))
         except (ValueError, AttributeError):
             purpose = ""
-    users = [c for c in cands if c["role"] == "user" and not c["text"].startswith("(harness note")]
+    users = [c for c in cands if c["role"] == "user" and not c["harness"]]
     trigger = users[-1]["row_id"] if users else cands[-1]["row_id"]
     facts = {}
     for f, pat in SCORED.items():
-        rows = {c["row_id"] for c in cands if not c["text"].startswith("(harness note")
+        rows = {c["row_id"] for c in cands if not c["harness"]
                 and re.search(pat, c["text"], re.I)}
         if rows:
             facts[f] = rows

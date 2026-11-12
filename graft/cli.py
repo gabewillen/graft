@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import sys
 import tempfile
 import threading
 
@@ -61,12 +62,13 @@ async def chat(db_path: str, trace: bool) -> None:
                 print(store.dump())
                 continue
             await h.user_says(text)
+        # Status and errors are diagnostics: stderr. stdout carries the conversation.
         if h.machines.background():
-            print("waiting for background clones to join...")
+            print("waiting for background clones to join...", file=sys.stderr)
         try:
             await h.settle()
         except Exception as e:  # already shown when it happened; do not end on a traceback
-            print(f"error: {type(e).__name__}: {e}")
+            print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
     finally:
         # Also on Ctrl-C (the task is cancelled): running clones are cancelled and joined failed.
         await h.close()

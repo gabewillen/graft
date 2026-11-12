@@ -125,7 +125,7 @@ def score_failure(ctx: RunContext) -> tuple[bool, dict, dict]:
         diag["joins"] = [(r[0], r[1]) for r in s.con.execute(
             "SELECT timeline_id, join_reason FROM timelines WHERE source_id IS NOT NULL ORDER BY created_at")]
         diag["error_record"] = bool(s.con.execute(
-            "SELECT 1 FROM turns WHERE content LIKE '(harness note: clone % failed%'").fetchone())
+            "SELECT 1 FROM turns WHERE harness=1 AND content LIKE '(harness note: clone % failed%'").fetchone())
     return all(checks.values()), checks, diag
 
 

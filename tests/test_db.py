@@ -45,7 +45,9 @@ def test_pointer_dedup_and_stored_once(store):
     assert [r["row_id"] for r in store.view("c1")] == [rid]
     assert store.con.execute("SELECT count(*) FROM turns").fetchone()[0] == 1
     # a join that re-selects a row the source already holds does not duplicate it
-    store.commit_join("o", "[join c1]", [rid])
+    tx = store.begin_tx("o", "join", target="c1")
+    store.commit_join("o", "[join c1]", [rid], error=None, trigger=None, tx=tx, status="committed",
+                      committed_sql=None, scratch=None)
     assert [r["row_id"] for r in store.view("o")].count(rid) == 1
 
 

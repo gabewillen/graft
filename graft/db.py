@@ -45,7 +45,10 @@ CREATE TABLE IF NOT EXISTS turns(
   owner_timeline TEXT NOT NULL REFERENCES timelines,
   role TEXT NOT NULL CHECK(role IN ('user','assistant')),
   kind TEXT NOT NULL CHECK(kind IN ('text','tool_use','tool_result','thinking')),
-  tool_name TEXT, content TEXT NOT NULL, tokens INTEGER, ts REAL NOT NULL);
+  tool_name TEXT, content TEXT NOT NULL, tokens INTEGER, ts REAL NOT NULL,
+  -- 1: written by the harness (join records, error records, wake notes). Set only by the
+  -- harness; a harness row is recognised by this mark, never by what its text says.
+  harness INTEGER NOT NULL DEFAULT 0 CHECK(harness IN (0, 1)));
 
 CREATE TABLE IF NOT EXISTS context(
   timeline_id TEXT NOT NULL REFERENCES timelines, pos INTEGER NOT NULL,
@@ -80,7 +83,7 @@ CREATE TRIGGER IF NOT EXISTS context_no_delete BEFORE DELETE ON context
   BEGIN SELECT RAISE(ABORT, 'context is append-only'); END;
 """
 
-TURN_COLS = "row_id, owner_timeline, role, kind, tool_name, content, tokens, ts"
+TURN_COLS = "row_id, owner_timeline, role, kind, tool_name, content, tokens, ts, harness"
 
 
 @dataclass
@@ -108,6 +111,10 @@ class Store:
         self.con.row_factory = sqlite3.Row
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.execute("PRAGMA foreign_keys=ON")
+        columns = [r[1] for r in self.con.execute("PRAGMA table_info(turns)")]
+        if columns and "harness" not in columns:
+            raise RuntimeError(f"{path} was written by an older graft: its turns carry no harness mark, so "
+                               "harness notes cannot be told from user messages. Re-run to produce a new store.")
         self.con.executescript(SCHEMA)
 
     # ---------- skills ----------
@@ -200,24 +207,24 @@ class Store:
 
     def running_leaf(self) -> str:
         """The branch holding the conversation: the deepest live focus graft, walking down from
-        the root (never hard-coded). Joined grafts and background grafts (running, or `queued`
-        with their join waiting) are skipped."""
+        the root (never hard-coded). Skipped: joined grafts, any graft that is `queued` with
+        its join waiting, and background grafts (running or abandoned)."""
         cur = self.root()
         while True:
             nxt = [c for c in self.children(cur)
-                   if self.timeline(c)["status"] not in ("joined", "background", "queued")]
+                   if self.timeline(c)["status"] not in ("joined", "background", "queued", "abandoned")]
             if not nxt:
                 return cur
             cur = nxt[-1]
 
     # ---------- turns & context ----------
     def insert_turn(self, owner: str, role: str, kind: str, content: Any,
-                    tool_name: str | None = None) -> int:
+                    tool_name: str | None = None, harness: bool = False) -> int:
         text = content if isinstance(content, str) else json.dumps(content)
         return self.con.execute(
-            "INSERT INTO turns(owner_timeline, role, kind, tool_name, content, tokens, ts) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (owner, role, kind, tool_name, text, max(1, len(text) // 4), time.time()),
+            "INSERT INTO turns(owner_timeline, role, kind, tool_name, content, tokens, ts, harness) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (owner, role, kind, tool_name, text, max(1, len(text) // 4), time.time(), int(harness)),
         ).lastrowid
 
     def append(self, tl: str, row_id: int) -> int | None:
@@ -231,8 +238,9 @@ class Store:
         return pos
 
     def add_turn(self, tl: str, role: str, kind: str, content: Any,
-                 tool_name: str | None = None) -> int:
-        rid = self.insert_turn(tl, role, kind, content, tool_name)
+                 tool_name: str | None = None, harness: bool = False) -> int:
+        """`harness=True` marks a row the harness wrote (a note); only the harness passes it."""
+        rid = self.insert_turn(tl, role, kind, content, tool_name, harness=harness)
         self.append(tl, rid)
         return rid
 
@@ -288,14 +296,6 @@ class Store:
         return {r[0] for r in self.con.execute(
             "SELECT row_id FROM context WHERE timeline_id=?", (tl,))}
 
-    def visible_to(self, viewer: str, row_id: int) -> bool:
-        """Downward-only: own rows, rows in own context, or rows owned by descendants."""
-        t = self.turn(row_id)
-        if t is None:
-            return False
-        return (t["owner_timeline"] == viewer or row_id in self.pointed(viewer)
-                or t["owner_timeline"] in self.descendants(viewer))
-
     # ---------- transactions ----------
     def begin_tx(self, tl: str, kind: str, target: str | None = None) -> int:
         return self.con.execute(
@@ -305,14 +305,25 @@ class Store:
     def tx_status(self, tx_id: int) -> str:
         return self.con.execute("SELECT status FROM transactions WHERE tx_id=?", (tx_id,)).fetchone()[0]
 
+    def join_outcome(self, child: str) -> str | None:
+        """'committed' or 'rolled_back' if child's join has been written to its source (the
+        outcome of its audit record), else None. A join attempt that failed and wrote nothing is
+        recorded as 'failed' and does not count."""
+        row = self.con.execute(
+            "SELECT status FROM transactions WHERE kind='join' AND target=? AND status IN "
+            "('committed','rolled_back') ORDER BY tx_id DESC LIMIT 1", (child,)).fetchone()
+        return row[0] if row else None
+
     def end_tx(self, tx_id: int, status: str, committed_sql: str | None, scratch: Any) -> None:
         self.con.execute(
             "UPDATE transactions SET status=?, committed_sql=?, scratch=? WHERE tx_id=?",
             (status, committed_sql, json.dumps(scratch, default=str), tx_id))
 
-    def commit_clone(self, source: str, grafts: Sequence[Graft]) -> None:
+    def commit_clone(self, source: str, grafts: Sequence[Graft],
+                     audits: Sequence[tuple[int, str, Any]] = ()) -> None:
         """One SQL transaction for the whole clone call: every graft's timelines row, seed
-        pointers and timeline_skills links, or none of them."""
+        pointers and timeline_skills links, and the `committed` outcome of its audit records
+        (`audits`: (tx_id, committed_sql, scratch)), or none of it."""
         self.con.execute("BEGIN")
         try:
             for g in grafts:
@@ -320,17 +331,29 @@ class Store:
                                      status="active" if g.focus else "background")
                 for rid in g.seed:
                     self.append(g.child, rid)
+            for tx, sql, scratch in audits:
+                self.end_tx(tx, status="committed", committed_sql=sql, scratch=scratch)
             self.con.execute("COMMIT")
         except Exception:
             self.con.execute("ROLLBACK")
             raise
 
-    def commit_join(self, source: str, record: str, rows: list[int]) -> int:
+    def commit_join(self, source: str, record: str, rows: list[int], *, error: str | None,
+                    trigger: int | None, tx: int, status: str, committed_sql: str | None,
+                    scratch: Any) -> int:
+        """One join, one SQL transaction: the record row, the remembered pointers, the error row
+        of a failed clone, the trigger pointer, and the outcome of the join's audit record `tx`.
+        All of it or none of it, so a join that failed halfway leaves nothing and can be retried."""
         self.con.execute("BEGIN")
         try:
-            rec = self.add_turn(source, "user", "text", record)
+            rec = self.add_turn(source, "user", "text", record, harness=True)
             for rid in rows:
                 self.append(source, rid)
+            if error:
+                self.add_turn(source, "user", "text", error, harness=True)
+            if trigger is not None:
+                self.append(source, trigger)
+            self.end_tx(tx, status=status, committed_sql=committed_sql, scratch=scratch)
             self.con.execute("COMMIT")
             return rec
         except Exception:
@@ -358,7 +381,10 @@ class Store:
 def row_block(r: dict) -> dict:
     kind = r["kind"]
     if kind == "text":
-        return {"type": "text", "text": r["content"]}
+        # The mark travels with the block so a caller can tell a harness note from a user message
+        # without reading its text. Provider adapters build their wire blocks from type and text.
+        return {"type": "text", "text": r["content"], "harness": True} if r.get("harness") \
+            else {"type": "text", "text": r["content"]}
     data = json.loads(r["content"])
     if kind == "tool_use":
         return {"type": "tool_use", "id": data["id"], "name": r["tool_name"], "input": data["input"]}

@@ -62,7 +62,8 @@ timeline_skills(timeline_id, skill_id)
 
 turns(row_id, owner_timeline, role,             -- role: user | assistant
       kind,                                     -- text | tool_use | tool_result | thinking
-      tool_name, content, tokens, ts)           -- stored once, never edited
+      tool_name, content, tokens, ts,           -- stored once, never edited
+      harness)                                  -- 1 = written by the harness (a note), else 0
 
 context(timeline_id, pos, row_id)               -- pointer table: an agent's context
 
@@ -159,7 +160,7 @@ The original has only `clone`. It converses, routes and clones; every other capa
 
 **Nesting was tried and removed; it does not fit grafting.** Letting clones clone was implemented (strict skill narrowing, per-timeline context budgets, and rollup of out-of-scope joins past levels that lacked the skills), evaluated, and removed. A graft hands one continuous conversation to a clone that holds the whole task; splitting that task into sub-clones breaks the continuity grafting exists to keep. In the evals, models left to choose never nested. When pushed to (`clone` linked automatically to multi-skill clones), quality fell: `nested_project` 5/20 against 19/20 without nesting, `multi_part` 2/10 against 10/10, at 22–78% more cost. Part clones lost context, handed back parts they held, and sources waited on the user between parts. Records: `experiments/results/nesting-*`.
 
-**Re-cloning is bounded.** A request that comes back to the original from a failed clone, or comes back out of scope a second time, is not cloned for again; the original answers the user. Within one turn, the original gets one retry after a refused clone call, and one committed clone call. Blocks are tracked per request, so an unrelated request reaching the source neither lifts another request's block nor inherits it; a new user message lets the source clone again. A block is recorded under the request the source is answering when the join is applied (its latest user message), never under whatever the clone was seeded with, so it always matches the check. A source woken only to report finished or failed background grafts does not clone in that run. A wake whose batch includes an `out_of_scope` join may route it, but a source commits at most one clone call in wake runs between two user messages; after that, wakes only report.
+**Re-cloning is bounded, per part.** A request with several parts is given to several clones, and each clone's *part* is identified by the request it was working on and its own linked catalog skills, both known to the harness. The request a clone was working on is the user message it hands back, or, for a clone that never received one, the source's current request at the moment it was cloned, recorded then; it is never taken from what the model chose to seed. A part that comes back from a failed clone, or comes back out of scope a second time, is not cloned for again: a clone call with an entry whose skills overlap a blocked part of the source's current request is refused, and the refusal names that entry. Other parts of the same request are not affected, so when one sibling fails and another hands its part back, the handed-back part can still be routed once; and a clone that fails after the user has moved on to a new message blocks nothing for that new message. Further bounds hold whatever the parts are: within one turn the original gets one retry after a refused clone call and one committed clone call; a request that has been handed back 8 times in all is not cloned for again; a source woken only to report finished or failed background grafts does not clone in that run; and a source commits at most one clone call in wake runs between two user messages, after which wakes only report. Every hand-back is counted, including one for a source that had no user message when it cloned. A new user message lets the source clone again.
 
 ## Lifecycle
 
@@ -175,8 +176,8 @@ The original has only `clone`. It converses, routes and clones; every other capa
    ```
 
    Each entry names the clone's `purpose`, the skills to link (from the catalog in the source's system prompt), and `focus`. `focus` is required and has no default, so the source makes the routing decision every time. **At most one entry has `focus: true`.** With no focus entry the source keeps the conversation and every graft runs in the background.
-2. A **seeder actor** picks the seed rows of each entry: for each text row in the source's working view it answers one yes/no question ("does a clone doing *purpose* need this message?") with a confidence score, using a small decision model (v1: TypeSafe Jev). Rows at or above a threshold are seeded in view order, and the triggering user message is always seeded. Each question carries only its row and its immediate neighbours plus the purpose and trigger, so the decision model's context limit never binds, and large views are split into parallel batches. The seeder runs once per entry, and the entries are seeded concurrently. The full decision (model, threshold, per-row scores, selection) is recorded with the clone, so seeds stay replayable. If the seeder fails, the source's own seed (row ids or exact quotes, optional in each entry) is the fallback. Either way the seed resolves to pointers, never copies or paraphrases.
-3. The harness validates the list and every entry's resulting view (see [Validated views](#validated-views)). The input is model-written, so nothing about its shape is assumed: each entry must be an object with a purpose, a boolean `focus`, `skills` as a list of known skill names without repeats, and seeds as lists of strings and integers; at most one entry has focus. **Limits:** a clone call takes at most 4 entries, and a source has at most 4 live background grafts (running, or finished with their join still queued). **The call is one atomic batch:** any violation refuses the whole call, with the violations listed per entry (by its index in the list), and creates nothing; the source gets one retry. An error raised while handling the call (the seeder, the commit) is a refusal as well: the source always gets a tool result, every transaction of the call is recorded `rolled_back`, and no clone exists.
+2. A **seeder actor** picks the seed rows of each entry: for each text row in the source's working view it answers one yes/no question ("does a clone doing *purpose* need this message?") with a confidence score, using a small decision model (v1: TypeSafe Jev). Rows at or above a threshold are seeded in view order, and the triggering user message is always seeded. Each question carries only its row and its immediate neighbours plus the purpose and trigger, so the decision model's context limit never binds, and large views are split into parallel batches. The seeder runs once per entry, and the entries are seeded concurrently; if one seeder call raises, the others are cancelled and awaited before the call is refused. The full decision (model, threshold, per-row scores, selection) is recorded with the clone, so seeds stay replayable. If the seeder fails, the source's own seed (row ids or exact quotes, optional in each entry) is the fallback. Either way the seed resolves to pointers, never copies or paraphrases, and only to rows the source holds in its own context.
+3. The harness validates the list and every entry's resulting view (see [Validated views](#validated-views)). The input is model-written, so nothing about its shape is assumed: each entry must be an object with a purpose, a boolean `focus`, `skills` as a list of known skill names without repeats, and seeds as lists of strings and integers; at most one entry has focus. **Limits:** a clone call takes at most 4 entries (a longer list is refused whole, before any entry is looked at, with one audit record), and a source has at most 4 live background grafts (running, or finished with their join still queued); the cap is a guard of the clone transition. **The call is one atomic batch:** any violation refuses the whole call, with the violations listed per entry (by its index in the list), and creates nothing; the source gets one retry. An error raised while handling the call (the seeder, a refusal by the state machine, the commit) is a refusal as well: the source always gets a tool result, every transaction of the call is recorded `rolled_back`, and no clone exists. The state machine's transition and the store's commit are one unit: the machine goes first and may refuse, and if the single SQL transaction then fails the machine's step is undone (`cloned ──clone abort──▶ turn`), so the machine and the store never disagree about which grafts exist.
 4. On success the harness inserts, in one transaction, every graft's `timelines` row, its seed pointers into `context`, and its `timeline_skills` links. The `clone` call's single result names every graft ("cloned → c7 (focus, active), c8 (background, running)"), so the source knows what it did.
 5. With a focus graft, the source enters the **cloned** state: suspended, its timeline does not grow. The focus graft becomes the active leaf and talks to the user.
 6. Without one, the source stays **active**, tells the user what it started, and keeps the conversation.
@@ -197,8 +198,10 @@ Architecture rules (routing, cloning, joining) are not part of the persona; they
 
 1. The clone decides it is done, out of scope, or failed, and uses its **join** skill (a background graft: the `join` tool of its **background** skill).
 2. The harness raises a join event. Everything after this is a deterministic state transition, with no model call:
-   - focus graft: `active → joined` (timeline frozen permanently); source: `cloned → joining`
+   - focus graft: `active → queued` (frozen permanently, its join last on the source's queue); source: `cloned → joining`. When the join has been written to the source: `queued → joined`.
    - background graft: `background → queued` (frozen permanently, its join waiting on the source's queue), then `queued → joined` when the join is applied to the source at rest (see [Parallel grafts](#parallel-grafts))
+
+   The state machine is asked first. If it refuses the join event (the timeline is the original, or has already raised its join event), nothing is written: a second join never changes a graft's recorded reason. The reason and trigger travel with the queue entry and are written to `timelines` once the event is accepted.
 3. The join event carries only harness-generated fields, never clone-written text:
 
    ```text
@@ -206,7 +209,7 @@ Architecture rules (routing, cloning, joining) are not part of the persona; they
    ```
 
    `trigger` is the user message the clone did not handle, if any. A background graft never receives a user message, so its trigger is always null.
-4. Mechanical failures (errors, timeouts, exhausted budget) raise `failed` without the model.
+4. Mechanical failures (errors, timeouts, exhausted budget) raise `failed` without the model. This holds for a focus graft as for a background graft: if its run raises, it joins `failed`, its source takes the conversation back and answers the user, and the error does not escape as an exception from the user's turn.
 5. **A background graft always joins.** Nobody can answer it, so a turn that ends on a text reply without a join call joins it `done` (the reply is its result), and an empty response joins it `failed`.
 
 ### Default join (deterministic)
@@ -222,11 +225,12 @@ When a clone joins, the harness applies a fixed default with no model call, then
 - The **working view** is the clone's context as it would be sent to the model: the full conversation if it never compacted, or its kept and compressed rows plus the turns after the last compaction if it did. The join is therefore bounded by one context window, and it is what a single agent would have remembered had it held the conversation itself.
 - Compaction is the agent compressing its own memory, with every compressed row pointing at the window it condenses, not a worker reporting to someone else, so it does not reintroduce the telephone problem.
 - Tool calls, tool results and thinking stay in the clone's frozen timeline.
-- The source then returns to `active`. On `done` it waits for the user; on `out_of_scope` or `failed` its only remaining decision is routing.
+- The source then returns to `active`. After a focus graft's `done` join it waits for the user; after `out_of_scope` or `failed` its only remaining decision is routing.
+- **One join is one SQL transaction:** the join record, the pointers, a failed clone's error record, the trigger pointer and the outcome of the join's audit record are written together or not at all. A join that fails halfway leaves nothing in the source, its audit record says `failed`, and it can be retried without duplicating anything. The write and the state machine's step are one unit: the graft becomes `joined` only after the write, and if that step fails after the write, the retry finds the join in the store, writes nothing, and completes the step.
 - Before joining `done`, a clone must have given its final reply (a focus graft to the user; a background graft as its written result); a clone never ends silently.
 - A background graft's join is the same default: the text rows of its working view that the source lacks. The seeded request is a row the source already holds, so it is skipped.
 
-The only exit from `cloned` is the focus graft's join event; the default join runs during `joining` and returns the source to `active`.
+A suspended source leaves `cloned` through its focus graft's join event (or, when a clone call could not be committed, back to its turn). Joins are applied during `joining`, which always returns the source to `active`.
 
 
 
@@ -241,26 +245,31 @@ active                       holds the conversation
     turn                     answering a request (a user message, or one a clone handed back); may clone
     reporting                woken only to tell the user what background grafts did; a clone is refused
 cloned                       suspended while its focus graft holds the conversation
-joining                      applying joins (a focus graft's, and queued background joins)
-joined                       final: frozen
+joining                      applying the joins on its queue, in order
+queued                       (a focus graft) frozen, its join waiting on its source; not final
+joined                       final: its join was applied
 
 idle ──turn begins──▶ turn ──turn ends──▶ idle        idle ──report begins──▶ reporting ──turn ends──▶ idle
-turn ──clone commit (focus graft)──▶ cloned ──focus graft joins──▶ joining
-turn ──clone commit (background only)──▶ turn
-idle ──drain begins [joins queued, holds the conversation]──▶ joining
+turn ──clone commit [the original; one focus graft; room for the background grafts]──▶ cloned
+turn ──clone commit, background only [the original; room]──▶ turn
+cloned ──clone abort (the commit failed)──▶ turn
+cloned ──focus graft joins──▶ joining
+idle ──drain begins [joins queued]──▶ joining
+joining ──join applied [the head of the queue]──▶ joining
 joining ──join commit | join rollback──▶ active (idle)
-active ──join skill [has a source]──▶ joined
+active ──join [a graft with no grafts of its own]──▶ queued ──join commit | join rollback──▶ joined
 ```
 
 A background graft:
 
 ```text
 background ──finishes──▶ queued ──join commit | join rollback──▶ joined (final)
+background ──abandon──▶ abandoned (final: its join event could not be raised)
 ```
 
-`queued` means the graft is frozen and its join is waiting; `joined` means the join was applied to the source. Both are recorded in `timelines.status`, so a join that has not landed is never mistaken for one that has. The queue belongs to the source's state machine, in finish order, and a graft leaves it only when its join has been applied.
+`queued` means the graft is frozen and its join event, with its reason and trigger, is waiting on its source; `joined` means that join was applied to the source. A focus graft and a background graft go through the same two steps. Both states are recorded in `timelines.status`, so a join that has not landed is never mistaken for one that has. The queue belongs to the source's state machine, in finish order; it changes only in transition effects, and a graft leaves it only when its join has been applied.
 
-**The state machine is the authority.** It refuses a drain when the source is in a turn, suspended, not holding the conversation, or has nothing queued; it refuses a clone outside `turn`; it refuses a second join on a joined graft. The harness asks and is refused; it does not decide from states it reads. A drain always ends through `join commit` or `join rollback`: rollback if any queued join was rolled back or its commit raised. A join whose commit raises stays `queued`, the user is told at once which clones are affected and that the commit failed, the source returns to rest, and the join is retried at the next commit point.
+**The state machine is the authority.** The graph refuses a drain when the source is in a turn, suspended or has nothing queued; a clone outside `turn`, from a graft (grafts are one level deep), or beyond the cap on live background grafts; a join from the original, from a timeline that still has grafts of its own, or a second time. It also records what kind each timeline is and which grafts have raised their join event; the harness keeps no copy. The harness dispatches and is told accepted or refused; it does not decide from states it reads. Each operation is one critical section that runs to completion even if its caller is cancelled, so an operation of several steps (undoing a clone call, applying a join) cannot be left half done. A drain always ends through `join commit` or `join rollback`: rollback if any join was rolled back or could not be applied. A join that cannot be applied, a focus graft's as much as a background graft's, stays `queued` with its reason and trigger; the user is told at once which clones are affected and that the commit failed; the source returns to rest holding the conversation; and the join is retried at the next commit point. Nothing is lost: a handed-back user message is still answered once its join lands.
 
 **Invariant: at most one branch holds the conversation.** Exactly one timeline is in `active` or `joining`, and it holds the single global conversation slot. Every other timeline is `cloned` (suspended), `background` or `queued` (outside the slot) or `joined` (frozen). A focus graft's join hands the slot from the clone straight to its source. Creating a background graft is not a handoff, and its join never moves the slot. The harness enforces this as a single global state, not per source.
 
@@ -272,7 +281,7 @@ A request with independent parts ("build the site, draft the deck, book the room
 
 **Background grafts never speak.** Only the slot holder's text reaches the user. A background graft's text is stored in its own timeline and reaches the source's memory through its join; the source tells the user the outcome.
 
-**Joins are queued, and commit only while the source is at rest.** A finishing background graft freezes at once (`queued`) and its join event goes on its source's queue, in finish order. The join itself is unchanged: deterministic, pointer-only, no model call, size-checked against the source's view at commit time. A queued join commits only when the state machine accepts a drain: its source holds the conversation and is `idle`, so the join never lands between a `tool_use` and its result or under a model call in flight. The commit points are:
+**Joins are queued, and commit only while the source is at rest.** A finishing background graft freezes at once (`queued`) and its join event goes on its source's queue, in finish order. The join itself is unchanged: deterministic, pointer-only, no model call, size-checked against the source's view at commit time. A queued join commits only when the state machine accepts a drain: its source is `idle`, which only the conversation holder can be, so the join never lands between a `tool_use` and its result or under a model call in flight. The harness also holds a conversation lock around a user turn and a wake run; that lock only keeps their steps from interleaving and decides nothing, the machine's `idle` or `busy` does. The commit points are:
 
 - **before a new user message** is appended to the source: the queued joins commit first, and the source answers the message with them in view;
 - **at the end of the source's turn**, and **when a graft finishes while the source is idle**: the queued joins commit and the source is woken (below);
@@ -280,13 +289,15 @@ A request with independent parts ("build the site, draft the deck, book the room
 
 Because contexts are append-only, a late join never moves earlier rows, and the source's prompt cache stays valid.
 
+**Harness notes are marked, not recognised.** Join records, error records and wake notes are user-role rows the harness writes, and each carries `harness = 1` in `turns`. Everything that must tell a note from a user message (what the source's current request is, which rows are seed candidates, the re-cloning bounds) reads that mark, never the text, so a user message that looks like a note is still a user message.
+
 **Notes name the grafts still running.** Every join record and every wake note appended to a source says, in harness-generated text, which of that source's grafts are still running, with their skills ("Still running: c9 (skills: slides)."), or that none are. A focus graft that hands a request back while background grafts are live makes this visible the same way, and the `clone` skill tells the source not to clone again for the parts those grafts are doing.
 
 **Wake.** When queued joins commit and no user message is waiting, the harness appends one closing note as a user row ("background clones c8, c9 joined; tell the user the outcome") and runs the source once, for everything committed together. The note tells the source to report only what has joined and not to describe still-running work as finished. The run is a `reporting` run, in which the machine refuses a clone, unless the batch includes an `out_of_scope` join and the source still has its wake clone call: then it is a `turn` and the source may route the request, under the re-cloning bounds in [Depth](#depth). If the size check kept none of a graft's rows, the note says that its result did not fit and stays in its frozen timeline, instead of pointing at rows that are not there. If the wake run itself fails, the joins stay committed and the harness tells the user at once that reporting failed; this holds wherever the wake happens (after a user turn, after a focus graft's `done` join, when a graft finishes while the source is idle, or when the harness is asked to settle). This is the one place a `done` join leads to a model call: the user did not see the graft's work, so the source reports it.
 
 **Shared resources: no locking.** Background grafts run concurrently, so there can be concurrent writers to external state, and v1 has no ownership or locking model. The source is responsible for handing out work that does not collide; the `clone` skill says so. Continuity across clones (c7 books an appointment, c8 later reschedules it) comes only through the seed: the source points c8 at the joined rows that record c7's actions, or c8 inspects the external state itself.
 
-**Shutdown.** Closing the harness cancels the background grafts still running; each joins `failed`, and joins that can be applied without running anything are applied. No model call is started on shutdown.
+**Shutdown.** Closing the harness cancels the background grafts still running. Every background graft that has not raised its join event then joins `failed`, including one that never ran a step; one whose join event cannot be raised ends `abandoned`, a final state, and the user is told. A background error that had not been reported is reported. Joins that can be applied without running anything are applied. No model call is started on shutdown.
 
 **A running graft cannot be steered or cancelled.** Clones are single-use and timelines never message each other. A follow-up on work that is still out waits for the join and then means a new clone. Cancelling a running graft (a harness-raised `failed` join) is deferred.
 
@@ -310,7 +321,7 @@ Clones are single-use. A clone joins once and never runs again. Agents never mes
 1. A clone sees only its seed pointers and its linked skills. No implicit history.
 2. Only the text rows of the clone's working view join back (for a focus graft, its user-visible conversation); tool calls, tool results and thinking stay in the clone's frozen timeline.
 3. Information crosses timelines only through the `clone` call (down) and the default join (up).
-4. **Reads go downward only.** A source may query its descendants' timelines; a clone may never read its source or its siblings, including siblings running at the same time. Enforced by the harness (SQLite authorizer or per-agent views), not by prompt.
+4. **A timeline reads only its own context.** No timeline has a tool that queries the store: each sees exactly the rows its context points at, rendered by the harness. A clone never reads its source or its siblings, including siblings running at the same time, and a source reaches a clone's rows only through that clone's join. A seed may point only at rows the source itself holds in its context, so a clone cannot be seeded with a running sibling's work or with tool output that never joined; the harness refuses any other row id. This is enforced in the harness (seed resolution and rendering), not by prompt; there is no SQLite authorizer or per-agent view.
 5. The only writes are new turns and appended pointers from a committed clone or join.
 6. **Least privilege:** a clone holds only its linked skills' tools.
 7. **Joined rows keep their role and kind.** Clone content is never rewritten or promoted into a different role; the only new row a join creates is the harness's join record (and error record on `failed`). Tool output is never joined by default, so a focus graft's join adds no prompt-injection exposure beyond the conversation the user already saw. A background graft's text was not seen by the user: it is model-written text that may restate tool output, and it enters the source's context in the assistant role.
@@ -371,7 +382,7 @@ The baseline is **subagents**, not a single shared agent.
    Also force the handoff: at the point where the parent invoked the subagent, cut the parent and make a `clone` call instead of letting it write a handoff prompt, then run a fresh clone from that seed and join it back. Compare that full counterfactual branch (seed → clone run → join → parent continuation) against the recorded branch (handoff prompt → subagent → summary → parent continuation). Clone runs need the environment as it was at that point, so start with read-only subagents (code search and research) replayed against the repository checked out at the trace's commit; subagents with side effects come later, if at all.
 
    Pilot results are in the README under "Results so far": with both arms on the same delegate model, neither the clone nor the subagent was clearly better, and the delegate model dominated the outcome.
-5. **Parallel grafts vs sequential clone-join (mechanics only, `experiments/parallel.py`):** the same multi-part request as one clone call with background grafts, and as one focus clone per part. Offline, with a scripted provider, both arms pass the same checks on the simulated world (the two worlds are not compared with each other, and the arms are not the same script: one message per part against one message for all parts). Whether a real model routes parts to background grafts sensibly, whether quality holds against the sequential baseline, and the real wall-clock gain are not measured yet.
+5. **Parallel grafts vs sequential clone-join (mechanics only, `experiments/parallel.py`):** the same multi-part request as one clone call with background grafts, and as one focus clone per part. Offline, with a scripted provider, both arms pass the same checks on the simulated world (the two worlds are not compared with each other, and the arms are not the same script: one message per part against one message for all parts). In both arms a clone that ends its turn on a question while the checks are unmet gets one fixed user reply, at most three times per arm, so that a live clone asking for details is not scored as a harness failure; the number used is reported. Whether a real model routes parts to background grafts sensibly, whether quality holds against the sequential baseline, and the real wall-clock gain are not measured yet.
 
 ## Principle
 

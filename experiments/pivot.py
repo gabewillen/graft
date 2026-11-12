@@ -285,7 +285,7 @@ async def run_graft(provider, nonce: str | None, quiet: bool, db_path: str | Non
     print(f"db: {path}")
     if not quiet:
         print(store.dump())
-    await h.machines.stop()
+    await h.close()
     return {"ok": ok, "roles": roles, "deck": h.world.deck_text(), "handoff": seed_text}
 
 

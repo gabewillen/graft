@@ -32,7 +32,7 @@ def _clone(purpose: str, skills: list[str], seed_quotes: list[str], focus: bool 
 def woken(messages: list[dict]) -> str | None:
     """The harness wake note, if the last user message ends with one (background clones joined)."""
     last = _last_block(messages)
-    if last["type"] == "text" and last["text"].startswith("(harness note: background clone"):
+    if last["type"] == "text" and last.get("harness") and last["text"].startswith("(harness note: background clone"):
         return last["text"]
     return None
 
@@ -42,7 +42,8 @@ def _wake_reply(messages: list[dict]) -> list[dict]:
     last spoke (each follows a join record in its view)."""
     replies: list[str] = []
     for prev, m in zip(messages, messages[1:]):
-        notes = [b["text"] for b in prev["content"] if b["type"] == "text"] if prev["role"] == "user" else []
+        notes = [b["text"] for b in prev["content"] if b["type"] == "text" and b.get("harness")] \
+            if prev["role"] == "user" else []
         if any(n.startswith("(harness note: background clone") for n in notes):
             replies = []  # an earlier wake: already reported
         if m["role"] == "assistant" and any(n.startswith("(harness note: clone ") for n in notes):
@@ -55,7 +56,9 @@ def _last_block(messages: list[dict]) -> dict:
 
 
 def _user_texts(messages: list[dict]) -> list[str]:
-    return [b["text"] for m in messages if m["role"] == "user" for b in m["content"] if b["type"] == "text"]
+    """What the user said. Harness notes are user-role rows too; they carry a mark and are left out."""
+    return [b["text"] for m in messages if m["role"] == "user" for b in m["content"]
+            if b["type"] == "text" and not b.get("harness")]
 
 
 def texts_of(messages: list[dict]) -> list[str]:
@@ -76,7 +79,6 @@ def pivot_policy(system: str, messages: list[dict], tools: list[dict]) -> list[d
         if woken(messages):
             return _wake_reply(messages)
         user = [re.sub(r"^\[conversation [^\]]*\]\s*", "", t) for t in texts_of(messages)]
-        user = [t for t in user if not t.startswith("(harness note")]
         wants_slides = any("slide" in t.lower() for t in user)
         return _use("clone", clone=[_clone("handle the user's request",
                                            ["slides" if wants_slides else "website"], user)])
@@ -228,7 +230,7 @@ def bench_graft_policy(system: str, messages: list[dict], tools: list[dict]) -> 
         if woken(messages):
             return _wake_reply(messages)
         texts = [_clean(t) for t in _user_texts(messages)]
-        texts = [t for t in texts if not t.startswith("(harness note") and not t.startswith("(compaction")]
+        texts = [t for t in texts if not t.startswith("(compaction")]
         wants = _wants(texts[-1] if texts else "") or _wants(" ".join(texts)) or ["website"]
         uniq = [t for t in dict.fromkeys(texts) if texts.count(t) == 1]
         return _use("clone", clone=[_clone("handle the user's request", wants, uniq or texts[-1:])])
@@ -247,7 +249,7 @@ def parallel_graft_policy(system: str, messages: list[dict], tools: list[dict]) 
         return _text("I have started on that and will report back when it is done.")
     if woken(messages):
         return _wake_reply(messages)
-    texts = [t for t in (_clean(t) for t in _user_texts(messages)) if not t.startswith("(harness note")]
+    texts = [_clean(t) for t in _user_texts(messages)]
     wants = _wants(texts[-1] if texts else "") or ["website"]
     if len(wants) == 1:
         return _use("clone", clone=[_clone("handle the user's request", wants, texts)])

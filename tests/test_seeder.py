@@ -52,7 +52,8 @@ def rows(store):
     u1 = store.add_turn("o", "user", "text", "I need a website.")
     a1 = store.add_turn("o", "assistant", "text", "Sure, which practice?")
     u2 = store.add_turn("o", "user", "text", "Harbor Light Dental, phone 218-555-0143.")
-    note = store.add_turn("o", "user", "text", "(harness note: clone c1 joined, reason=out_of_scope; rows 1 follow)")
+    note = store.add_turn("o", "user", "text", "(harness note: clone c1 joined, reason=out_of_scope; rows 1 follow)",
+                          harness=True)
     a2 = store.add_turn("o", "assistant", "text", "Noted the details.")
     trig = store.add_turn("o", "user", "text", "Make slides instead.")
     return dict(asst0=asst0, u1=u1, a1=a1, u2=u2, note=note, a2=a2, trig=trig)

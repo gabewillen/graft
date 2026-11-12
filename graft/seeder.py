@@ -56,7 +56,9 @@ def seed_threshold() -> float:
 
 
 def is_candidate(row: dict) -> bool:
-    return row["kind"] == "text" and not row["content"].startswith("(harness note")
+    """A text row of the conversation. Harness notes are excluded by their mark (`turns.harness`),
+    never by their text: a user message that looks like a note is still a user message."""
+    return row["kind"] == "text" and not row.get("harness")
 
 
 def seed_budget() -> int:

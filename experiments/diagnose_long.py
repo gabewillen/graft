@@ -61,11 +61,11 @@ def diagnose(path: str) -> dict:
     first_sl_row = min((r["row_id"] for r in s.view(sl) if r["owner_timeline"] == sl), default=10 ** 9)
     # harness notes (join records index row snippets) are not seedable carriers of a fact
     o_wv = [r for r in s.working_view("o") if r["row_id"] < first_sl_row
-            and not r["content"].startswith("(harness note")]
+            and not r["harness"]]
     joined = [r for r in s.view("o") if r["owner_timeline"] in web]
     web_wv = [r for c in web for r in s.working_view(c)]
     web_full = [r for c in web for r in s.view(c)]
-    o_full = [r for r in s.view("o") if not r["content"].startswith("(harness note")]
+    o_full = [r for r in s.view("o") if not r["harness"]]
     svc = sum(has(SCORED[k], deck) for k in ("cleanings", "crowns", "Invisalign"))
     core = [f for f in ("practice name", "city", "Dr. Okafor", "Dr. Brandt", "phone") if not has(SCORED[f], deck)]
     out["failed"] = bool(core) or svc < 2

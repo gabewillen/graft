@@ -10,8 +10,13 @@ two ways:
               three background entries (focus=false), keeps the conversation, and is woken when
               they have joined.
 
-Reported per arm: the checks on the simulated world, user turns, model calls, clones with their
-join reasons, wakes, and wall-clock.
+Reported per arm: the checks on the simulated world, user turns, follow-ups, model calls, clones
+with their join reasons, wakes, and wall-clock.
+
+A live clone may ask the user a question instead of finishing (the website skill tells it to ask
+for missing details). So that a question is not scored as a failure of the harness, both arms
+get the same bounded follow-up: after each scripted message, while the last reply is a question
+and the checks are not met, one fixed user reply is sent, at most MAX_FOLLOW_UPS times per arm.
 
 Offline by default: a scripted provider (graft/fake.py) plays every role, and `--latency` adds a
 fixed delay to each model call so that overlap between background clones is visible in the
@@ -32,6 +37,7 @@ import os
 import sys
 import tempfile
 import time
+from typing import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -39,7 +45,6 @@ from graft.db import Store, validate  # noqa: E402
 from graft.fake import bench_graft_policy, parallel_graft_policy  # noqa: E402
 from graft.harness import Harness  # noqa: E402
 from graft.providers import FakeProvider, make_provider  # noqa: E402
-from graft.sim import run_script  # noqa: E402
 from graft.skills import World, install  # noqa: E402
 
 FACTS = ("We are Okafor Dental in Columbus, Ohio. Our services: cleaning, implants, whitening. "
@@ -56,6 +61,10 @@ PARALLEL = [f"{FACTS} Please do three things: {PARTS['website']}; {PARTS['slides
             f"{PARTS['calendar']}."]
 
 
+FOLLOW_UP = "No other details; use what I gave you and finish."
+MAX_FOLLOW_UPS = 3  # per arm
+
+
 def checks(world: World) -> dict[str, bool]:
     site = " ".join(world.site.values()).lower()
     deck = world.decks[-1] if world.decks else {}
@@ -68,17 +77,48 @@ def checks(world: World) -> dict[str, bool]:
     }
 
 
-def slowed(policy, latency: float):
-    def call(system, messages, tools):
+Policy = Callable[[str, list[dict], list[dict]], list[dict]]  # (system, messages, tools) -> blocks
+
+
+def slowed(policy: Policy, latency: float) -> Policy:
+    def call(system: str, messages: list[dict], tools: list[dict]) -> list[dict]:
         time.sleep(latency)  # runs in the harness's worker thread: concurrent calls overlap
         return policy(system, messages, tools)
     return call
 
 
-async def run_arm(arm: str, live: bool, latency: float, trace: bool) -> dict:
-    policy = bench_graft_policy if arm == "sequential" else parallel_graft_policy
+async def converse(h: Harness, script: list[str], world: World) -> tuple[list[tuple[str, str]], int]:
+    """Send the script. After each message, let background clones join, then apply the follow-up
+    rule: while the last reply is a question and the checks are not met, answer it with
+    FOLLOW_UP, at most MAX_FOLLOW_UPS times in all. Returns (transcript, follow-ups used)."""
+    transcript: list[tuple[str, str]] = []
+    follow_ups = 0
+
+    async def say(text: str) -> list[str]:
+        print(f"\nUSER: {text}")
+        transcript.append(("user", text))
+        replies = await h.user_says(text) + await h.settle()
+        for reply in replies:
+            print(f"ASSISTANT: {reply}")
+            transcript.append(("assistant", reply))
+        return replies
+
+    for message in script:
+        replies = await say(message)
+        while (follow_ups < MAX_FOLLOW_UPS and replies and replies[-1].rstrip().endswith("?")
+               and not all(checks(world).values())):
+            follow_ups += 1
+            replies = await say(FOLLOW_UP)
+    return transcript, follow_ups
+
+
+async def run_arm(arm: str, live: bool, latency: float, trace: bool, policy: Policy | None = None,
+                  workdir: str | None = None) -> dict:
+    """`policy`: a scripted policy to use instead of the arm's default (offline tests).
+    `workdir`: where the arm's store is written (default: a new temporary directory)."""
+    policy = policy or (bench_graft_policy if arm == "sequential" else parallel_graft_policy)
     provider = make_provider() if live else FakeProvider(slowed(policy, latency))
-    path = os.path.join(tempfile.mkdtemp(prefix=f"graft-parallel-{arm}-"), "m.db")
+    path = os.path.join(tempfile.mkdtemp(prefix=f"graft-parallel-{arm}-", dir=workdir), "m.db")
     store = Store(path)
     install(store)
     world = World()
@@ -90,20 +130,20 @@ async def run_arm(arm: str, live: bool, latency: float, trace: bool) -> dict:
     script = SEQUENTIAL if arm == "sequential" else PARALLEL
     print(f"\n######## ARM: {arm} ########")
     t0 = time.perf_counter()
-    transcript = await run_script(h, script)  # run_script settles background clones at the end
+    transcript, follow_ups = await converse(h, script, world)
     wall = time.perf_counter() - t0
     h.machines.check()
     clones = [(r["timeline_id"], r["status"], r["join_reason"]) for r in store.con.execute(
         "SELECT timeline_id, status, join_reason FROM timelines WHERE source_id IS NOT NULL ORDER BY timeline_id")]
     modes = [json.loads(r[0]).get("focus") for r in store.con.execute(
         "SELECT scratch FROM transactions WHERE kind='clone' AND status='committed' ORDER BY tx_id")]
-    res = {"arm": arm, "checks": checks(world), "user_turns": len(script),
+    res = {"arm": arm, "checks": checks(world), "user_turns": len(script), "follow_ups": follow_ups,
            "model_calls": provider.usage["calls"], "wall_s": wall, "clones": clones,
            "background": modes.count(False), "focus": modes.count(True), "wakes": len(h.wakes),
            "clone_calls": provider.by_tag.get("original:clone_tx", {}).get("calls", 0),
            "view_violations": validate(store.view("o"), "o", require_user_end=False),
            "replies": [t for who, t in transcript if who == "assistant"], "db": path}
-    await h.machines.stop()
+    await h.close()
     return res
 
 
@@ -119,7 +159,8 @@ def report(results: list[dict], live: bool, latency: float) -> bool:
             print(f"  {'ok  ' if good else 'FAIL'} {name}")
         if r["view_violations"]:
             print(f"  FAIL original's view is invalid: {r['view_violations']}")
-        print(f"  user turns {r['user_turns']}; clone calls {r['clone_calls']}; clones {len(r['clones'])} "
+        print(f"  user turns {r['user_turns']}; follow-ups {r['follow_ups']} (of at most {MAX_FOLLOW_UPS}); "
+              f"clone calls {r['clone_calls']}; clones {len(r['clones'])} "
               f"({r['focus']} focus, {r['background']} background); wakes {r['wakes']}")
         print(f"  clones: {', '.join(f'{c} {s}/{j}' for c, s, j in r['clones'])}")
         print(f"  model calls {r['model_calls']}; wall-clock {r['wall_s']:.2f}s")

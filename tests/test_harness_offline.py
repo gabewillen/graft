@@ -131,8 +131,8 @@ def test_default_join_out_of_scope_and_failed(harness):
         assert rows[-1] == trig and err is None
         rows, err = h.default_join_rows("o", child, "failed", trig)
         assert rows[-1] == trig and "failed" in err
+        await h.machines.join_focus(child, reason="failed", trigger=trig)
         s.set_join(child, "failed", trigger=trig)
-        await h.machines.join_focus(child)
         assert h.default_join("o", child, "failed", trigger=trig)
         tail = s.view("o")[-3:]
         assert "failed" in tail[1]["content"] and tail[2]["row_id"] == trig  # error record, then trigger last
@@ -305,7 +305,7 @@ def test_join_without_window_is_not_size_checked(harness):
         seed = s.add_turn("o", "user", "text", "Write.")
         (child,), _ = await clone_in_turn(h, clone_use(["website"], seed_row_ids=[seed]), retry_left=False)
         a = s.add_turn(child, "assistant", "text", "y" * 50000)
-        rows, record = h.fit_join("o", child, "done", [a], None, None)
+        rows, record = h.fit_join("o", child, "done", rows=[a], error=None, trigger=None)
         assert rows == [a] and "follow" in record and h.join_fallbacks == []
         await h.machines.stop()
 
@@ -373,18 +373,20 @@ def test_a_request_that_bounces_back_twice_is_not_recloned(harness):
         trig = s.add_turn("o", "user", "text", "Make a site.")
         (c1,), _ = await clone_in_turn(h, clone_use(["website"], seed_row_ids=[trig], id="a"), retry_left=False)
         s.add_turn(c1, "assistant", "text", "Hm.")  # then the same request comes back, unhandled
+        await h.machines.join_focus(c1, reason="out_of_scope", trigger=trig)
         s.set_join(c1, "out_of_scope", trigger=trig)
-        await h.machines.join_focus(c1)
         h.default_join("o", c1, "out_of_scope", trigger=trig)
+        await h.machines.commit_queued(c1, committed=True)
         await h.machines.finish_join("o", committed=True)
-        h.join_arrivals[("o", trig)] = 1  # first arrival, recorded as do_join would
-        assert h.clone_blocked("o", 0) is None
+        h.join_arrivals[("o", trig, frozenset({"website"}))] = 1  # first arrival, recorded as do_join would
+        assert not h.part_blocked("o", ["website"])
         s.add_turn("o", "assistant", "tool_use", {"id": "b", "input": {}}, "clone")
         s.add_turn("o", "user", "tool_result", {"tool_use_id": "b", "content": "ok"}, "clone")
         (c2,), _ = await clone_in_turn(h, clone_use(["website"], seed_row_ids=[trig], id="b"), retry_left=False)
         h.provider.policy = lambda *a: [{"type": "text", "text": "I could not do that."}]
         await h.do_join(c2, "out_of_scope")  # the same request comes back a second time
-        assert h.reclone_block.get("o") == {trig} and h.clone_blocked("o", 0)
+        assert h.reclone_block.get("o") == {(trig, frozenset({"website"}))} and h.part_blocked("o", ["website"])
+        assert not h.part_blocked("o", ["slides"])  # another part of the same message is not blocked
         await h.machines.stop()
 
     asyncio.run(go())
