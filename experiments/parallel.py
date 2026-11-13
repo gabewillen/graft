@@ -105,7 +105,7 @@ async def converse(h: Harness, script: list[str], world: World) -> tuple[list[tu
 
     for message in script:
         replies = await say(message)
-        while (follow_ups < MAX_FOLLOW_UPS and replies and replies[-1].rstrip().endswith("?")
+        while (follow_ups < MAX_FOLLOW_UPS and replies and "?" in replies[-1]
                and not all(checks(world).values())):
             follow_ups += 1
             replies = await say(FOLLOW_UP)
