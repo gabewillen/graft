@@ -22,7 +22,7 @@ A timeline that can hold the conversation (the original, and a focus graft):
     cloned --focus_joined--> joining        (the focus graft's join is put on the queue)
     joining --join_applied [the head of the queue]--> joining   (internal: that join leaves the queue)
     joining --join_commit | join_rollback--> active (idle)
-    active --join [a graft, with no live grafts of its own]--> queued
+    active --join [a graft: it has a source]--> queued
     queued --join_commit | join_rollback--> joined
     queued --join_abandon--> abandoned      (final: the join could not be applied; it is given up)
     live  --graft_queued--> live            (internal: a background graft's join is put on the queue)
@@ -48,8 +48,8 @@ handoff and their joins never move it.
 
 The graph is the authority for what may happen. A drain is refused mid-turn, while suspended, or
 with nothing queued; a clone is refused outside `turn`, from a graft (grafts are one level deep),
-and beyond MAX_LIVE_BACKGROUND live background grafts; a join is refused from the original, from
-a timeline that still has grafts, and twice. Callers dispatch and are told accepted or refused;
+and beyond MAX_LIVE_BACKGROUND live background grafts; a join is refused from the original and
+a second time (a graft never has grafts of its own to leave behind: only the original clones). Callers dispatch and are told accepted or refused;
 neither they nor this module decide by reading a state first. An event is accepted when a
 transition's effect ran for it (each event carries a token the effect records), so internal
 transitions are observable too.
@@ -131,7 +131,7 @@ def _may_clone_background(ctx, inst: TimelineSM, event) -> bool:
 
 
 def _may_join(ctx, inst: TimelineSM, event) -> bool:
-    return inst.source_id is not None and not inst.grafts
+    return inst.source_id is not None  # the original has nobody to join
 
 
 def _has_queue(ctx, inst: TimelineSM, event) -> bool:
@@ -326,10 +326,6 @@ class Machines:
         return [t for t, sm in self.timelines.items()
                 if self.state(t) == "background" and (source is None or sm.source_id == source)]
 
-    def live_background(self, source: str) -> list[str]:
-        """source's background grafts that have not joined: running, or with their join waiting."""
-        return [g for g, is_focus in self.timelines[source].grafts.items() if not is_focus]
-
     def clone_refusal(self, source: str, grafts: list[tuple[str, bool]]) -> str | None:
         """Why source may not make this clone call (depth, the focus rule, the cap on live
         background grafts), or None. The same rule the clone transitions are guarded by, for a
@@ -468,12 +464,12 @@ class Machines:
         """A focus graft's join event. Accepted: the graft is `queued` (frozen, not final), its
         join is last on its source's queue, the source is `joining` and holds the conversation
         again; returns (source, the queue to apply, in order). Refused (None): the timeline is
-        the original, has grafts of its own, or has already raised its join event."""
+        the original, or has already raised its join event."""
         async def operation() -> tuple[str, list[QueuedJoin]] | None:
             if not await self._accepts(child, name="join"):
                 return None
             src = self.timelines[child].source_id
-            await self._must(src, name="focus_joined", payload=QueuedJoin(child, reason, trigger))
+            await self._must(src, name="focus_joined", payload=QueuedJoin(child=child, reason=reason, trigger=trigger))
             await self._handoff(child, src)
             self.check()
             return src, list(self.timelines[src].queue)
@@ -487,7 +483,7 @@ class Machines:
             if not await self._accepts(child, name="finish"):
                 return None
             src = self.timelines[child].source_id
-            await self._must(src, name="graft_queued", payload=QueuedJoin(child, reason, None))
+            await self._must(src, name="graft_queued", payload=QueuedJoin(child=child, reason=reason, trigger=None))
             self.check()
             return src
         return await self._atomic(operation)
@@ -513,13 +509,6 @@ class Machines:
             self.check()
             return list(self.timelines[source].queue)
         return await self._atomic(operation)
-
-    async def begin_drain(self, source: str) -> list[QueuedJoin]:
-        """`try_begin_drain`, refused loudly."""
-        queue = await self.try_begin_drain(source)
-        if queue is None:
-            raise TransitionRefused(f"{source}: 'drain_begin' refused (not at rest, or nothing is queued)")
-        return queue
 
     async def commit_queued(self, child: str, committed: bool) -> None:
         """The join at the head of its source's queue was applied to the source. The source

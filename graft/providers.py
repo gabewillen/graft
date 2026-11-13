@@ -49,6 +49,25 @@ def window_tokens_for(provider) -> int | None:
 
 
 class Provider(Protocol):
+    """What the harness needs from a model provider.
+
+    Concurrency: `complete` is called from several worker threads at once, one per timeline
+    that is running (the conversation holder and every background graft), never from the event
+    loop. An implementation must be safe under that: no unguarded shared mutable state, and a
+    client that tolerates concurrent requests.
+
+    Blocking: a call may block for as long as the model takes; the harness bounds it with its
+    own `call_timeout` and abandons the thread if it runs over, so a late return is dropped.
+
+    Optional methods. The harness looks each of these up with `getattr` and works without it;
+    `UsageMixin` provides them all:
+      usage_tag(tag)        context manager: attribute calls made inside it to a role
+      last_call()           this thread's most recent call-log entry
+      retag(entry, tag)     move one call-log entry to another tag
+      thread_state()        this thread's tag and usage counter, to carry into a worker thread
+      adopt(state)          context manager: run a call in a worker thread with that state
+      count_prefix_tokens(system, tools)   size of the static prefix (experiments only)
+    """
     name: str
     model: str
 

@@ -23,7 +23,7 @@ def text(t):
     return [{"type": "text", "text": t}]
 
 
-def entry(skills, focus, quotes=(REQUEST,), purpose="p"):
+def entry(skills, *, focus, quotes=(REQUEST,), purpose="p"):
     return {"purpose": purpose, "skills": skills, "focus": focus, "seed_quotes": list(quotes)}
 
 
@@ -93,9 +93,9 @@ def test_clone_entries_shape():
     assert clone_entries({"clone": []})[1]
     _, v = clone_entries({"clone": [{"purpose": "p", "skills": ["website"]}]})
     assert v == ["clone[0]: focus is required and must be true or false"]
-    _, v = clone_entries({"clone": [entry(["website"], True), entry(["slides"], True)]})
+    _, v = clone_entries({"clone": [entry(["website"], focus=True), entry(["slides"], focus=True)]})
     assert len(v) == 1 and "at most one entry may have focus=true" in v[0]
-    es, v = clone_entries({"clone": [entry(["website"], True), entry(["slides"], False)]})
+    es, v = clone_entries({"clone": [entry(["website"], focus=True), entry(["slides"], focus=False)]})
     assert v == [] and len(es) == 2
 
 
@@ -105,23 +105,23 @@ def test_refused_batch_is_atomic(tmp_path):
     async def go():
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
-        for bad in (clone_use(entry(["website"], True), entry(["slides"], True)),          # two focus
-                    clone_use(entry(["website"], False), {"purpose": "p", "skills": ["slides"],
+        for bad in (clone_use(entry(["website"], focus=True), entry(["slides"], focus=True)),          # two focus
+                    clone_use(entry(["website"], focus=False), {"purpose": "p", "skills": ["slides"],
                                                           "seed_quotes": [REQUEST]}),        # focus missing
-                    clone_use(entry(["website"], False), entry(["nope"], False)),            # one bad entry
-                    clone_use(entry(["website"], False), entry(["slides"], False, ["no such message"]))):
+                    clone_use(entry(["website"], focus=False), entry(["nope"], focus=False)),            # one bad entry
+                    clone_use(entry(["website"], focus=False), entry(["slides"], focus=False, quotes=["no such message"]))):
             children, msg = await clone_in_turn(h, bad, retry_left=True)
             assert children is None and "no clone was created" in msg and "Your messages" in msg
             assert list(h.machines.timelines) == ["o"] and h.machines.state("o") == "active"
             assert store.con.execute("SELECT count(*) FROM timelines").fetchone()[0] == 1
             assert not store.con.execute("SELECT 1 FROM transactions WHERE status='committed'").fetchone()
         assert "clone[1]: unknown skill 'nope'" in msg or "clone[1]: seed quote" in msg  # per-entry violations
-        children, msg = await clone_in_turn(h, clone_use(entry(["website"], False), entry(["slides"], False)),
+        children, msg = await clone_in_turn(h, clone_use(entry(["website"], focus=False), entry(["slides"], focus=False)),
                                            retry_left=False)
         assert children == ["c1", "c2"]  # distinct ids for one batch
         assert "c1 (background, running" in msg and "c2 (background, running" in msg
         assert [h.machines.state(t) for t in ("o", "c1", "c2")] == ["active", "background", "background"]
-        assert store.running_leaf() == "o"  # the conversation stays with the source
+        assert h.machines.holder() == "o"  # the conversation stays with the source
         h.machines.check()
         assert {t["name"] for t in store.tools_for("c1")} == {"load_skill", "join", "site_write", "site_read"}
         assert "background:" in h.system("c1") and "join:" not in h.system("c1")
@@ -138,7 +138,7 @@ def test_background_and_join_are_not_selectable_skills(tmp_path):
     async def go():
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
-        children, msg = await clone_in_turn(h, clone_use(entry(["background"], False)), retry_left=False)
+        children, msg = await clone_in_turn(h, clone_use(entry(["background"], focus=False)), retry_left=False)
         assert children is None and "'background' is linked by the harness" in msg
         await h.machines.stop()
 
@@ -147,7 +147,7 @@ def test_background_and_join_are_not_selectable_skills(tmp_path):
 
 # ------------------------------------------------------------------ background grafts end to end
 def test_source_keeps_the_conversation_and_is_woken_when_grafts_join(tmp_path):
-    script = Script([entry(["website"], False), entry(["slides"], False)])
+    script = Script([entry(["website"], focus=False), entry(["slides"], focus=False)])
     store, h, said = make(tmp_path, script)
 
     async def go():
@@ -155,7 +155,7 @@ def test_source_keeps_the_conversation_and_is_woken_when_grafts_join(tmp_path):
         out = await h.user_says(REQUEST)
         assert out == ["Started."]  # the source answered while both grafts are still out
         assert [h.machines.state(t) for t in ("o", "c1", "c2")] == ["active", "background", "background"]
-        assert store.running_leaf() == "o" and h.machines.slot.holder == "o"
+        assert h.machines.holder() == "o"
         h.machines.check()
         assert join_records(store) == []
         script.open()
@@ -183,7 +183,7 @@ def test_source_keeps_the_conversation_and_is_woken_when_grafts_join(tmp_path):
 
 
 def test_joins_wait_for_the_source_to_be_at_rest_and_one_wake_covers_them(tmp_path):
-    script = Script([entry(["website"], False), entry(["slides"], False)])
+    script = Script([entry(["website"], focus=False), entry(["slides"], focus=False)])
     script.root_gate_on_reply = True  # the source is mid-turn until the gate opens
     script.open("website", "slides")
     store, h, _ = make(tmp_path, script)
@@ -220,7 +220,7 @@ def test_queued_joins_commit_before_the_next_user_message_without_a_wake(tmp_pat
         await h.start()
         req = store.add_turn("o", "user", "text", REQUEST)
         store.add_turn("o", "assistant", "text", "Started.")
-        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], False)), retry_left=False)
+        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False)), retry_left=False)
         done = store.add_turn(c1, "assistant", "text", "Site built.")
         await h.do_join(c1, "done")  # the graft's join event: frozen and queued, nothing committed
         assert h.machines.state(c1) == "queued" and [q.child for q in h.machines.queued("o")] == [c1]
@@ -245,11 +245,11 @@ def test_background_joins_commit_before_a_focus_join_so_its_trigger_stays_last(t
     async def go():
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
-        (c1, c2), msg = await clone_in_turn(h, clone_use(entry(["website"], True), entry(["slides"], False)),
+        (c1, c2), msg = await clone_in_turn(h, clone_use(entry(["website"], focus=True), entry(["slides"], focus=False)),
                                            retry_left=False)
         assert "c1 (focus, active" in msg and "c2 (background, running" in msg
         assert [h.machines.state(t) for t in ("o", c1, c2)] == ["cloned", "active", "background"]
-        assert store.running_leaf() == c1  # the focus graft, not the newer background graft
+        assert h.machines.holder() == c1  # the focus graft, not the newer background graft
         store.add_turn("o", "assistant", "tool_use", {"id": "t", "input": {}}, "clone")
         store.add_turn("o", "user", "tool_result", {"tool_use_id": "t", "content": msg}, "clone")
         deck = store.add_turn(c2, "assistant", "text", "Deck built.")
@@ -276,7 +276,7 @@ def test_focus_done_with_queued_background_joins_wakes_the_source_once(tmp_path)
     async def go():
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
-        (c1, c2), msg = await clone_in_turn(h, clone_use(entry(["website"], True), entry(["slides"], False)),
+        (c1, c2), msg = await clone_in_turn(h, clone_use(entry(["website"], focus=True), entry(["slides"], focus=False)),
                                            retry_left=False)
         store.add_turn("o", "assistant", "tool_use", {"id": "t", "input": {}}, "clone")
         store.add_turn("o", "user", "tool_result", {"tool_use_id": "t", "content": msg}, "clone")
@@ -298,7 +298,7 @@ def test_background_step_budget_and_empty_response_join_failed(tmp_path):
             return []  # empty response
         return [{"type": "tool_use", "id": f"r{len(messages)}", "name": "site_read", "input": {"page": "x"}}]
 
-    script = Script([entry(["website"], False), entry(["slides"], False)], graft)
+    script = Script([entry(["website"], focus=False), entry(["slides"], focus=False)], graft)
     script.open()
     store, h, _ = make(tmp_path, script, max_steps=3)
 
@@ -325,7 +325,7 @@ def test_background_mechanical_error_joins_failed(tmp_path):
     def graft(skill, messages):
         raise ValueError("provider exploded")
 
-    script = Script([entry(["website"], False)], graft)
+    script = Script([entry(["website"], focus=False)], graft)
     script.open()
     store, h, _ = make(tmp_path, script)
 
@@ -346,7 +346,7 @@ def test_background_silent_done_is_refused_until_it_writes_its_result(tmp_path):
         [{"type": "text", "text": "Site built with defaults."},
          {"type": "tool_use", "id": "j2", "name": "join", "input": {"reason": "done"}}],
     ])
-    script = Script([entry(["website"], False)], lambda skill, messages: next(steps))
+    script = Script([entry(["website"], focus=False)], lambda skill, messages: next(steps))
     script.open()
     store, h, _ = make(tmp_path, script)
 
@@ -373,7 +373,7 @@ def test_one_clone_call_per_message_and_no_clone_in_a_wake(tmp_path):
         if "clone" in names:
             if last["type"] == "tool_result" and "not executed" in str(last["content"]):
                 return text("Okay.")
-            return [clone_use(entry(["website"], False), id=f"c{len(messages)}") | {"type": "tool_use"}]
+            return [clone_use(entry(["website"], focus=False), id=f"c{len(messages)}") | {"type": "tool_use"}]
         return text("site finished")
 
     store, h, _ = make(tmp_path, policy)
@@ -390,19 +390,21 @@ def test_one_clone_call_per_message_and_no_clone_in_a_wake(tmp_path):
     assert len(refusals) == 2 and "no clone calls left" in refusals[0] and "woken to report" in refusals[1]
 
 
-def test_running_leaf_ignores_background_grafts(tmp_path):
+def test_a_clone_batch_is_one_store_transaction(tmp_path):
     from graft.db import Graft
     store = Store(str(tmp_path / "l.db"))
     install(store)
     store.create_timeline("o", None, ["clone"])
     rid = store.add_turn("o", "user", "text", "hi")
     store.commit_clone("o", [Graft(child="c1", seed=[rid], skills=["website", "background"], focus=False)])
-    assert store.timeline("c1")["status"] == "background" and store.running_leaf() == "o"
-    store.commit_clone("o", [Graft(child="c2", seed=[rid], skills=["slides", "join"], focus=True), Graft(child="c3", seed=[rid], skills=["calendar", "background"], focus=False)])
-    assert store.running_leaf() == "c2"
+    assert store.timeline("c1")["status"] == "background"
+    store.commit_clone("o", [Graft(child="c2", seed=[rid], skills=["slides", "join"], focus=True),
+                             Graft(child="c3", seed=[rid], skills=["calendar", "background"], focus=False)])
+    assert (store.timeline("c2")["status"], store.timeline("c3")["status"]) == ("active", "background")
     assert store.next_clone_ids(3) == ["c4", "c5", "c6"]
     with pytest.raises(Exception):  # one transaction: a bad graft rolls the whole batch back
-        store.commit_clone("o", [Graft(child="c7", seed=[rid], skills=["website", "join"], focus=True), Graft(child="c8", seed=[rid], skills=["nope"], focus=False)])
+        store.commit_clone("o", [Graft(child="c7", seed=[rid], skills=["website", "join"], focus=True),
+                                 Graft(child="c8", seed=[rid], skills=["nope"], focus=False)])
     assert store.timeline("c7") is None
 
 
@@ -428,7 +430,7 @@ def test_parallel_experiment_runs_offline(capsys, tmp_path):
 
 # ------------------------------------------------------------------ wake failures, and what a wake may do
 def test_a_failed_wake_is_visible_when_it_happens_and_still_raises_at_settle(tmp_path):
-    script = Script([entry(["website"], False)])
+    script = Script([entry(["website"], focus=False)])
     broken = {"on": True}
 
     def policy(system, messages, tools):
@@ -467,7 +469,7 @@ def test_a_wake_reports_or_routes_according_to_its_own_batch(tmp_path):
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
         store.add_turn("o", "assistant", "text", "Started.")
-        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], False), entry(["slides"], False)),
+        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False), entry(["slides"], focus=False)),
                                          retry_left=False)
         store.add_turn(c1, "assistant", "text", "Site built.")
         await h.do_join(c1, "done")
@@ -488,7 +490,7 @@ def test_a_background_failure_block_survives_an_unrelated_focus_trigger(tmp_path
     async def go():
         await h.start()
         req = store.add_turn("o", "user", "text", REQUEST)
-        (c1, c2), msg = await clone_in_turn(h, clone_use(entry(["website"], True), entry(["slides"], False)),
+        (c1, c2), msg = await clone_in_turn(h, clone_use(entry(["website"], focus=True), entry(["slides"], focus=False)),
                                            retry_left=False)
         store.add_turn("o", "assistant", "tool_use", {"id": "t", "input": {}}, "clone")
         store.add_turn("o", "user", "tool_result", {"tool_use_id": "t", "content": msg}, "clone")
@@ -510,7 +512,7 @@ def test_a_failed_background_request_is_not_recloned_until_a_new_message(tmp_pat
         await h.start()
         req = store.add_turn("o", "user", "text", REQUEST)
         store.add_turn("o", "assistant", "text", "Started.")
-        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], False), entry(["slides"], False)),
+        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False), entry(["slides"], focus=False)),
                                          retry_left=False)
         await h.do_join(c1, "failed")
         await h.do_join(c2, "out_of_scope")
@@ -558,7 +560,7 @@ def test_a_focus_graft_seeded_with_a_multi_part_message_does_its_part(tmp_path):
             return bench_graft_policy(system, messages, tools)
         last = messages[-1]["content"][-1]
         if last["type"] == "text" and last["text"] == multi:
-            return [clone_use(entry(["website"], True, [multi]), entry(["slides"], False, [multi]),
+            return [clone_use(entry(["website"], focus=True, quotes=[multi]), entry(["slides"], focus=False, quotes=[multi]),
                               id="k1") | {"type": "tool_use"}]
         return text("Okay.")
 
@@ -587,7 +589,7 @@ def test_pivot_policy_website_graft_keeps_a_multi_part_seed(tmp_path):
     async def go():
         await h.start()
         store.add_turn("o", "user", "text", "I need a website and later a slide show. Our services: cleaning.")
-        (c1,), msg = await clone_in_turn(h, clone_use(entry(["website"], True, ["I need a website"])),
+        (c1,), msg = await clone_in_turn(h, clone_use(entry(["website"], focus=True, quotes=["I need a website"])),
                                         retry_left=False)
         store.add_turn("o", "assistant", "tool_use", {"id": "t", "input": {}}, "clone")
         store.add_turn("o", "user", "tool_result", {"tool_use_id": "t", "content": msg}, "clone")
@@ -608,7 +610,7 @@ def test_wake_note_and_join_record_name_the_grafts_still_running(tmp_path):
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
         store.add_turn("o", "assistant", "text", "Started.")
-        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], False), entry(["slides"], False)),
+        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False), entry(["slides"], focus=False)),
                                          retry_left=False)
         store.add_turn(c1, "assistant", "text", "Site built.")
         await h.do_join(c1, "done")
@@ -653,7 +655,7 @@ def test_focus_join_record_names_live_background_grafts(tmp_path):
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
         (c1, c2, c3), msg = await clone_in_turn(h, clone_use(
-            entry(["website"], True), entry(["slides"], False), entry(["calendar"], False)), retry_left=False)
+            entry(["website"], focus=True), entry(["slides"], focus=False), entry(["calendar"], focus=False)), retry_left=False)
         store.add_turn("o", "assistant", "tool_use", {"id": "t", "input": {}}, "clone")
         store.add_turn("o", "user", "tool_result", {"tool_use_id": "t", "content": msg}, "clone")
         await h.do_join(c1, "out_of_scope")  # bounces at once, while both background grafts are live
@@ -683,7 +685,7 @@ def test_out_of_scope_background_joins_cannot_loop_without_a_user_message(tmp_pa
         if policy.calls > 12:  # the probe's stop: without a bound this never ends
             return text("Giving up.")
         policy.calls += 1
-        return [clone_use(entry(["website"], False, ["Earlier note."]), id=f"k{policy.calls}") | {"type": "tool_use"}]
+        return [clone_use(entry(["website"], focus=False, quotes=["Earlier note."]), id=f"k{policy.calls}") | {"type": "tool_use"}]
 
     policy.calls = 0
     store, h, _ = make(tmp_path, policy)
@@ -713,7 +715,7 @@ def test_an_exception_inside_clone_handling_ends_as_a_refused_tool_result(tmp_pa
         last = messages[-1]["content"][-1]
         if last["type"] == "tool_result":
             return text("Could not start that.")
-        return [clone_use(entry(["website"], False), id="k1") | {"type": "tool_use"}]
+        return [clone_use(entry(["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
     store = Store(str(tmp_path / "e.db"))
     install(store)
@@ -736,7 +738,7 @@ def test_an_exception_inside_clone_handling_ends_as_a_refused_tool_result(tmp_pa
 
 
 def test_a_failed_wake_at_the_end_of_a_user_turn_still_returns_the_turn(tmp_path):
-    script = Script([entry(["website"], False)])
+    script = Script([entry(["website"], focus=False)])
     script.root_gate_on_reply = True
     script.open("website")
 
@@ -763,7 +765,7 @@ def test_a_failed_wake_at_the_end_of_a_user_turn_still_returns_the_turn(tmp_path
 
 
 def test_settle_raises_every_failed_background_task(tmp_path):
-    script = Script([entry(["website"], False), entry(["slides"], False)])
+    script = Script([entry(["website"], focus=False), entry(["slides"], focus=False)])
 
     def policy(system, messages, tools):
         last = messages[-1]["content"][-1]
@@ -797,7 +799,7 @@ def test_wake_note_does_not_point_at_rows_the_size_backstop_dropped(tmp_path):
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
         store.add_turn("o", "assistant", "text", "Started.")
-        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], False)), retry_left=False)
+        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False)), retry_left=False)
         store.add_turn(c1, "assistant", "text", "Site built. " + "x" * 4000)
         await h.do_join(c1, "done")
         await h.drain_and_wake("o")
@@ -823,7 +825,7 @@ def test_clone_entries_validates_model_written_fields_and_keeps_raw_indexes():
                  "clone[2]: seed_quotes must be a list of strings",
                  "clone[2]: seed_row_ids must be a list of integers"]
     assert es[0].skills == [] and es[1].seed_quotes == [] and es[1].seed_row_ids == []  # nothing unusable kept
-    _, v = clone_entries({"clone": [entry(["website"], False)] * (MAX_CLONE_ENTRIES + 1)})
+    _, v = clone_entries({"clone": [entry(["website"], focus=False)] * (MAX_CLONE_ENTRIES + 1)})
     assert v == [f"a clone call takes at most {MAX_CLONE_ENTRIES} entries (got {MAX_CLONE_ENTRIES + 1})"]
     assert clone_entries("not a dict")[1] and clone_entries({"clone": {"purpose": "p"}})[1]
     schema = next(t for s in CATALOG if s.name == "clone" for t in s.tools if t["name"] == "clone")["input_schema"]
@@ -837,14 +839,14 @@ def test_clone_call_refuses_bad_entries_by_raw_index_and_caps_live_background_gr
     async def go():
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
-        children, msg = await clone_in_turn(h, clone_use("junk", entry(["nope"], False)), retry_left=True)
+        children, msg = await clone_in_turn(h, clone_use("junk", entry(["nope"], focus=False)), retry_left=True)
         assert children is None and "clone[0]: must be an object" in msg and "clone[1]: unknown skill 'nope'" in msg
-        children, msg = await clone_in_turn(h, clone_use(*[entry(["website"], False)] * MAX_LIVE_BACKGROUND))
+        children, msg = await clone_in_turn(h, clone_use(*[entry(["website"], focus=False)] * MAX_LIVE_BACKGROUND))
         assert len(children) == MAX_LIVE_BACKGROUND
-        children, msg = await clone_in_turn(h, clone_use(entry(["slides"], False)))
+        children, msg = await clone_in_turn(h, clone_use(entry(["slides"], focus=False)))
         assert children is None and f"at most {MAX_LIVE_BACKGROUND} background clones may be live" in msg
         assert "c1, c2, c3, c4" in msg and len(h.machines.timelines) == 1 + MAX_LIVE_BACKGROUND
-        (focus,), msg = await clone_in_turn(h, clone_use(entry(["slides"], True)))  # a focus clone is not capped
+        (focus,), msg = await clone_in_turn(h, clone_use(entry(["slides"], focus=True)))  # a focus clone is not capped
         assert focus == "c5"
         statuses = {r[0] for r in store.con.execute("SELECT status FROM transactions")}
         assert statuses == {"rolled_back", "committed"}
@@ -865,7 +867,7 @@ def test_a_failed_commit_of_the_clone_batch_is_a_refusal(tmp_path, monkeypatch):
             raise sqlite3.IntegrityError("UNIQUE constraint failed: timelines.timeline_id")
 
         monkeypatch.setattr(store, "commit_clone", broken)
-        children, msg = await clone_in_turn(h, clone_use(entry(["website"], False), entry(["slides"], True)),
+        children, msg = await clone_in_turn(h, clone_use(entry(["website"], focus=False), entry(["slides"], focus=True)),
                                             retry_left=True)
         assert children is None and "no clone was created" in msg and "IntegrityError" in msg
         assert list(h.machines.timelines) == ["o"] and h.machines.phase("o") == "idle"
@@ -880,7 +882,7 @@ async def _two_queued(store, h):
     await h.start()
     store.add_turn("o", "user", "text", REQUEST)
     store.add_turn("o", "assistant", "text", "Started.")
-    (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], False), entry(["slides"], False)))
+    (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False), entry(["slides"], focus=False)))
     store.add_turn(c1, "assistant", "text", "Site built.")
     store.add_turn(c2, "assistant", "text", "Deck built.")
     await h.do_join(c1, "done")
@@ -979,7 +981,7 @@ def test_a_failed_wake_after_a_focus_done_join_is_contained(tmp_path):
     async def go():
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
-        (c1, c2), msg = await clone_in_turn(h, clone_use(entry(["website"], True), entry(["slides"], False)))
+        (c1, c2), msg = await clone_in_turn(h, clone_use(entry(["website"], focus=True), entry(["slides"], focus=False)))
         store.add_turn("o", "assistant", "tool_use", {"id": "t", "input": {}}, "clone")
         store.add_turn("o", "user", "tool_result", {"tool_use_id": "t", "content": msg}, "clone")
         store.add_turn(c2, "assistant", "text", "Deck built.")
@@ -994,7 +996,7 @@ def test_a_failed_wake_after_a_focus_done_join_is_contained(tmp_path):
 
 
 def test_close_cancels_running_background_grafts_and_joins_them_failed(tmp_path):
-    script = Script([entry(["website"], False), entry(["slides"], False)])  # gates closed: both hang
+    script = Script([entry(["website"], focus=False), entry(["slides"], focus=False)])  # gates closed: both hang
     store, h, _ = make(tmp_path, script)
 
     async def go():
@@ -1067,8 +1069,8 @@ def test_multi_entry_clone_call_with_an_async_seeder_and_one_fallback(tmp_path):
         store.add_turn("o", "assistant", "text", "Noted.")
         req = store.add_turn("o", "user", "text", REQUEST)
         (c1, c2), msg = await clone_in_turn(h, clone_use(
-            entry(["website"], False, quotes=(), purpose="the site"),
-            entry(["slides"], False, quotes=(REQUEST,), purpose="the deck")))
+            entry(["website"], focus=False, quotes=(), purpose="the site"),
+            entry(["slides"], focus=False, quotes=(REQUEST,), purpose="the deck")))
         assert seeder.peak == 2
         assert [r["row_id"] for r in store.view(c1)][0] == fact and store.view(c1)[-1]["row_id"] == req
         assert [r["row_id"] for r in store.view(c2)] == [req]  # the model's own seed: the fallback
@@ -1166,8 +1168,8 @@ def test_a_failed_graft_blocks_only_its_own_part(tmp_path):
     hands its part back. The slides part can be routed once; the website part cannot."""
     calls = iter([
         # woken for (c1 failed, c2 out_of_scope): first tries both parts again, then only slides
-        [clone_use(entry(["website"], False), entry(["slides"], False), id="k2") | {"type": "tool_use"}],
-        [clone_use(entry(["slides"], False), id="k3") | {"type": "tool_use"}],
+        [clone_use(entry(["website"], focus=False), entry(["slides"], focus=False), id="k2") | {"type": "tool_use"}],
+        [clone_use(entry(["slides"], focus=False), id="k3") | {"type": "tool_use"}],
         text("Trying the deck again."),
         text("The deck is done; the site could not be built."),
     ])
@@ -1181,7 +1183,7 @@ def test_a_failed_graft_blocks_only_its_own_part(tmp_path):
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
         store.add_turn("o", "assistant", "text", "Started.")
-        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], False), entry(["slides"], False)))
+        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False), entry(["slides"], focus=False)))
         await h.do_join(c1, "failed")
         await h.do_join(c2, "out_of_scope")
         await h.drain_and_wake("o")  # one wake for both: a routing turn
@@ -1207,7 +1209,7 @@ def test_a_join_is_one_sql_transaction(tmp_path, monkeypatch):
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
         store.add_turn("o", "assistant", "text", "Started.")
-        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], False)))
+        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False)))
         store.add_turn(c1, "assistant", "text", "Half a site.")
         await h.do_join(c1, "failed")
         before = [r["row_id"] for r in store.view("o")]
@@ -1257,7 +1259,7 @@ def test_a_machine_failure_in_a_clone_call_leaves_no_graft_anywhere(tmp_path, mo
 
         real = h.machines.clone
         monkeypatch.setattr(h.machines, "clone", refuse)
-        children, msg = await clone_in_turn(h, clone_use(entry(["website"], focus), entry(["slides"], False)),
+        children, msg = await clone_in_turn(h, clone_use(entry(["website"], focus=focus), entry(["slides"], focus=False)),
                                             retry_left=True)
         assert children is None and "no clone was created" in msg and "injected" in msg
         assert [r[0] for r in store.con.execute("SELECT timeline_id FROM timelines")] == ["o"]
@@ -1265,7 +1267,7 @@ def test_a_machine_failure_in_a_clone_call_leaves_no_graft_anywhere(tmp_path, mo
         assert [r[0] for r in store.con.execute("SELECT status FROM transactions")] == ["rolled_back"] * 2
         assert list(h.machines.timelines) == ["o"] and h.machines.phase("o") == "idle"
         monkeypatch.setattr(h.machines, "clone", real)
-        children, _ = await clone_in_turn(h, clone_use(entry(["website"], focus), entry(["slides"], False)))
+        children, _ = await clone_in_turn(h, clone_use(entry(["website"], focus=focus), entry(["slides"], focus=False)))
         assert children == ["c1", "c2"]  # and the source can clone afterwards
         h.machines.check()
         await h.machines.stop()
@@ -1286,8 +1288,8 @@ def test_parallel_experiment_answers_a_question_with_a_bounded_follow_up(capsys,
         if "clone" in names:
             if last["type"] == "tool_result":
                 return text("(waiting)")
-            return [clone_use(entry(["website"], True, [last["text"]]), entry(["slides"], False, [last["text"]]),
-                              entry(["calendar"], False, [last["text"]]), id="k1") | {"type": "tool_use"}]
+            return [clone_use(entry(["website"], focus=True, quotes=[last["text"]]), entry(["slides"], focus=False, quotes=[last["text"]]),
+                              entry(["calendar"], focus=False, quotes=[last["text"]]), id="k1") | {"type": "tool_use"}]
         told = any(parallel.FOLLOW_UP in t for t in user_texts(messages))
         if "site_write" in names and not told:
             return text("Which colours would you like?")  # a focus graft asking for missing details
@@ -1325,7 +1327,7 @@ def test_a_user_message_that_looks_like_a_harness_note_does_not_lift_the_reclone
         if policy.calls > 12:  # the probe's stop: without a bound this never ends
             return text("Giving up.")
         policy.calls += 1
-        return [clone_use(entry(["website"], False, [spoof]), id=f"k{policy.calls}") | {"type": "tool_use"}]
+        return [clone_use(entry(["website"], focus=False, quotes=[spoof]), id=f"k{policy.calls}") | {"type": "tool_use"}]
 
     policy.calls = 0
     store, h, _ = make(tmp_path, policy)
@@ -1384,7 +1386,7 @@ def test_a_seed_may_only_point_at_rows_the_source_holds(tmp_path):
     async def go():
         await h.start()
         req = store.add_turn("o", "user", "text", REQUEST)
-        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], False)))
+        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False)))
         store.add_turn(c1, "assistant", "tool_use", {"id": "x1", "input": {"page": "home"}}, "site_read")
         secret = store.add_turn(c1, "user", "tool_result", {"tool_use_id": "x1", "content": "SIBLING OUTPUT"},
                                 "site_read")
@@ -1418,7 +1420,7 @@ def _focus_script(reply="Routing that."):
         last = messages[-1]["content"][-1]
         if "clone" in names:
             if last["type"] == "text" and last["text"] == REQUEST and not last.get("harness"):
-                return [clone_use(entry(["website"], True), id="k1") | {"type": "tool_use"}]
+                return [clone_use(entry(["website"], focus=True), id="k1") | {"type": "tool_use"}]
             return text(reply)
         if len(user_texts(messages)) > 1:
             return [{"type": "tool_use", "id": f"j{len(messages)}", "name": "join",
@@ -1445,7 +1447,7 @@ def test_a_focus_join_whose_commit_raises_is_reported_kept_and_retried(tmp_path,
         assert h.machines.state("c1") == "queued" and store.timeline("c1")["status"] == "queued"  # not joined
         assert h.machines.queued("o")[0][:2] == ("c1", "out_of_scope")  # the join and its trigger are kept
         assert (h.machines.state("o"), h.machines.phase("o")) == ("active", "idle")  # the source has the conversation
-        assert store.running_leaf() == "o"
+        assert h.machines.holder() == "o"
         monkeypatch.setattr(store, "commit_join", real)
         assert await h.settle() == ["Routing that."]  # the next commit point lands it and the request is answered
         assert h.machines.state("c1") == "joined" and h.machines.queued("o") == []
@@ -1466,7 +1468,7 @@ def test_a_refused_join_leaves_the_store_untouched(tmp_path):
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
         store.add_turn("o", "assistant", "text", "Started.")
-        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], False), entry(["slides"], False)))
+        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False), entry(["slides"], focus=False)))
         store.add_turn(c1, "assistant", "text", "Site built.")
         await h.do_join(c1, "done")
         with pytest.raises(TransitionRefused):
@@ -1526,7 +1528,7 @@ def test_a_focus_graft_whose_run_raises_joins_failed_without_the_model(tmp_path)
             return text("Sorry, I could not build that.")
         if any(b.get("harness") for m in messages for b in m["content"] if b["type"] == "text"):
             return text("Sorry, I could not build that.")
-        return [clone_use(entry(["website"], True), id="k1") | {"type": "tool_use"}]
+        return [clone_use(entry(["website"], focus=True), id="k1") | {"type": "tool_use"}]
 
     store, h, _ = make(tmp_path, policy)
 
@@ -1535,7 +1537,7 @@ def test_a_focus_graft_whose_run_raises_joins_failed_without_the_model(tmp_path)
         out = await h.user_says(REQUEST)  # the clone's provider call raises: no exception reaches the user
         assert out == ["Sorry, I could not build that."]
         assert store.timeline("c1")["join_reason"] == "failed" and h.machines.state("c1") == "joined"
-        assert (h.machines.state("o"), h.machines.phase("o")) == ("active", "idle") and store.running_leaf() == "o"
+        assert (h.machines.state("o"), h.machines.phase("o"), h.machines.holder()) == ("active", "idle", "o")
         assert h.graft_errors == [("c1", "ValueError: provider exploded")]
         assert h.part_blocked("o", ["website"])  # and it is not cloned for again
         await h.machines.stop()
@@ -1551,7 +1553,7 @@ def test_close_joins_failed_a_background_graft_that_never_started(tmp_path):
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
         store.add_turn("o", "assistant", "text", "Started.")
-        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], False)))
+        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False)))
         h._start_background([c1])  # the task exists but has not run a single step
         await h.close()
 
@@ -1562,7 +1564,7 @@ def test_close_joins_failed_a_background_graft_that_never_started(tmp_path):
 
 
 def test_close_gives_a_graft_whose_join_cannot_be_raised_a_terminal_state(tmp_path, monkeypatch):
-    script = Script([entry(["website"], False)])
+    script = Script([entry(["website"], focus=False)])
     store, h, said = make(tmp_path, script)
 
     async def go():
@@ -1607,8 +1609,8 @@ def test_a_seeder_failure_cancels_the_sibling_seeder_calls(tmp_path):
     async def go():
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
-        children, msg = await clone_in_turn(h, clone_use(entry(["website"], False, purpose="the site"),
-                                                         entry(["slides"], False, purpose="the deck")))
+        children, msg = await clone_in_turn(h, clone_use(entry(["website"], focus=False, purpose="the site"),
+                                                         entry(["slides"], focus=False, purpose="the deck")))
         assert children is None and "seeder exploded" in msg
         assert state == {"cancelled": True, "started": 2}  # nothing keeps running after the refusal
         await h.machines.stop()
@@ -1622,7 +1624,7 @@ def test_an_over_cap_clone_call_is_refused_before_any_entry_work_with_one_audit_
     async def go():
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
-        children, msg = await clone_in_turn(h, clone_use(*[entry(["website"], False)] * 300), retry_left=True)
+        children, msg = await clone_in_turn(h, clone_use(*[entry(["website"], focus=False)] * 300), retry_left=True)
         assert children is None and "at most 4 entries (got 300)" in msg and "clone[" not in msg
         await h.machines.stop()
 
@@ -1635,7 +1637,7 @@ def test_a_request_handed_back_too_often_is_not_cloned_for_again(tmp_path, monke
     no part is blocked, yet the request has come back MAX_REQUEST_HANDBACKS times."""
     import graft.harness as harness_module
     monkeypatch.setattr(harness_module, "MAX_REQUEST_HANDBACKS", 2)
-    calls = iter([[clone_use(entry(["calendar"], False), id="k2") | {"type": "tool_use"}],
+    calls = iter([[clone_use(entry(["calendar"], focus=False), id="k2") | {"type": "tool_use"}],
                   text("I could not finish that.")])
     store, h, _ = make(tmp_path, lambda *a: next(calls))
 
@@ -1643,7 +1645,7 @@ def test_a_request_handed_back_too_often_is_not_cloned_for_again(tmp_path, monke
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
         store.add_turn("o", "assistant", "text", "Started.")
-        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], False), entry(["slides"], False)))
+        (c1, c2), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False), entry(["slides"], focus=False)))
         await h.do_join(c1, "out_of_scope")
         await h.do_join(c2, "out_of_scope")
         await h.drain_and_wake("o")  # a routing wake; the source asks for a third part
@@ -1663,7 +1665,7 @@ def test_a_block_is_keyed_on_the_request_the_graft_was_cloned_for(tmp_path):
         await h.start()
         a = store.add_turn("o", "user", "text", REQUEST)
         store.add_turn("o", "assistant", "text", "Started.")
-        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], False)))
+        (c1,), _ = await clone_in_turn(h, clone_use(entry(["website"], focus=False)))
         await h.user_says("Separately: what are your opening hours?")  # request B arrives while c1 runs
         b = h.current_request("o")
         await h.do_join(c1, "failed")  # c1 was working on A
@@ -1691,7 +1693,7 @@ def test_chat_status_and_error_lines_go_to_stderr(tmp_path, monkeypatch, capsys)
             raise ValueError("wake exploded")
         if last["type"] == "tool_result":
             return text("Started.")
-        return [clone_use(entry(["website"], False, [last["text"]]), id="k1") | {"type": "tool_use"}]
+        return [clone_use(entry(["website"], focus=False, quotes=[last["text"]]), id="k1") | {"type": "tool_use"}]
 
     lines = iter(["Build me a website."])
 
@@ -1699,8 +1701,15 @@ def test_chat_status_and_error_lines_go_to_stderr(tmp_path, monkeypatch, capsys)
         try:
             return next(lines)
         except StopIteration:
-            threading.Timer(0.2, gate.set).start()  # the clone finishes after the user has quit
             raise EOFError from None
+
+    real_settle = Harness.settle
+
+    async def settle_then_release(self):
+        gate.set()  # the clone finishes only once the chat is waiting for it: no timing involved
+        return await real_settle(self)
+
+    monkeypatch.setattr(Harness, "settle", settle_then_release)
 
     monkeypatch.setattr(cli, "make_provider", lambda: FakeProvider(policy))
     monkeypatch.setattr("builtins.input", fake_input)
@@ -1815,7 +1824,7 @@ def _fails_after_speaking(raises):
                 return text("Sorry, building the site failed.")
             if last["type"] == "tool_result":
                 return text("(waiting)")
-            return [clone_use(entry(["website"], True), id="k1") | {"type": "tool_use"}]
+            return [clone_use(entry(["website"], focus=True), id="k1") | {"type": "tool_use"}]
         if raises and any(m["role"] == "assistant" for m in messages):
             raise ValueError("provider exploded")
         return [{"type": "text", "text": "Working on it."},
@@ -1923,7 +1932,7 @@ def test_a_cancelled_turn_leaves_a_valid_view_and_no_open_transaction(tmp_path):
     def policy(system, messages, tools):
         last = messages[-1]["content"][-1]
         if last["type"] == "text" and last["text"] == REQUEST:
-            return [clone_use(entry(["website"], True), entry(["slides"], False), id="k1") | {"type": "tool_use"}]
+            return [clone_use(entry(["website"], focus=True), entry(["slides"], focus=False), id="k1") | {"type": "tool_use"}]
         return text("Hello.")
 
     store = Store(str(tmp_path / "c.db"))
@@ -1947,7 +1956,7 @@ def test_a_cancelled_turn_leaves_a_valid_view_and_no_open_transaction(tmp_path):
 
 
 def test_do_join_stops_a_running_background_graft_before_it_freezes_it(tmp_path):
-    script = Script([entry(["website"], False)])  # the graft's model call hangs on its gate
+    script = Script([entry(["website"], focus=False)])  # the graft's model call hangs on its gate
     store, h, _ = make(tmp_path, script)
 
     async def go():
@@ -1982,7 +1991,7 @@ def test_a_model_call_that_never_returns_times_out_and_the_graft_joins_failed(tm
             return text("That did not work.")
         if last["type"] == "tool_result":
             return text("Started.")
-        return [clone_use(entry(["website"], focus), id="k1") | {"type": "tool_use"}]
+        return [clone_use(entry(["website"], focus=focus), id="k1") | {"type": "tool_use"}]
 
     store, h, _ = make(tmp_path, policy, call_timeout=0.1)
 

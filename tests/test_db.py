@@ -87,16 +87,6 @@ def test_trigger_must_be_last():
     assert validate(rows, "o", trigger=3) == []
 
 
-def test_running_leaf_and_descendants(store):
-    rid = store.add_turn("o", "user", "text", "hi")
-    assert store.running_leaf() == "o"
-    store.commit_clone("o", [Graft(child="c1", seed=[rid], skills=["website", "join"], focus=True)])
-    assert store.running_leaf() == "c1"
-    assert store.descendants("o") == ["c1"] and store.descendants("c1") == []
-    store.set_status("c1", "joined")
-    assert store.running_leaf() == "o"
-
-
 def test_tools_only_through_skills(store):
     rid = store.add_turn("o", "user", "text", "hi")
     store.commit_clone("o", [Graft(child="c1", seed=[rid], skills=["website", "join"], focus=True)])

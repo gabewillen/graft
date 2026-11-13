@@ -189,33 +189,10 @@ class Store:
         first = self.con.execute("SELECT count(*) FROM timelines").fetchone()[0]
         return [f"c{first + i}" for i in range(n)]
 
-    def children(self, tl: str) -> list[str]:
-        return [r[0] for r in self.con.execute(
-            "SELECT timeline_id FROM timelines WHERE source_id=? ORDER BY created_at", (tl,))]
-
-    def descendants(self, tl: str) -> list[str]:
-        """Read scope: descendants of tl (recursive over source_id; spec Depth)."""
-        return [r[0] for r in self.con.execute(
-            "WITH RECURSIVE d(id) AS (SELECT timeline_id FROM timelines WHERE source_id=? "
-            "UNION SELECT t.timeline_id FROM timelines t JOIN d ON t.source_id=d.id) "
-            "SELECT id FROM d", (tl,))]
-
     def root(self) -> str:
         return self.con.execute(
             "SELECT timeline_id FROM timelines WHERE source_id IS NULL ORDER BY created_at"
         ).fetchone()[0]
-
-    def running_leaf(self) -> str:
-        """The branch holding the conversation: the deepest live focus graft, walking down from
-        the root (never hard-coded). Skipped: joined grafts, any graft that is `queued` with
-        its join waiting, and background grafts (running or abandoned)."""
-        cur = self.root()
-        while True:
-            nxt = [c for c in self.children(cur)
-                   if self.timeline(c)["status"] not in ("joined", "background", "queued", "abandoned")]
-            if not nxt:
-                return cur
-            cur = nxt[-1]
 
     # ---------- turns & context ----------
     def insert_turn(self, owner: str, role: str, kind: str, content: Any,

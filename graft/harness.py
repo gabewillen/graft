@@ -25,16 +25,24 @@ back, to route it.
 
 The lifecycle is the state machine's (graft/machine.py): which grafts exist and of what kind,
 which have raised their join event, what is queued, and what may happen now. The harness keeps
-no copy of that; it dispatches and is told accepted or refused. Every join, a focus graft's as
-much as a background graft's, is a queue entry carrying its reason and trigger: the graft is
-`queued` until its join has been written to the source and only then `joined`, so a commit that
-fails loses nothing and is retried at the next commit point.
+no copy of that. Every join, a focus graft's as much as a background graft's, is a queue entry
+carrying its reason and trigger: the graft is `queued` until its join has been written to the
+source and only then `joined`, so a commit that fails loses nothing and is retried at the next
+commit point (a bounded number of times).
 
-The conversation lock (`Harness._conv`) is serialisation only: it keeps a user turn and a wake
-run from interleaving their awaits. It decides nothing. Whether a queued join may be applied is
-the machine's `idle`/`busy` answer to `drain_begin`, asked while the lock is held. All store and World access stays on the event-loop thread; there is no locking on external
-state. Commits are recorded in `transactions`.
-A clone may not join `done` before it has replied to the user's last message.
+Who decides what. The machine decides what is ALLOWED: every step the harness takes is a
+dispatch that the graph accepts or refuses. The harness does read the machine: `holder` (whose
+turn a user message is), `kind` and `source` (what a timeline was created as, and by whom),
+`waiting` and `background` (which sources have joins queued, which grafts still run, for
+`settle`, `close` and the notes), `clone_refusal` (the reason a clone call would be refused,
+before any seeding work), `has` (after an interrupted clone call), and `state` (copied to the
+store). None of these replaces a dispatch: whatever a read suggested, the step is still
+re-decided by the graph when it is dispatched.
+
+The conversation lock (`Harness._conv`) is where things WAIT: a user turn, a wake run, a graft
+that has finished and wants its join applied, `settle` and `close` take it one at a time, so
+their awaits do not interleave. It allows nothing by itself; whether a queued join may be applied
+is the machine's answer to `drain_begin`, asked while the lock is held.
 """
 
 from __future__ import annotations
@@ -392,7 +400,7 @@ class Harness:
         while the conversation was idle. A wake or join-commit failure after the turn is part of
         that output (a harness error line), not an exception."""
         async with self._conv:
-            leaf = self.store.running_leaf()
+            leaf = self.machines.holder()  # the machine's slot says whose turn this is
             await self._drain(leaf)  # queued background joins land before the message
             await self.machines.begin_turn(leaf)  # refused unless leaf is at rest
             try:  # between the accepted turn_begin and `_turn`, which closes the turn
@@ -1205,7 +1213,7 @@ class Harness:
                 "tool_name": None, "content": content, "harness": 1}
 
     # ------------------------------------------------------------ one-shot clone
-    def resolve_seed(self, src: str, quotes: list, row_ids: list) -> tuple[list[int], list[str]]:
+    def resolve_seed(self, src: str, *, quotes: list, row_ids: list) -> tuple[list[int], list[str]]:
         """Seed items -> row ids (pointers). A seed may only point at rows the source itself holds
         in its context: its own rows and what was joined into it. A descendant's other rows (a
         running sibling's work, tool output that never joined) are not reachable through a seed.
@@ -1346,7 +1354,7 @@ class Harness:
                       "handed it back twice. Do not clone for that part again: leave this entry out and "
                       "tell the user, briefly, what could not be done"
                       for e in entries if self.part_blocked(src, e.skills)]
-        resolved = [self.resolve_seed(src, e.seed_quotes, e.seed_row_ids) for e in entries]
+        resolved = [self.resolve_seed(src, quotes=e.seed_quotes, row_ids=e.seed_row_ids) for e in entries]
         decisions: list[dict | None] = [None] * len(entries)
         if self.seeder is not None and not shape:
             try:  # all entries, or none left running: a failure cancels and awaits the others

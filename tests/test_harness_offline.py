@@ -55,7 +55,7 @@ def test_pivot_flow_offline(harness):
     # one clone call per clone: every original call either routed (clone_tx) or answered
     assert h.provider.by_tag["original:clone_tx"]["calls"] == 2
     assert "ohio" in h.world.deck_text().lower()
-    assert s.running_leaf() == "c2"
+    assert h.machines.holder() == "c2"
     # the clone only had its linked tools
     c2_tools = {c["tools"][i]["name"] for c in h.provider.calls if "slides_create" in str(c["tools"])
                 for i in range(len(c["tools"]))}
@@ -356,7 +356,7 @@ def test_failed_clone_is_not_recloned_for_the_same_message(tmp_path):
         assert out == ["Sorry, I could not build that."]
         assert [t for t in h.machines.timelines if t != "o"] == ["c1"]  # cloned once, not again
         assert store.timeline("c1")["join_reason"] == "failed"
-        assert store.running_leaf() == "o"
+        assert h.machines.holder() == "o"
         out = await h.user_says("Try a different page.")  # a new message may clone again
         assert "c2" in h.machines.timelines
         await h.machines.stop()
