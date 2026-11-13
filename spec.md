@@ -209,7 +209,7 @@ Architecture rules (routing, cloning, joining) are not part of the persona; they
    ```
 
    `trigger` is the user message the clone did not handle, if any: the last user message in its view when it hands it back or never answered it. A harness note is not a user message and is never a trigger. A background graft never receives a user message, so its trigger is always null.
-4. Mechanical failures (errors, timeouts, exhausted budget) raise `failed` without the model. This holds for a focus graft as for a background graft: if its run raises, it joins `failed`, its source takes the conversation back and answers the user, and the error does not escape as an exception from the user's turn.
+4. Mechanical failures (errors, timeouts, exhausted budget) raise `failed` without the model. A model call has a time limit (300 seconds by default, configurable, and it can be switched off); a call that does not return in time is such a failure, so a hung call cannot keep a graft live for ever. This holds for a focus graft as for a background graft: if its run raises, it joins `failed`, its source takes the conversation back and answers the user, and the error does not escape as an exception from the user's turn.
 5. **A background graft always joins.** Nobody can answer it, so a turn that ends on a text reply without a join call joins it `done` (the reply is its result), and an empty response joins it `failed`.
 
 ### Default join (deterministic)
@@ -258,18 +258,22 @@ idle ──drain begins [joins queued]──▶ joining
 joining ──join applied [the head of the queue]──▶ joining
 joining ──join commit | join rollback──▶ active (idle)
 active ──join [a graft with no grafts of its own]──▶ queued ──join commit | join rollback──▶ joined
+queued ──join abandon──▶ abandoned (final: the join could not be applied and was given up)
 ```
 
 A background graft:
 
 ```text
 background ──finishes──▶ queued ──join commit | join rollback──▶ joined (final)
+queued ──join abandon──▶ abandoned (final: the join could not be applied and was given up)
 background ──abandon──▶ abandoned (final: its join event could not be raised)
 ```
 
 `queued` means the graft is frozen and its join event, with its reason and trigger, is waiting on its source; `joined` means that join was applied to the source. A focus graft and a background graft go through the same two steps. Both states are recorded in `timelines.status`, so a join that has not landed is never mistaken for one that has. The queue belongs to the source's state machine, in finish order; it changes only in transition effects, and a graft leaves it only when its join has been applied.
 
-**The state machine is the authority.** The graph refuses a drain when the source is in a turn, suspended or has nothing queued; a clone outside `turn`, from a graft (grafts are one level deep), or beyond the cap on live background grafts; a join from the original, from a timeline that still has grafts of its own, or a second time. It also records what kind each timeline is and which grafts have raised their join event; the harness keeps no copy. The harness dispatches and is told accepted or refused; it does not decide from states it reads. Each operation is one critical section that runs to completion even if its caller is cancelled, so an operation of several steps (undoing a clone call, applying a join) cannot be left half done. A drain always ends through `join commit` or `join rollback`: rollback if any join was rolled back or could not be applied. A join that cannot be applied, a focus graft's as much as a background graft's, stays `queued` with its reason and trigger; the user is told at once which clones are affected and that the commit failed; the source returns to rest holding the conversation; and the join is retried at the next commit point. Nothing is lost: a handed-back user message is still answered once its join lands.
+**The state machine is the authority.** The graph refuses a drain when the source is in a turn, suspended or has nothing queued; a clone outside `turn`, from a graft (grafts are one level deep), or beyond the cap on live background grafts; a join from the original, from a timeline that still has grafts of its own, or a second time. It also records what kind each timeline is and which grafts have raised their join event; the harness keeps no copy. The harness dispatches and is told accepted or refused; it does not decide from states it reads. Each operation is one critical section that runs to completion even if its caller is cancelled, so an operation of several steps (undoing a clone call, applying a join) cannot be left half done. A drain always ends through `join commit` or `join rollback`: rollback if any join was rolled back or could not be applied. A join that cannot be applied, a focus graft's as much as a background graft's, stays `queued` with its reason and trigger; the user is told at once which clones are affected and that the commit failed; the source returns to rest holding the conversation; and the join is retried at the next commit point. A handed-back user message is still answered once its join lands. The retries are bounded: after 3 failed attempts the join is given up, the graft ends `abandoned`, the user is told once that its work is not part of the conversation's memory, and the joins behind it are applied. Between the machine accepting a step that must be closed (`drain begins`, `focus graft joins`, `turn begins`, `report begins`) and the code that guarantees the closing event, the harness writes nothing, so a failed write cannot leave a source in `joining` or `busy`.
+
+**An interrupted turn leaves a valid view.** If a turn is cancelled, or fails, after a tool call was stored and before its result was, the harness stores a result saying the call was not executed, and closes any open transaction of a clone call as `rolled_back`. The next model call on that timeline is well formed.
 
 **Invariant: at most one branch holds the conversation.** Exactly one timeline is in `active` or `joining`, and it holds the single global conversation slot. Every other timeline is `cloned` (suspended), `background` or `queued` (outside the slot) or `joined` (frozen). A focus graft's join hands the slot from the clone straight to its source. Creating a background graft is not a handoff, and its join never moves the slot. The harness enforces this as a single global state, not per source.
 

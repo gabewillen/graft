@@ -65,6 +65,12 @@ MAX_REQUEST_HANDBACKS = 8
 # hand-backs and wakes it sets off. Reset only by a user message. This bound depends on no key:
 # whatever a model seeds and however a hand-back is attributed, cloning stops here.
 MAX_CLONE_CALLS_PER_MESSAGE = 4
+# Seconds one model call may take before it is abandoned as a mechanical failure (the harness's
+# `call_timeout`; None disables it). Without it a hung call keeps a graft live for ever.
+MODEL_CALL_TIMEOUT = 300.0
+# Times a join's commit is tried, at successive commit points, before the join is given up and
+# the graft ends `abandoned`, so one join that can never be applied does not block the queue.
+MAX_JOIN_ATTEMPTS = 3
 # A join must leave the source's working view under this fraction of the model window:
 # estimate_tokens is chars / 4 (rough), and the reply needs room too.
 JOIN_WINDOW_FRACTION = 0.85
@@ -183,6 +189,10 @@ async def in_daemon_thread(fn: Callable[[], object]) -> object:
     return await future
 
 
+class ModelCallTimeout(TimeoutError):
+    """A model call did not return within the harness's `call_timeout`."""
+
+
 def _reason(reason: str) -> str:
     return reason if reason in ("done", "out_of_scope", "failed") else "failed"
 
@@ -192,7 +202,8 @@ class Harness:
                  trace: Callable[[str], None] | None = None, max_steps: int = 10,
                  persona: str = BASE_SYSTEM, nonce: str | None = None,
                  compact_tokens: int | None = None, compaction_mode: str = "turns", seeder=...,
-                 window_tokens: int | None = ..., emit: Callable[[str], None] | None = None):
+                 window_tokens: int | None = ..., emit: Callable[[str], None] | None = None,
+                 call_timeout: float | None = MODEL_CALL_TIMEOUT):
         self.store = store
         self.persona = persona  # user-provided; identical, verbatim, on every timeline
         self.provider = provider
@@ -200,6 +211,11 @@ class Harness:
         self.machines = Machines()
         self.trace = trace or (lambda s: None)
         self.max_steps = max_steps
+        # Seconds a model call may take (None: no limit). A call that exceeds it raises
+        # ModelCallTimeout, which is handled like any error of the run it belongs to.
+        if call_timeout is not None and call_timeout <= 0:
+            raise ValueError(f"call_timeout must be positive or None, got {call_timeout!r}")
+        self.call_timeout = call_timeout
         self.silent_done_refusals: list[str] = []  # clones whose join(done) was refused
         # Seed actor (graft/seeder.py): None = the original names the seed itself (GRAFT_SEEDER=model)
         self.seeder = seeder_mod.make_seeder() if seeder is ... else seeder
@@ -224,6 +240,8 @@ class Harness:
         self.task_errors: list[tuple[str, list[str], str]] = []
         self._failures: list[Exception] = []  # the same errors, as raised, in order
         self.graft_errors: list[tuple[str, str]] = []  # (clone, error): its run raised; it joined failed
+        self.join_attempts: dict[str, int] = {}  # graft -> failed attempts to commit its join
+        self._taken_over: set[str] = set()  # background grafts whose task do_join is stopping
         # Per-run conversation nonce, prefixed to the first message of every request at render
         # time (never stored). None = no nonce (cache experiments: --cache-scope global).
         self.nonce = nonce
@@ -275,7 +293,13 @@ class Harness:
                     blocks = provider.complete(system, sent, tools, **kw, **cs)
                 return blocks, getattr(provider, "last_call", lambda: None)()
 
-        return await in_daemon_thread(call)
+        if self.call_timeout is None:
+            return await in_daemon_thread(call)
+        try:
+            return await asyncio.wait_for(in_daemon_thread(call), timeout=self.call_timeout)
+        except TimeoutError:  # the thread is a daemon: its late result, if any, is dropped
+            raise ModelCallTimeout(f"the model call for {tag} did not return within "
+                                   f"{self.call_timeout:g}s") from None
 
     def role(self, tl: str) -> str:
         return "original" if self.store.timeline(tl)["source_id"] is None else f"clone:{tl}"
@@ -331,7 +355,8 @@ class Harness:
         word += "s" if len(clones) != 1 else ""
         return f"{word} {', '.join(clones)}" if named else word
 
-    def _report_failure(self, *, kind: str, src: str, clones: list[str], error: Exception) -> None:
+    def _report_failure(self, *, kind: str, src: str, clones: list[str], error: Exception,
+                        quiet: bool = False) -> None:
         """The one place a failed wake run, a failed join commit, or an unreported background
         task error is recorded and shown. The user is told at once (the line is user-facing
         output and goes through `emit`); the error itself is kept for `settle()` and for the
@@ -345,11 +370,18 @@ class Harness:
             self.commit_errors.append((src, clones, err))
             line = (f"(harness error: committing the join of {names} failed: {err}; "
                     "the result is kept and the join will be retried)")
+        elif kind == "abandon":
+            line = (f"(harness error: the join of {names} could not be applied after {MAX_JOIN_ATTEMPTS} attempts "
+                    f"({err}); it is abandoned. Its work stays in its frozen timeline and is not part of the "
+                    "conversation's memory.)")
         else:
             self.task_errors.append((src, clones, err))
             line = f"(harness error: {names} stopped with an error: {err})"
-        self._failures.append(error)
+        if kind != "abandon":
+            self._failures.append(error)  # an abandonment follows a commit failure already recorded
         self.trace(f"[{src}] {kind.upper()} FAILED for {clones}: {err}")
+        if quiet:  # a repeat of something the user was already told
+            return
         self.out.append(line)
         self.emit(line)
 
@@ -363,11 +395,15 @@ class Harness:
             leaf = self.store.running_leaf()
             await self._drain(leaf)  # queued background joins land before the message
             await self.machines.begin_turn(leaf)  # refused unless leaf is at rest
-            rid = self.store.add_turn(leaf, "user", "text", text)
-            self.reclone_block.pop(leaf, None)  # a new request may clone again
-            self.clone_calls_this_message = 0
-            self.wake_clone_calls.pop(leaf, None)
-            self.trace(f"[{leaf}] user (row {rid}): {text}")
+            try:  # between the accepted turn_begin and `_turn`, which closes the turn
+                rid = self.store.add_turn(leaf, "user", "text", text)
+                self.reclone_block.pop(leaf, None)  # a new request may clone again
+                self.clone_calls_this_message = 0
+                self.wake_clone_calls.pop(leaf, None)
+                self.trace(f"[{leaf}] user (row {rid}): {text}")
+            except BaseException:
+                await self.machines.try_end_turn(leaf)
+                raise
             failed_commits = len(self.commit_errors)
             await self._turn(leaf)
             if len(self.commit_errors) == failed_commits:  # a commit that just failed is not retried at once
@@ -565,13 +601,19 @@ class Harness:
         return await self._turn(tl)
 
     async def _turn(self, tl: str, wake: bool = False, report: bool = False) -> str:
-        """Run tl, which the caller has just put in `turn` or `reporting`, and close the turn. A
-        focus graft whose run raises joins `failed` without the model (spec: Join), like a
-        background graft: the error does not leave the conversation stuck on a dead clone."""
+        """Run tl, which the caller has just put in `turn` or `reporting`, and close the turn.
+        Everything after the machine accepted that step happens in here, so whatever raises
+        (the model, a tool, a store write) the turn is closed and tl is not left busy. A turn
+        that is interrupted leaves tl's view valid: a tool call already stored gets a result
+        saying it was not executed. A focus graft whose run raises joins `failed` without the
+        model (spec: Join), like a background graft: the error does not leave the conversation
+        stuck on a dead clone."""
         try:
+            self._mirror()
             end = await self._loop(tl, wake=wake, report=report)
         except Exception as e:
             await self.machines.try_end_turn(tl)  # leave tl usable; refused if it handed off
+            self._close_tool_uses(tl)
             self._mirror()
             if self.machines.kind(tl) != "focus":
                 raise
@@ -582,14 +624,31 @@ class Harness:
             self.graft_errors.append((tl, f"{type(e).__name__}: {e}"))
             self.trace(f"[{tl}] run failed -> join failed: {type(e).__name__}: {e}")
             return "joined"
-        except BaseException:
+        except BaseException:  # cancelled
             await self.machines.try_end_turn(tl)
+            self._close_tool_uses(tl)
             self._mirror()
             raise
         if end == "ended":
             await self.machines.end_turn(tl)
             self._mirror()
         return end
+
+    def _close_tool_uses(self, tl: str) -> None:
+        """tl's run was interrupted. If its view ends on tool calls that have no result (the
+        interruption fell between storing the calls and storing their results), store a result
+        for each saying it was not executed, so the view stays valid for the next model call."""
+        rows = self.store.view(tl)
+        tail: list[dict] = []
+        for r in reversed(rows):
+            if r["role"] != "assistant":
+                break
+            tail.append(r)
+        if len(tail) == len(rows) or not tail or rows[-1]["role"] != "assistant":
+            return
+        self._store_results(tl, [({"id": json.loads(r["content"])["id"], "name": r["tool_name"]},
+                                  "not executed: the turn was interrupted", True)
+                                 for r in reversed(tail) if r["kind"] == "tool_use"])
 
     async def _loop(self, tl: str, wake: bool = False, report: bool = False) -> str:
         """The model loop for tl. Returns "ended" (tl ended its turn and still holds the
@@ -717,6 +776,8 @@ class Harness:
         try:
             await self._loop(child)
         except asyncio.CancelledError:
+            if child in self._taken_over:  # `do_join` stopped the run and raises the join event itself
+                raise
             if await self._join_background(child, reason="failed"):
                 self.trace(f"[{child}] background run cancelled -> join failed")
             raise
@@ -777,26 +838,50 @@ class Harness:
         req = self.current_request(tl)
         return any(r == req and part & set(skills) for r, part in self.reclone_block.get(tl, ()))
 
-    async def _commit_joining(self, src: str, queue: list[QueuedJoin]) -> tuple[list[QueuedJoin], bool]:
+    async def _commit_joining(self, src: str, queue: list[QueuedJoin], note: str | None = None
+                              ) -> tuple[list[QueuedJoin], bool]:
         """src is `joining` and `queue` is what the machine handed over, in order: apply each
-        join to src. Each graft becomes `joined` and leaves the queue only after its join was
-        written. If one cannot be applied, it and those behind it stay `queued` with their
-        reason and trigger, the user is told, and they are retried at the next commit point.
-        src always leaves `joining`: through join_commit if every join was committed, else
-        through join_rollback. Returns (the joins applied, whether that was all of them)."""
+        join to src. Everything that follows the machine's accepting `focus_joined` or
+        `drain_begin` happens in here, inside the block that always dispatches the closing
+        event, so no failed write can leave src in `joining`. Each graft becomes `joined` and
+        leaves the queue only after its join was written. If one cannot be applied, it and
+        those behind it stay `queued` with their reason and trigger, the user is told, and they
+        are retried at the next commit point; after MAX_JOIN_ATTEMPTS failed attempts that join
+        is given up (the graft ends `abandoned`, the user is told once) and the queue moves on.
+        src leaves `joining` through join_commit if every join was committed, else through
+        join_rollback. Returns (the joins applied, whether the whole queue was dealt with)."""
         applied: list[QueuedJoin] = []
         outcomes: list[bool] = []
         complete = False
+        current = 0
         try:
-            for join in queue:
-                committed = self.default_join(src, join.child, join.reason, trigger=join.trigger)
-                await self.machines.commit_queued(join.child, committed=committed)
+            self._mirror()
+            if note:
+                self.trace(note)
+            for current, join in enumerate(queue):
+                try:
+                    self.store.set_join(join.child, join.reason, trigger=join.trigger)
+                    committed = self.default_join(src, join.child, join.reason, trigger=join.trigger)
+                    await self.machines.commit_queued(join.child, committed=committed)
+                except Exception as e:
+                    attempts = self.join_attempts[join.child] = self.join_attempts.get(join.child, 0) + 1
+                    if attempts < MAX_JOIN_ATTEMPTS:
+                        raise
+                    self._report_failure(kind="commit", src=src, clones=[j.child for j in queue[current:]],
+                                         error=e, quiet=True)
+                    await self.machines.abandon_queued(join.child)
+                    self._report_failure(kind="abandon", src=src, clones=[join.child], error=e)
+                    outcomes.append(False)
+                    continue
                 self._note_arrival(src, join)
                 applied.append(join)
                 outcomes.append(committed)
             complete = True
         except Exception as e:
-            self._report_failure(kind="commit", src=src, clones=[j.child for j in queue[len(applied):]], error=e)
+            waiting = [j.child for j in queue[current:]]
+            # the user hears of a join that cannot be applied once, not at every retry
+            repeat = bool(waiting) and self.join_attempts.get(waiting[0], 0) > 1
+            self._report_failure(kind="commit", src=src, clones=waiting, error=e, quiet=repeat)
         finally:
             await self.machines.finish_join(src, committed=complete and all(outcomes))
             self._mirror()
@@ -809,7 +894,6 @@ class Harness:
         queue = await self.machines.try_begin_drain(src)
         if queue is None:
             return None
-        self._mirror()
         return await self._commit_joining(src, queue)
 
     async def _drain_waiting(self) -> None:
@@ -903,8 +987,7 @@ class Harness:
                 await self.machines.begin_turn(src)
             else:
                 await self.machines.begin_report(src)
-            self._mirror()
-            await self._turn(src, wake=not focus_back, report=not routing)
+            await self._turn(src, wake=not focus_back, report=not routing)  # closes what was begun
         except Exception as e:
             self._report_failure(kind="wake", src=src, clones=[c for c, _ in joined], error=e)
 
@@ -978,32 +1061,41 @@ class Harness:
         return self.request_at_clone.get(join.child)
 
     async def do_join(self, child: str, reason: str) -> None:
-        """Raise child's join event from outside its own loop (tests, the replay experiment).
-        TransitionRefused, with nothing written, if the machine refuses it: child is the
-        original, or has already raised its join event."""
-        if self.is_background(child):
-            if not await self._join_background(child, reason=_reason(reason)):
-                raise TransitionRefused(f"{child} has already raised its join event")
-        else:
+        """Raise child's join event from outside its own loop (tests, the replay experiment). A
+        background graft whose task is still running is stopped first, so nothing runs in a
+        timeline after it is frozen. TransitionRefused, with nothing written, if the machine
+        refuses the event: child is the original, or has already raised its join event."""
+        if not self.is_background(child):
             await self._join_focus(child, reason=_reason(reason))
+            return
+        task = self._tasks.get(child)
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            self._taken_over.add(child)
+            try:
+                task.cancel()
+                await asyncio.wait([task])
+            finally:
+                self._taken_over.discard(child)
+        if not await self._join_background(child, reason=_reason(reason)):
+            raise TransitionRefused(f"{child} has already raised its join event")
 
     async def _join_focus(self, child: str, reason: str) -> None:
         """A focus graft's join: deterministic, no model call. The machine is asked first; it
         puts the join, with its reason and trigger, last on the source's queue, behind any
         background joins that were waiting, so the trigger stays the last row. The graft is
-        `queued` until its join has been written. If the write fails the join stays queued, the
-        source takes the conversation back, the user is told, and the next commit point retries
-        it. TransitionRefused, with nothing written, if the machine refuses the join event."""
+        `queued` until its join has been written. Nothing is written between the machine's
+        accepting the event and `_commit_joining`, which closes `joining` whatever happens. If
+        a write fails the join stays queued, the source takes the conversation back, the user
+        is told, and the next commit point retries it. TransitionRefused, with nothing written,
+        if the machine refuses the join event."""
         trigger = self.compute_trigger(child, reason)
         accepted = await self.machines.join_focus(child, reason=reason, trigger=trigger)
         if accepted is None:
             raise TransitionRefused(f"{child} cannot join: it is the original, or has already "
                                     "raised its join event")
         src, queue = accepted
-        self.store.set_join(child, reason, trigger=trigger)
-        self._mirror()
-        self.trace(f"JOIN EVENT {{clone: {child}, reason: {reason}, trigger: {trigger}}} -> {src} joining")
-        applied, _ = await self._commit_joining(src, queue)
+        applied, _ = await self._commit_joining(
+            src, queue, note=f"JOIN EVENT {{clone: {child}, reason: {reason}, trigger: {trigger}}} -> {src} joining")
         if applied:
             await self._after_commit(src, applied, contain=False)
 
@@ -1221,7 +1313,7 @@ class Harness:
         state = {"committed": False}
         try:
             return await self._clone_call(src, use, retry_left=retry_left, txs=txs, state=state)
-        except Exception as e:
+        except BaseException as e:  # an error, or the turn was cancelled while the call was awaiting
             if state["committed"]:
                 raise  # the grafts exist in the store: not a refusal, a harness bug
             err = f"{type(e).__name__}: {e}"
@@ -1232,6 +1324,8 @@ class Harness:
                     self.store.end_tx(tx, status="rolled_back", committed_sql=None,
                                       scratch={"args": use.get("input"), "error": err})
             self.trace(f"[{src}] clone refused: internal error: {err}")
+            if not isinstance(e, Exception):
+                raise  # cancelled: the transactions are closed; `_turn` stores the tool result
             tail = "Call clone once more." if retry_left \
                 else "No retries left for this message; answer the user instead."
             return None, None, f"clone refused; no clone was created: internal error ({err}).\n{tail}"
@@ -1301,11 +1395,14 @@ class Harness:
         # The machine transition and the store commit are one unit. The machine goes first (it may
         # refuse, and then nothing was written); if the single SQL transaction then fails, the
         # machine step is undone. Nothing awaits in between, so no one observes the gap.
-        await self.machines.clone(src, pairs)
         try:
+            await self.machines.clone(src, grafts=pairs)
             self.store.commit_clone(src, grafts, audits=audits)
         except BaseException:
-            await self.machines.unclone(src, pairs)
+            # The commit failed, or the turn was cancelled while the machine step was running
+            # (the step itself always completes): if the machine has the grafts, undo it.
+            if self.machines.has(pairs[0][0]):
+                await self.machines.unclone(src, grafts=pairs)
             raise
         state["committed"] = True
         request = self.current_request(src)

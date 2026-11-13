@@ -24,13 +24,15 @@ A timeline that can hold the conversation (the original, and a focus graft):
     joining --join_commit | join_rollback--> active (idle)
     active --join [a graft, with no live grafts of its own]--> queued
     queued --join_commit | join_rollback--> joined
+    queued --join_abandon--> abandoned      (final: the join could not be applied; it is given up)
     live  --graft_queued--> live            (internal: a background graft's join is put on the queue)
     live  --grafts_dropped--> live          (internal: grafts that never joined are forgotten)
 
 A background graft (it runs concurrently and never holds the conversation):
 
     background --finish--> queued --join_commit | join_rollback--> joined (final)
-    background --abandon--> abandoned (final: its join event could not be raised)
+    queued --join_abandon--> abandoned      (final: the join could not be applied; it is given up)
+    background --abandon--> abandoned       (final: its join event could not be raised)
 
 `queued` means the graft is frozen and its join event, with its reason and trigger, is waiting on
 its source; `joined` means that join was applied to the source (committed, or rolled back to a
@@ -215,8 +217,10 @@ TIMELINE = hsm.Define(
         "queued",
         hsm.Transition(hsm.On("join_commit"), hsm.Target("../joined"), _fx()),
         hsm.Transition(hsm.On("join_rollback"), hsm.Target("../joined"), _fx()),
+        hsm.Transition(hsm.On("join_abandon"), hsm.Target("../abandoned"), _fx()),
     ),
     hsm.Final("joined"),
+    hsm.Final("abandoned"),
 )
 
 BACKGROUND = hsm.Define(
@@ -231,6 +235,7 @@ BACKGROUND = hsm.Define(
         "queued",
         hsm.Transition(hsm.On("join_commit"), hsm.Target("../joined"), _fx()),
         hsm.Transition(hsm.On("join_rollback"), hsm.Target("../joined"), _fx()),
+        hsm.Transition(hsm.On("join_abandon"), hsm.Target("../abandoned"), _fx()),
     ),
     hsm.Final("joined"),
     hsm.Final("abandoned"),
@@ -528,6 +533,24 @@ class Machines:
             await self._must(child, name="join_commit" if committed else "join_rollback")
             self.check()
         await self._atomic(operation)
+
+    async def abandon_queued(self, child: str) -> None:
+        """The join at the head of its source's queue cannot be applied and is given up: the
+        source (which must be `joining`) drops the entry, and the graft ends `abandoned`. The
+        joins behind it can then be applied."""
+        async def operation() -> None:
+            src = self.timelines[child].source_id
+            if src is None:
+                raise TransitionRefused(f"{child} has no source")
+            await self._must(src, name="join_applied", payload=child)
+            await self._must(child, name="join_abandon")
+            self.check()
+        await self._atomic(operation)
+
+    def has(self, tl: str) -> bool:
+        """Does the machine know this timeline? For a caller whose clone was interrupted and
+        that must find out whether the step was taken before it undoes it."""
+        return tl in self.timelines
 
     async def finish_join(self, source: str, committed: bool) -> None:
         """The joins source was applying are done: joining->active (idle). `committed` is the

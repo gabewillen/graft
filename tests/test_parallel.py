@@ -1839,3 +1839,207 @@ def test_a_focus_graft_that_fails_after_speaking_still_gets_the_user_an_answer(t
 
     asyncio.run(go())
     assert validate(store.view("o"), "o", require_user_end=False) == []
+
+
+# ------------------------------------------------------------------ a failed write never leaves the source stuck
+def _once(real, when, error):
+    """Wrap a store method: raise `error` the first time `when(*args)` holds, then behave."""
+    fired = []
+
+    def wrapper(*args, **kw):
+        if not fired and when(*args, **kw):
+            fired.append(args)
+            raise error
+        return real(*args, **kw)
+
+    wrapper.fired = fired
+    return wrapper
+
+
+def test_a_store_error_while_a_focus_graft_joins_does_not_strand_the_source(tmp_path, monkeypatch):
+    store, h, said = make(tmp_path, _focus_script())
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        broken = _once(store.set_join, lambda child, reason, trigger=None: child == "c1", OSError("disk full"))
+        monkeypatch.setattr(store, "set_join", broken)
+        out = await h.user_says("Now email it to Bob.")  # c1 hands it back; the first write after the event fails
+        assert broken.fired and len(out) == 1 and "disk full" in out[0] and out[0].startswith("(harness error")
+        assert (h.machines.state("o"), h.machines.phase("o"), h.machines.holder()) == ("active", "idle", "o")
+        assert h.machines.state("c1") == "queued"
+        assert await h.settle() == ["Routing that."]  # the retry lands the join; the request is answered
+        assert store.timeline("c1")["join_reason"] == "out_of_scope" and h.machines.state("c1") == "joined"
+        await h.close()
+
+    asyncio.run(go())
+
+
+def test_a_store_error_right_after_a_drain_begins_does_not_strand_the_source(tmp_path, monkeypatch):
+    store, h, said = make(tmp_path, lambda *a: text("Reporting."))
+
+    async def go():
+        c1, c2 = await _two_queued(store, h)
+        broken = _once(store.set_status, lambda tl, status: (tl, status) == ("o", "joining"), OSError("disk full"))
+        monkeypatch.setattr(store, "set_status", broken)
+        await h.drain_and_wake("o")
+        assert broken.fired and h.commit_errors == [("o", [c1, c2], "OSError: disk full")]
+        assert (h.machines.state("o"), h.machines.phase("o")) == ("active", "idle")  # not left in `joining`
+        assert [q.child for q in h.machines.queued("o")] == [c1, c2]
+        await h.drain_and_wake("o")
+        assert h.machines.queued("o") == [] and len(h.wakes) == 1
+        await h.close()
+
+    asyncio.run(go())
+
+
+def test_a_store_error_right_after_a_wake_begins_does_not_strand_the_source(tmp_path, monkeypatch):
+    store, h, said = make(tmp_path, lambda *a: text("Reporting."))
+
+    async def go():
+        c1, c2 = await _two_queued(store, h)
+        broken = _once(store.set_status, lambda tl, status: tl == "o" and h.machines.phase("o") == "reporting",
+                       OSError("disk full"))
+        monkeypatch.setattr(store, "set_status", broken)
+        await h.drain_and_wake("o")
+        assert broken.fired and h.wake_errors == [("o", [c1, c2], "OSError: disk full")]
+        assert (h.machines.state("o"), h.machines.phase("o")) == ("active", "idle")  # not left in `reporting`
+        assert await h.user_says("Did it work?") == [said[0], "Reporting."]
+        await h.close()
+
+    asyncio.run(go())
+
+
+def test_a_cancelled_turn_leaves_a_valid_view_and_no_open_transaction(tmp_path):
+    from graft import seeder as sd
+
+    class Slow:
+        name = "slow"
+
+        async def score(self, purpose, cands, trigger):
+            await asyncio.sleep(30)
+            return sd.SeedDecision()
+
+    def policy(system, messages, tools):
+        last = messages[-1]["content"][-1]
+        if last["type"] == "text" and last["text"] == REQUEST:
+            return [clone_use(entry(["website"], True), entry(["slides"], False), id="k1") | {"type": "tool_use"}]
+        return text("Hello.")
+
+    store = Store(str(tmp_path / "c.db"))
+    install(store)
+    h = Harness(store, FakeProvider(policy), seeder=Slow())
+
+    async def go():
+        await h.start()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(h.user_says(REQUEST), timeout=0.2)  # cancelled inside the clone call
+        assert validate(store.view("o"), "o", require_user_end=False) == []  # no dangling tool_use
+        result = [r["content"] for r in store.view("o") if r["kind"] == "tool_result"]
+        assert len(result) == 1 and '"is_error": true' in result[0]
+        statuses = [r[0] for r in store.con.execute("SELECT status FROM transactions")]
+        assert statuses and set(statuses) == {"rolled_back"}
+        assert list(h.machines.timelines) == ["o"] and h.machines.phase("o") == "idle"
+        assert await h.user_says("Hi.") == ["Hello."]  # and the next turn runs
+        await h.close()
+
+    asyncio.run(go())
+
+
+def test_do_join_stops_a_running_background_graft_before_it_freezes_it(tmp_path):
+    script = Script([entry(["website"], False)])  # the graft's model call hangs on its gate
+    store, h, _ = make(tmp_path, script)
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        task = h.background_task("c1")
+        await h.do_join("c1", "failed")
+        assert task.cancelled() and h.machines.state("c1") == "queued"
+        frozen = [r["row_id"] for r in store.view("c1")]
+        script.open()  # the abandoned model call returns: nothing may reach the frozen timeline
+        await asyncio.sleep(0.05)
+        assert [r["row_id"] for r in store.view("c1")] == frozen
+        assert store.timeline("c1")["join_reason"] == "failed"
+        await h.settle()
+        await h.close()
+
+    asyncio.run(go())
+
+
+# ------------------------------------------------------------------ bounds on waiting and retrying
+@pytest.mark.parametrize("focus", [False, True])
+def test_a_model_call_that_never_returns_times_out_and_the_graft_joins_failed(tmp_path, focus):
+    never = threading.Event()
+
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" not in names:
+            never.wait(10)  # a hung provider call
+            return text("too late")
+        if last["type"] == "text" and last.get("harness"):
+            return text("That did not work.")
+        if last["type"] == "tool_result":
+            return text("Started.")
+        return [clone_use(entry(["website"], focus), id="k1") | {"type": "tool_use"}]
+
+    store, h, _ = make(tmp_path, policy, call_timeout=0.1)
+
+    async def go():
+        await h.start()
+        out = await h.user_says(REQUEST) + await h.settle()  # returns: nothing waits on the hung call
+        assert out[-1] == "That did not work."
+        assert store.timeline("c1")["join_reason"] == "failed" and h.machines.state("c1") == "joined"
+        assert h.graft_errors[0][0] == "c1" and "did not return within 0.1s" in h.graft_errors[0][1]
+        await h.close()
+
+    asyncio.run(go())
+    never.set()
+
+
+def test_the_call_timeout_is_configurable_and_can_be_disabled(tmp_path):
+    from graft.harness import MODEL_CALL_TIMEOUT
+    store = Store(str(tmp_path / "t.db"))
+    provider = FakeProvider(lambda *a: text("ok"))
+    assert Harness(store, provider).call_timeout == MODEL_CALL_TIMEOUT > 0
+    assert Harness(store, provider, call_timeout=None).call_timeout is None
+    with pytest.raises(ValueError):
+        Harness(store, provider, call_timeout=0)
+
+
+def test_a_join_that_can_never_be_applied_is_abandoned_and_the_queue_moves_on(tmp_path, monkeypatch):
+    from graft.harness import MAX_JOIN_ATTEMPTS
+    store, h, said = make(tmp_path, lambda *a: text("Reporting."))
+
+    async def go():
+        c1, c2 = await _two_queued(store, h)
+        real = h.default_join
+
+        def never(src, child, reason, trigger):
+            if child == c1:
+                raise OSError("bad row")
+            return real(src, child, reason, trigger=trigger)
+
+        monkeypatch.setattr(h, "default_join", never)
+        for attempt in range(1, MAX_JOIN_ATTEMPTS):
+            await h.drain_and_wake("o")
+            assert h.machines.state(c1) == "queued" and h.machines.state(c2) == "queued"  # c2 waits behind it
+            assert len(h.commit_errors) == attempt
+        await h.drain_and_wake("o")  # the last attempt
+        assert (h.machines.state(c1), store.timeline(c1)["status"]) == ("abandoned", "abandoned")
+        assert h.machines.state(c2) == "joined" and h.machines.queued("o") == []  # the queue moved on
+        assert "Deck built." in [r["content"] for r in store.view("o")]
+        assert [w["joined"] for w in h.wakes] == [[(c2, "done")]]
+        await h.drain_and_wake("o")  # nothing is retried any more
+        assert len(h.commit_errors) == MAX_JOIN_ATTEMPTS
+        await h.close()
+
+    asyncio.run(go())
+    told = [x for x in said if x.startswith("(harness error")]
+    assert len(told) == 2  # the first failure, and the abandonment: once each
+    assert "will be retried" in told[0] and c1_abandoned(told[1])
+
+
+def c1_abandoned(line):
+    return "c1" in line and "abandoned" in line and "3 attempts" in line and "bad row" in line

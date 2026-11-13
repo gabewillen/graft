@@ -345,3 +345,41 @@ def test_an_operation_cancelled_midway_still_completes(monkeypatch):
         await m.clone("o", [(f"g{i}", False) for i in range(MAX_LIVE_BACKGROUND)])
         await m.stop()
     run(go())
+
+
+def test_a_queued_join_that_is_given_up_ends_abandoned_and_frees_the_queue():
+    async def go():
+        m = await root_in_turn()
+        await m.clone("o", [("c1", False), ("c2", False)])
+        await m.finish_background("c1", reason="done")
+        await m.finish_background("c2", reason="done")
+        with pytest.raises(TransitionRefused):
+            await m.abandon_queued("c1")  # only while the source is applying its queue
+        await m.end_turn("o")
+        assert [q.child for q in await m.try_begin_drain("o")] == ["c1", "c2"]
+        with pytest.raises(TransitionRefused):
+            await m.abandon_queued("c2")  # not the head
+        await m.abandon_queued("c1")
+        assert m.state("c1") == "abandoned" and [q.child for q in m.queued("o")] == ["c2"]
+        await m.commit_queued("c2", committed=True)  # the join behind it is applied
+        await m.finish_join("o", committed=False)
+        assert m.clone_refusal("o", [(f"g{i}", False) for i in range(MAX_LIVE_BACKGROUND)]) is None  # no slot is held
+        with pytest.raises(TransitionRefused):
+            await m.commit_queued("c1", committed=True)  # abandoned is final
+        assert m.has("c1") and not m.has("c9")
+        m.check()
+        await m.stop()
+    run(go())
+
+
+def test_a_focus_graft_whose_join_is_given_up_ends_abandoned():
+    async def go():
+        m = await root_in_turn()
+        await m.clone("o", [("c1", True)])
+        await m.join_focus("c1", reason="out_of_scope", trigger=3)
+        await m.abandon_queued("c1")
+        await m.finish_join("o", committed=False)
+        assert (m.state("c1"), m.state("o"), m.phase("o"), m.holder()) == ("abandoned", "active", "idle", "o")
+        assert m.queued("o") == [] and await m.join_focus("c1", reason="done", trigger=None) is None
+        await m.stop()
+    run(go())
