@@ -132,7 +132,9 @@ async def run_arm(arm: str, live: bool, latency: float, trace: bool, policy: Pol
     t0 = time.perf_counter()
     transcript, follow_ups = await converse(h, script, world)
     wall = time.perf_counter() - t0
-    h.machines.check()
+    # One branch holds the conversation: the store's copy of each machine's state says which.
+    holders = [r[0] for r in store.con.execute("SELECT timeline_id FROM timelines WHERE status IN ('active', 'joining')")]
+    assert len(holders) == 1, f"invariant violated: holding the conversation: {holders}"
     clones = [(r["timeline_id"], r["status"], r["join_reason"]) for r in store.con.execute(
         "SELECT timeline_id, status, join_reason FROM timelines WHERE source_id IS NOT NULL ORDER BY timeline_id")]
     modes = [json.loads(r[0]).get("focus") for r in store.con.execute(

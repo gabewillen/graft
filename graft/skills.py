@@ -31,6 +31,16 @@ JOIN_TOOL = {
     "input_schema": obj({"reason": {"type": "string", "enum": ["done", "out_of_scope", "failed"]}},
                         ["reason"])}
 
+MAX_CANCEL_IDS = 8  # graft ids in one cancel call (twice the live cap: anything longer is noise)
+
+# `cancelled` is not a reason a clone can give: only the harness sets it, when the original cancels.
+CANCEL_TOOL = {
+    "name": "cancel",
+    "description": "Stop background clones of yours that are still running, by id. Each one is "
+                   "stopped where it is and its work so far joins your conversation when your turn ends.",
+    "input_schema": obj(props={"cancel": {"type": "array", "minItems": 1, "maxItems": MAX_CANCEL_IDS, "items": S}},
+                        required=["cancel"])}
+
 MAX_CLONE_ENTRIES = 4  # entries (clones) in one clone call
 
 CLONE_ENTRY = obj({"purpose": S, "skills": STRS, "focus": {"type": "boolean"},
@@ -75,6 +85,19 @@ your messages, and no clone is created; fix it and call `clone` once more.
 Background clones do not share locks: never give two clones work that changes the same thing.
 After a call with no focus clone, tell the user briefly what you started. While background
 clones run you keep talking to the user; you cannot steer a running clone.
+
+CANCEL. `cancel(cancel=["c2", ...])` stops background clones of yours that are still running;
+harness notes and the clone result give their ids. Use it when the user asks you to stop a part,
+or when a part is no longer needed. Only you can cancel: a clone never cancels another clone. A
+cancelled clone is stopped where it is and joins like any other when your turn ends: you get the
+messages it had written and a note naming the tools it had already run. Nothing it already did
+outside the conversation (a page written, a booking made) is undone, so tell the user what was
+left behind. An id that is unknown, is a focus clone, or has already finished is reported in the
+result and nothing happens for it. To replace a part with different work, call `cancel` and
+`clone` in the same response: the cancel runs first, so the cancelled clone's place is free for
+the new one. Do not clone again for the same part you cancelled unless the user asks for it in
+a new message; that entry is refused. Any tool call other than `cancel` beside a `clone` call
+is skipped.
 
 JOIN (automatic). When a clone joins, the harness remembers for you, with no decision on your
 part: it appends a note listing the row ids, then the text messages (user and assistant) of the
@@ -133,7 +156,8 @@ CATALOG: list[Skill] = [
           "Built-in. When a user request needs any catalog skill, call clone(clone=[...]) right "
           "away, with no text, instead of doing or planning the work yourself. Each entry is one "
           "clone: one with focus=true talks to the user; entries with focus=false work in the "
-          "background. Load this skill for the focus and seed rules and the join protocol.",
+          "background. cancel(cancel=[ids]) stops background clones that are still running. Load this "
+          "skill for the focus and seed rules, cancelling, and the join protocol.",
           CLONE_INSTRUCTIONS, [
         LOAD_SKILL_TOOL,
         {"name": "clone", "description": "Create one or more clones in one call. Each entry names its "
@@ -142,6 +166,7 @@ CATALOG: list[Skill] = [
                                          "short verbatim quote or by row id).",
          "input_schema": obj({"clone": {"type": "array", "minItems": 1, "maxItems": MAX_CLONE_ENTRIES,
                                         "items": CLONE_ENTRY}}, ["clone"])},
+        CANCEL_TOOL,
     ]),
     Skill("join",
           "Built-in. You are a focused instance for one task; details about that task are always in "

@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from _util import clone_in_turn
+from _util import clone_in_turn, clones, holders, status
 from graft.db import Graft, Store
 from graft.fake import pivot_policy
 from graft.harness import Harness, check_skill_link
@@ -34,7 +34,7 @@ def test_pivot_flow_offline(harness):
         await run_script(h, [
             "I need a website.", "It is for dentists in Ohio.", "Formal tone please.",
             "Our services: cleaning, implants, whitening.", "Instead let's build a slide show."], echo=False)
-        h.machines.check()
+        assert len(holders(h.store)) == 1
         return h
 
     asyncio.run(go())
@@ -55,7 +55,7 @@ def test_pivot_flow_offline(harness):
     # one clone call per clone: every original call either routed (clone_tx) or answered
     assert h.provider.by_tag["original:clone_tx"]["calls"] == 2
     assert "ohio" in h.world.deck_text().lower()
-    assert h.machines.holder() == "c2"
+    assert holders(s) == ["c2"]
     # the clone only had its linked tools
     c2_tools = {c["tools"][i]["name"] for c in h.provider.calls if "slides_create" in str(c["tools"])
                 for i in range(len(c["tools"]))}
@@ -72,13 +72,13 @@ def test_one_shot_clone_refused_with_violations_then_retry(harness):
         s.add_turn("o", "assistant", "text", "hi")
         use = {"id": "t1", "name": "clone", "input": {"clone": [{
             "purpose": "p", "skills": ["clone"], "focus": True, "seed_quotes": ["hello", "hi", "nope"]}]}}
-        child, text = await clone_in_turn(h, use, retry_left=True)
+        child, text = await clone_in_turn(h=h, use=use)
         assert child is None
         assert "cannot be linked to a clone" in text and "matches no message" in text
         assert "end on a user turn" in text and "Your messages (row_id role: text):" in text
-        (child,), text = await clone_in_turn(h, dict(use, input={"clone": [{
-            "purpose": "p", "skills": ["website"], "focus": True, "seed_quotes": ["hello"]}]}), retry_left=False)
-        assert child == "c1" and h.machines.state("c1") == "active" and h.machines.state("o") == "cloned"
+        (child,), text = await clone_in_turn(h=h, use=dict(use, input={"clone": [{
+            "purpose": "p", "skills": ["website"], "focus": True, "seed_quotes": ["hello"]}]}))
+        assert child == "c1" and status(store=s, tl="c1") == "active" and status(store=s, tl="o") == "cloned"
         assert [r["content"] for r in s.view("c1")] == ["hello"]
         await h.machines.stop()
 
@@ -98,7 +98,7 @@ def test_default_join_is_deterministic_text_rows_only(harness):
         await h.start()
         s = h.store
         seed = s.add_turn("o", "user", "text", "Make a deck.")
-        (child,), _ = await clone_in_turn(h, clone_use(["slides"], seed_row_ids=[seed]), retry_left=False)
+        (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["slides"], seed_row_ids=[seed]))
         a1 = s.add_turn(child, "assistant", "text", "Which audience?")
         u1 = s.add_turn(child, "user", "text", "Retirees.")
         s.add_turn(child, "assistant", "tool_use", {"id": "x1", "input": {"title": "T"}}, "slides_create")
@@ -109,7 +109,7 @@ def test_default_join_is_deterministic_text_rows_only(harness):
         assert len(h.provider.calls) == calls_before  # no model call
         joined = [r["row_id"] for r in s.view("o")][-3:]
         assert joined == [a1, u1, a2]  # text rows only, seed row skipped (already held)
-        assert h.machines.state("o") == "active" and h.machines.state(child) == "joined"
+        assert status(store=s, tl="o") == "active" and status(store=s, tl=child) == "joined"
         assert not [r for r in s.view("o") if r["kind"] in ("tool_use", "tool_result")
                     and r["owner_timeline"] == child]
         await h.machines.stop()
@@ -124,16 +124,15 @@ def test_default_join_out_of_scope_and_failed(harness):
         await h.start()
         s = h.store
         seed = s.add_turn("o", "user", "text", "Make a site.")
-        (child,), _ = await clone_in_turn(h, clone_use(["website"], seed_row_ids=[seed]), retry_left=False)
+        (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"], seed_row_ids=[seed]))
         s.add_turn(child, "assistant", "text", "Sure.")
         trig = s.add_turn(child, "user", "text", "Actually, slides.")
         rows, err = h.default_join_rows("o", child, "out_of_scope", trig)
         assert rows[-1] == trig and err is None
         rows, err = h.default_join_rows("o", child, "failed", trig)
         assert rows[-1] == trig and "failed" in err
-        await h.machines.join_focus(child, reason="failed", trigger=trig)
         s.set_join(child, "failed", trigger=trig)
-        assert h.default_join("o", child, "failed", trigger=trig)
+        assert h.default_join(src="o", child=child, reason="failed", trigger=trig, running=[])
         tail = s.view("o")[-3:]
         assert "failed" in tail[1]["content"] and tail[2]["row_id"] == trig  # error record, then trigger last
         await h.machines.stop()
@@ -148,7 +147,7 @@ def test_working_view_after_compaction_bounds_the_default_join(harness):
         await h.start()
         s = h.store
         seed = s.add_turn("o", "user", "text", "Plan a long project.")
-        (child,), _ = await clone_in_turn(h, clone_use(["website"], seed_row_ids=[seed]), retry_left=False)
+        (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"], seed_row_ids=[seed]))
         old_a = s.add_turn(child, "assistant", "text", "Early detail.")
         old_u = s.add_turn(child, "user", "text", "Early answer.")
         old_b = s.add_turn(child, "assistant", "text", "Long early reply.")
@@ -178,24 +177,24 @@ def test_silent_done_is_refused_until_the_clone_replies(tmp_path):
     async def go():
         await h.start()
         seed = store.add_turn("o", "user", "text", "Make a deck.")
-        (child,), _ = await clone_in_turn(h, clone_use(["slides"], seed_row_ids=[seed]), retry_left=False)
+        (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["slides"], seed_row_ids=[seed]))
         store.add_turn("o", "assistant", "tool_use", {"id": "t", "input": {}}, "clone")
         store.add_turn("o", "user", "tool_result", {"tool_use_id": "t", "content": "cloned"}, "clone")
         await h.run(child)
         assert h.silent_done_refusals == [child]
         refusal = [r for r in store.view(child) if r["kind"] == "tool_result"][0]
         assert "refused" in refusal["content"] and '"is_error": true' in refusal["content"]
-        assert h.machines.state(child) == "joined" and store.timeline(child)["join_reason"] == "done"
+        assert status(store=store, tl=child) == "joined" and store.timeline(child)["join_reason"] == "done"
         assert store.view("o")[-1]["content"] == "I built the deck."  # the reply was joined
         await h.machines.stop()
 
     asyncio.run(go())
 
 
-def test_clone_skill_has_only_load_skill_and_clone(harness):
+def test_clone_skill_has_only_load_skill_clone_and_cancel(harness):
     s = harness.store
     s.create_timeline("o", None, ["clone"])
-    assert [t["name"] for t in s.tools_for("o")] == ["load_skill", "clone"]
+    assert [t["name"] for t in s.tools_for("o")] == ["load_skill", "clone", "cancel"]
 
 
 def test_clone_is_never_linked_to_a_clone(harness):
@@ -271,7 +270,7 @@ def test_oversized_join_falls_back_to_last_reply_and_survives_refused_compaction
         await h.start()
         s = h.store
         seed = s.add_turn("o", "user", "text", "Write a long report.")
-        (child,), _ = await clone_in_turn(h, clone_use(["website"], seed_row_ids=[seed]), retry_left=False)
+        (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"], seed_row_ids=[seed]))
         big = []
         for i in range(3):
             big.append(s.add_turn(child, "assistant", "text", f"Section {i}: " + "x" * 1000))
@@ -303,9 +302,9 @@ def test_join_without_window_is_not_size_checked(harness):
         await h.start()
         s = h.store
         seed = s.add_turn("o", "user", "text", "Write.")
-        (child,), _ = await clone_in_turn(h, clone_use(["website"], seed_row_ids=[seed]), retry_left=False)
+        (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"], seed_row_ids=[seed]))
         a = s.add_turn(child, "assistant", "text", "y" * 50000)
-        rows, record = h.fit_join("o", child, "done", rows=[a], error=None, trigger=None)
+        rows, record = h.fit_join(src="o", child=child, reason="done", rows=[a], error=None, trigger=None, running=[])
         assert rows == [a] and "follow" in record and h.join_fallbacks == []
         await h.machines.stop()
 
@@ -354,11 +353,11 @@ def test_failed_clone_is_not_recloned_for_the_same_message(tmp_path):
         await h.start()
         out = await h.user_says("Build my site.")
         assert out == ["Sorry, I could not build that."]
-        assert [t for t in h.machines.timelines if t != "o"] == ["c1"]  # cloned once, not again
+        assert clones(store) == ["c1"]  # cloned once, not again
         assert store.timeline("c1")["join_reason"] == "failed"
-        assert h.machines.holder() == "o"
+        assert holders(store) == ["o"]
         out = await h.user_says("Try a different page.")  # a new message may clone again
-        assert "c2" in h.machines.timelines
+        assert "c2" in clones(store)
         await h.machines.stop()
 
     asyncio.run(go())
@@ -371,22 +370,19 @@ def test_a_request_that_bounces_back_twice_is_not_recloned(harness):
         await h.start()
         s = h.store
         trig = s.add_turn("o", "user", "text", "Make a site.")
-        (c1,), _ = await clone_in_turn(h, clone_use(["website"], seed_row_ids=[trig], id="a"), retry_left=False)
+        (c1,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"], seed_row_ids=[trig], id="a"))
         s.add_turn(c1, "assistant", "text", "Hm.")  # then the same request comes back, unhandled
-        await h.machines.join_focus(c1, reason="out_of_scope", trigger=trig)
-        s.set_join(c1, "out_of_scope", trigger=trig)
-        h.default_join("o", c1, "out_of_scope", trigger=trig)
-        await h.machines.commit_queued(c1, committed=True)
-        await h.machines.finish_join("o", committed=True)
-        h.join_arrivals[("o", trig, frozenset({"website"}))] = 1  # first arrival, recorded as do_join would
-        assert not h.part_blocked("o", ["website"])
+        h.provider.policy = lambda *a: [{"type": "text", "text": "I could not do that."}]
+        await h.do_join(child=c1, reason="out_of_scope")  # the first arrival: the source answers the request itself
         s.add_turn("o", "assistant", "tool_use", {"id": "b", "input": {}}, "clone")
         s.add_turn("o", "user", "tool_result", {"tool_use_id": "b", "content": "ok"}, "clone")
-        (c2,), _ = await clone_in_turn(h, clone_use(["website"], seed_row_ids=[trig], id="b"), retry_left=False)
-        h.provider.policy = lambda *a: [{"type": "text", "text": "I could not do that."}]
+        # after one arrival the part may be cloned for again
+        (c2,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"], seed_row_ids=[trig], id="b"))
         await h.do_join(c2, "out_of_scope")  # the same request comes back a second time
-        assert h.reclone_block.get("o") == {(trig, frozenset({"website"}))} and h.part_blocked("o", ["website"])
-        assert not h.part_blocked("o", ["slides"])  # another part of the same message is not blocked
+        again, text = await clone_in_turn(h=h, use=clone_use(skills=["website"], seed_row_ids=[trig], id="c"))
+        assert again is None and "handed it back twice" in text  # now the part is blocked
+        # another part of the same message is not blocked
+        (c3,), _ = await clone_in_turn(h=h, use=clone_use(skills=["slides"], seed_row_ids=[trig], id="d"))
         await h.machines.stop()
 
     asyncio.run(go())

@@ -67,9 +67,9 @@ def test_jev_selects_by_threshold_with_trigger_and_audit(tmp_path, monkeypatch):
         await h.start()
         r = rows(store)
         # the original's own seed fields are ignored when the seeder is jev (schema unchanged)
-        children, text = await clone_in_turn(h, {"id": "t", "name": "clone", "input": {"clone": [{
+        children, text = await clone_in_turn(h=h, use={"id": "t", "name": "clone", "input": {"clone": [{
             "purpose": "build slides", "skills": ["slides"], "focus": True,
-            "seed_quotes": ["I need a website."]}]}}, retry_left=True)
+            "seed_quotes": ["I need a website."]}]}})
         assert children == ["c1"], text
         seed = [x["row_id"] for x in store.view("c1")]
         assert seed == [r["u2"], r["trig"]]  # selected in view order + trigger; harness note never a candidate
@@ -99,8 +99,8 @@ def test_leading_assistant_row_gets_nearest_earlier_user_row(tmp_path, monkeypat
     async def go():
         await h.start()
         r = rows(store)
-        (child,), _ = await clone_in_turn(h, {"id": "t", "name": "clone", "input": {"clone": [
-            {"purpose": "p", "skills": ["slides"], "focus": True}]}}, retry_left=True)
+        (child,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "clone", "input": {"clone": [
+            {"purpose": "p", "skills": ["slides"], "focus": True}]}})
         assert [x["row_id"] for x in store.view(child)] == [r["u2"], r["a2"], r["trig"]]
         assert h.seeder_log[0]["added_lead_user_row"] == r["u2"]
         await h.machines.stop()
@@ -118,8 +118,7 @@ def test_seeder_failure_falls_back_and_is_recorded(tmp_path, monkeypatch, with_m
         args = {"purpose": "p", "skills": ["slides"], "focus": True}
         if with_model_seed:
             args["seed_row_ids"] = [r["u2"], r["trig"]]
-        children, text = await clone_in_turn(h, {"id": "t", "name": "clone", "input": {"clone": [args]}},
-                                            retry_left=True)
+        children, text = await clone_in_turn(h=h, use={"id": "t", "name": "clone", "input": {"clone": [args]}})
         child = children[0] if children else None
         audit = h.seeder_log[0]
         assert "TimeoutError" in audit["error"]

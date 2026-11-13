@@ -188,10 +188,9 @@ async def arm_g(e, sb: sandbox.Sandbox, max_steps: int, workdir: str) -> dict:
     store.add_turn("o", "user", "text", subtask_text(e))
     t0 = time.perf_counter()
     # one focus graft: the replay hands the recorded subtask to a single clone and joins it back
-    await h.machines.begin_turn("o")  # a clone call belongs to a turn of the source
-    _, child, text = await h.clone_call("o", {"id": "replay", "name": "clone", "input": {"clone": [{
-        "purpose": f"{e.description}: {e.handoff[:1500]}", "skills": [skill.name], "focus": True}]}},
-        retry_left=False)
+    await h.begin_turn("o")  # a clone call belongs to a turn of the source
+    _, child, text = await h.clone_call(src="o", use={"id": "replay", "name": "clone", "input": {"clone": [{
+        "purpose": f"{e.description}: {e.handoff[:1500]}", "skills": [skill.name], "focus": True}]}})
     forced = False
     if child:
         if await h.run(child) == "ended":  # no live user: end the task if it stopped without joining
