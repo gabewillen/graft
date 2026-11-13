@@ -945,7 +945,7 @@ def test_a_queued_commit_that_raises_is_reported_kept_and_retried(tmp_path, monk
         def flaky(src, child, reason, trigger, running):
             if child == c2:
                 raise OSError("disk full")
-            return real(src, child=child, reason=reason, trigger=trigger, running=running)
+            return real(src=src, child=child, reason=reason, trigger=trigger, running=running)
 
         monkeypatch.setattr(h, "default_join", flaky)
         await drain(h)  # c1 commits and is reported; c2's commit raises
@@ -973,7 +973,7 @@ def test_a_rolled_back_queued_join_ends_its_graft_joined_and_the_queue_moves_on(
         c1, c2 = await _two_queued(store, h)
         real = h.default_join
         monkeypatch.setattr(h, "default_join", lambda src, child, reason, trigger, running:
-                            False if child == c1 else real(src, child=child, reason=reason, trigger=trigger,
+                            False if child == c1 else real(src=src, child=child, reason=reason, trigger=trigger,
                                                            running=running))
         await drain(h)
         # a join that rolls back ends its graft `joined` too, and the queue moves on to the next one
@@ -2050,7 +2050,7 @@ def test_a_join_that_can_never_be_applied_is_abandoned_and_the_queue_moves_on(tm
         def never(src, child, reason, trigger, running):
             if child == c1:
                 raise OSError("bad row")
-            return real(src, child=child, reason=reason, trigger=trigger, running=running)
+            return real(src=src, child=child, reason=reason, trigger=trigger, running=running)
 
         monkeypatch.setattr(h, "default_join", never)
         for attempt in range(1, MAX_JOIN_ATTEMPTS):
@@ -2812,7 +2812,7 @@ def test_a_failed_write_of_a_cancel_result_is_reported_as_that_and_the_real_resu
             if results and results[0][0]["name"] == "cancel" and not failures:
                 failures.append("failed")
                 raise OSError("disk full")
-            return real(tl, results=results)
+            return real(tl=tl, results=results)
 
         monkeypatch.setattr(h, "_store_results", fails_for_the_cancel)
         with pytest.raises(OSError, match="disk full"):
@@ -3255,7 +3255,7 @@ def test_a_cancel_beside_a_focus_clone_joins_before_the_focus_graft_does(tmp_pat
     assert [store.timeline(c)["join_reason"] for c in ("c1", "c2", "c3")] == ["cancelled", "done", "done"]
 
 
-# ------------------------------------------------------------------ round-4 regressions
+# ------------------------------------------------------------------ a model call that answers as its cancel lands
 THREAD_JOIN = 5  # seconds to wait for a scripted model call's worker thread to end
 
 
@@ -3382,7 +3382,7 @@ def test_a_failed_cancel_result_write_in_a_wake_run_is_reported_once_and_raised_
         if results and results[0][0]["name"] == "cancel" and not failures:
             failures.append("failed")
             raise OSError("disk full")
-        return real(tl, results=results)
+        return real(tl=tl, results=results)
 
     monkeypatch.setattr(h, "_store_results", fails_for_the_cancel)
 
@@ -3410,9 +3410,8 @@ def test_a_failed_cancel_result_write_in_a_wake_run_is_reported_once_and_raised_
 # ------------------------------------------------------------------ a user's call cancelled at any moment
 @pytest.mark.parametrize("point", ["before it starts", "on the machine", "in the model call", "as it replies"])
 def test_a_user_call_cancelled_at_any_moment_leaves_the_original_usable(tmp_path, point):
-    """On main, a `user_says` cancelled while it began a turn left the original in `turn` for
-    good, and every later message was refused. The turn is now the machine's: a cancelled call
-    interrupts it, whenever that lands, and the next message is answered. Each moment is
+    """A cancelled `user_says` interrupts the run answering it, whenever the cancel lands, and
+    the original answers the next message. Each moment is
     forced: the call has not started; its message is on the machine (its run has begun); its
     run is inside the model call (held at a gate); the run is saying its reply."""
     entered, gate = threading.Event(), threading.Event()
@@ -3459,7 +3458,7 @@ def test_a_user_call_cancelled_at_any_moment_leaves_the_original_usable(tmp_path
     asyncio.run(go())
 
 
-# ------------------------------------------------------------------ round-1 regressions of the machine-owned coordination
+# ------------------------------------------------------------------ waiting calls, closes and requests the machines refuse
 def _focus_then_root(gate, entered=None):
     """The original clones one website focus graft for "Build a website." and answers anything
     else itself; the graft sets `entered` when its model call starts, waits on `gate`, then
@@ -3680,7 +3679,7 @@ def test_a_failure_report_is_recorded_and_shown_whatever_clone_it_names(tmp_path
     asyncio.run(go())
 
 
-# ------------------------------------------------------------------ round-3 regressions
+# ------------------------------------------------------------------ clone retries, interrupts of a focus graft, settle, cancels first, close
 def test_a_run_makes_one_clone_call_and_one_retry_and_seeds_nothing_more(tmp_path):
     """A model that sends a refused clone call on every step: the call and its one retry are
     seeded and audited; every later call is not executed and seeds nothing."""
@@ -3838,3 +3837,266 @@ def test_a_graft_made_by_a_clone_in_flight_at_close_is_shut_down_before_close_re
 
     asyncio.run(go())
     script.open()
+
+
+# ------------------------------------------------------------------ a cancelled call ends any run that answers it
+def test_a_cancelled_call_ends_the_run_that_answers_a_handed_back_message(tmp_path):
+    gate, entered = threading.Event(), threading.Event()
+
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" in names:
+            if last["type"] == "tool_result":
+                return text("ok.")
+            if any("joined, reason=out_of_scope" in b.get("text", "") for m in messages for b in m["content"]
+                   if b["type"] == "text"):  # the run that answers the handed-back message
+                entered.set()
+                assert gate.wait(GATE_TIMEOUT)
+                return [clone_use(clone_entry(skills=["calendar"], focus=False, quotes=["Build a website."]), id="late")
+                        | {"type": "tool_use"}]
+            return [clone_use(clone_entry(skills=["website"], focus=True, quotes=["Build a website."]), id="t1")
+                    | {"type": "tool_use"}]
+        return [{"type": "tool_use", "id": "j", "name": "join", "input": {"reason": "out_of_scope"}}]
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+
+    async def go():
+        await h.start()
+        call = asyncio.create_task(h.user_says("Build a website."))
+        await until(event=entered, what="the hand-back run's model call")
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        gate.set()  # its model call returns now: what it asks for must not run
+        assert await h.until_rest("o") == "ended"
+        await h.settle()
+        await h.close()
+
+    asyncio.run(go())
+    assert clones(store) == ["c1"]  # the late clone call was never run
+    assert violations(store=store, tl="o") == []
+
+
+def test_a_cancelled_call_ends_the_wake_run_that_follows_its_turn(tmp_path):
+    replying, finish, wake, gate = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" in names:
+            if last["type"] == "tool_result":
+                replying.set()
+                assert finish.wait(GATE_TIMEOUT)  # the graft's join is queued during this turn
+                return text("Started.")
+            if is_wake(last):
+                wake.set()
+                assert gate.wait(GATE_TIMEOUT)
+                return [{"type": "tool_use", "id": "w", "name": "load_skill", "input": {"name": "clone"}}]
+            return [clone_use(clone_entry(skills=["website"], focus=False), id="t1") | {"type": "tool_use"}]
+        return text("website finished")
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+
+    async def go():
+        await h.start()
+        call = asyncio.create_task(h.user_says(REQUEST))
+        await until(event=replying, what="the turn's reply")
+        await h.join_queued("c1")
+        finish.set()
+        await until(event=wake, what="the wake run's model call")
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        gate.set()  # its model call returns now: what it asks for must not run
+        assert await h.until_rest("o") == "ended"
+        await h.settle()
+        await h.close()
+
+    asyncio.run(go())
+    assert [name for name, _, _ in tool_results(store=store, tl="o")] == ["clone"]  # load_skill never ran
+    assert violations(store=store, tl="o") == []
+
+
+# ------------------------------------------------------------------ rows kept by the machine are written before a hand-over
+@pytest.mark.parametrize("focus", [False, True])
+def test_a_cancel_row_that_cannot_be_written_beside_a_clone_ends_the_run_with_that_error(tmp_path, monkeypatch, focus):
+    def graft(skill, messages):
+        if skill == "slides":
+            return [{"type": "text", "text": "Deck made."},
+                    {"type": "tool_use", "id": "j1", "name": "join", "input": {"reason": "done"}}]
+        return script.finish(skill=skill, messages=messages)
+
+    script = Replace(entries=ONE, response=[cancel_use(ids=["c1"], id="x1"),
+                                            new_clone(clone_entry(skills=["slides"], focus=focus))], graft=graft)
+    store, h, said = make(tmp_path=tmp_path, policy=script)
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await script.in_call("website")
+        real, failed = h._store_results, []
+
+        def fails_for_the_cancel(tl, results):
+            if results and results[0][0]["name"] == "cancel" and not failed:
+                failed.append(results[0][0]["id"])
+                raise OSError("disk full")
+            return real(tl=tl, results=results)
+
+        monkeypatch.setattr(h, "_store_results", fails_for_the_cancel)
+        with pytest.raises(OSError, match="disk full"):
+            await h.user_says(STOP)  # the run ends with that error: the clone call is not run
+        assert clones(store) == ["c1"]
+        results = results_by_name(store=store, tl="o")
+        assert results["cancel"][0].startswith("cancelled -> c1") and not results["cancel"][1]  # the kept row
+        assert results["clone"] == (NOT_RUN_INTERRUPTED, True)
+        script.open()
+        assert "Started." in await h.user_says("hello again")  # usable: it answers and clones again
+        await h.close()
+
+    asyncio.run(go())
+    assert violations(store=store, tl="o") == []
+
+
+def test_a_focus_clone_whose_result_row_cannot_be_written_has_it_written_before_the_hand_over(tmp_path, monkeypatch):
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" in names:
+            if last["type"] == "tool_result" or last.get("harness"):
+                return text("Back at the original.")
+            if last["text"] == REQUEST:
+                return [clone_use(clone_entry(skills=["website"], focus=True)) | {"type": "tool_use"}]
+            return text("here")
+        return [{"type": "text", "text": "Site built."},
+                {"type": "tool_use", "id": "j", "name": "join", "input": {"reason": "done"}}]
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+
+    async def go():
+        await h.start()
+        real, failed = h.store_result, []
+
+        def flaky(tl, use, content, is_error):
+            if tl == "o" and use["name"] == "clone" and not failed:
+                failed.append(use["id"])
+                raise OSError("disk full")
+            return real(tl=tl, use=use, content=content, is_error=is_error)
+
+        monkeypatch.setattr(h, "store_result", flaky)
+        out = await h.user_says(REQUEST)
+        assert "disk full" in out[0] and "Site built." in out
+        assert violations(store=store, tl="o") == []
+        rows = store.view("o")
+        result = next(i for i, r in enumerate(rows) if r["kind"] == "tool_result")
+        built = next(i for i, r in enumerate(rows) if r["content"] == "Site built.")
+        assert result < built and "cloned -> c1" in rows[result]["content"]  # the real result, before c1's work
+        assert store.con.execute("SELECT status FROM transactions WHERE kind='join'").fetchone()[0] == "committed"
+        assert await h.user_says("anything else?") == ["here"]
+        await h.close()
+
+    asyncio.run(go())
+
+
+# ------------------------------------------------------------------ requests are answered however a run is left
+def test_close_during_a_clone_calls_preparation_answers_the_call(tmp_path):
+    from graft import seeder as sd
+
+    class Slow:
+        name = "slow"
+        entered: asyncio.Future | None = None
+
+        async def score(self, purpose, cands, trigger):
+            self.entered.set_result(None)
+            await asyncio.get_running_loop().create_future()  # never answered
+            return sd.SeedDecision()
+
+    slow = Slow()
+    store = Store(str(tmp_path / "c.db"))
+    install(store)
+    h = Harness(store=store, provider=FakeProvider(lambda *a: text("hi")), seeder=slow)
+
+    async def go():
+        await h.start()
+        slow.entered = asyncio.get_running_loop().create_future()
+        store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
+        await h.begin_turn("o")
+        call = asyncio.create_task(h.clone_call(src="o", use=clone_use(clone_entry(skills=["website"], focus=False))))
+        await asyncio.wait_for(slow.entered, timeout=WAIT_TIMEOUT)  # the call is being prepared
+        await asyncio.wait_for(h.close(), timeout=WAIT_TIMEOUT)
+        children, _, text_ = await asyncio.wait_for(call, timeout=WAIT_TIMEOUT)
+        assert children is None and text_ == "clone not executed: the turn ended before it ran"
+
+    asyncio.run(go())
+    assert clones(store) == []
+    assert {r[0] for r in store.con.execute("SELECT status FROM transactions")} == {"rolled_back"}
+
+
+def test_until_rest_answers_only_what_is_true_and_close_stops_every_machine(tmp_path):
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" in names:
+            if last["type"] == "tool_result" or last.get("harness"):
+                return text("ok.")
+            return [clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=False))
+                    | {"type": "tool_use"}]
+        if "site_write" in names:
+            return [{"type": "text", "text": "Site built."},
+                    {"type": "tool_use", "id": "j", "name": "join", "input": {"reason": "done"}}]
+        return text("slides finished")
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await h.settle()
+        assert await h.until_rest("o") == "ended"
+        assert await h.until_rest("c1") == "joined"  # the focus graft joined
+        with pytest.raises(TransitionRefused, match="'rest_request' refused"):
+            await h.until_rest("c2")  # a background graft does not rest: its join is waited for instead
+        assert await h.join_queued("c2") is True
+        await h.close()
+        for request in (h.until_rest("o"), h.user_says("again"), h.join_queued("c2"), h.run("c1")):
+            with pytest.raises(TransitionRefused, match="refused in state closed"):
+                await request  # every machine was stopped
+        assert await h.settle() == [] and await h.close() is None
+
+    asyncio.run(go())
+
+
+def test_a_focus_graft_whose_join_can_never_be_applied_ends_abandoned(tmp_path, monkeypatch):
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" in names:
+            if last["type"] == "text" and last["text"] == REQUEST:
+                return [clone_use(clone_entry(skills=["website"], focus=True)) | {"type": "tool_use"}]
+            return text("Original here.")
+        return [{"type": "text", "text": "Site done."}, {"type": "tool_use", "id": "j", "name": "join",
+                                                          "input": {"reason": "done"}}]
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+
+    async def go():
+        await h.start()
+        real = h.default_join
+
+        def never(src, child, reason, trigger, running):
+            if child == "c1":
+                raise OSError("bad row")
+            return real(src=src, child=child, reason=reason, trigger=trigger, running=running)
+
+        monkeypatch.setattr(h, "default_join", never)
+        for message in (REQUEST, "two", "three"):
+            await h.user_says(message)  # each is a commit point; the original holds the conversation
+            assert holder(store) == "o"
+        assert status(store=store, tl="c1") == "abandoned"
+        with pytest.raises(TransitionRefused, match="'rest_request' refused in state abandoned"):
+            await h.until_rest("c1")  # its run ended, but its join was not: it is not answered "joined"
+        await h.close()
+
+    asyncio.run(go())
+    told = said_errors(said)
+    assert len(told) == 2 and "will be retried" in told[0] and "is abandoned" in told[1]

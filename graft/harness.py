@@ -248,8 +248,11 @@ def _reason(reason: str) -> str:
 
 @dataclass
 class CloneBatch:
-    """The harness's record of a clone call the original's machine is to decide: the grafts to
-    commit, their audit records, the result text, and whether a wake run made it."""
+    """The harness's record of a prepared clone call, which the original's machine decides:
+    `grafts`, the grafts to commit; `audits`, each graft's (transaction id, audit text, scratch)
+    written with the commit; `text`, the call's result if it commits; `txs`, the open audit
+    transactions, rolled back if it is refused; `retry_left`, whether the run may make one more
+    clone call after this one (it words a refusal)."""
     grafts: list[Graft]
     audits: list[tuple[int, str, dict]]
     text: str
@@ -407,7 +410,8 @@ class Harness:
         """One user message, put to the original's machine: it answers it, forwards it to its
         focus graft, or keeps it until the run in progress and the joins waiting are done. Returns
         the user-facing texts emitted since the last return, once the conversation is at rest. If
-        the call is cancelled the run answering it is interrupted. A wake or join-commit failure
+        the call is cancelled, any run it waits on is interrupted: its turn, a focus graft's, the run
+        answering a message handed back, or the wake run that follows its turn. A wake or join-commit failure
         after the turn is part of that output (a harness error line), not an exception."""
         root = self.machines.root
         reply = self.machines.future()  # the reply, and the request's identity
@@ -447,7 +451,11 @@ class Harness:
         return await self.machines.ask(tl=tl, name="turn_request", build=lambda reply: (Mode(name="turn", user=True), reply))
 
     async def until_rest(self, tl: str) -> str:
-        """Wait until tl is no longer running; answered like `run`."""
+        """Wait until tl, a timeline that can hold the conversation, is no longer running. Returns
+        "ended" (it is at rest), "handed_off" (it is suspended under a focus graft) or "joined"
+        (its run ended by joining, applied or not yet). TransitionRefused if tl does not rest: a
+        background graft (wait for its join with `join_queued`), one whose join was abandoned,
+        or a closed harness."""
         return await self.machines.ask(tl=tl, name="rest_request", build=lambda reply: reply)
 
     async def begin_turn(self, tl: str) -> None:

@@ -156,9 +156,10 @@ async def clone(m, pairs, parts=None, request=None):
         use={"id": "k"}, reply=reply, store=True, pairs=pairs, parts=parts, request=request))
 
 
-async def cancel(m, tl, ids):
+async def cancel(m, tl, ids, request=None):
     call = CancelCall(use={"id": "x"}, ids=ids, problems=[])
-    return await m.ask(tl=tl, name="cancel_request", build=lambda reply: Cancel(calls=[call], reply=reply))
+    return await m.ask(tl=tl, name="cancel_request", build=lambda reply: Cancel(calls=[call], reply=reply,
+                                                                                  request=request))
 
 
 async def at_rest(m, tl="o"):
@@ -670,6 +671,22 @@ def test_a_clone_write_that_fails_ends_in_its_handled_state(name, refused):
     run(go)
 
 
+def test_a_focus_clone_whose_result_row_fails_has_the_kept_row_written_before_the_hand_over():
+    """The row kept by `recording` is written by `flushing`, the step every hand-over passes,
+    before the original is suspended."""
+    async def go():
+        host, m = await started()
+        await say(m=m, text="go")
+        _failing(host=host, name="store_result", error=OSError("disk full"))
+        _, focus, _ = await clone(m=m, pairs=[("c1", True)])
+        assert focus == "c1" and host.status["o"] == "cloned"
+        closed = host.logged("close", "o")
+        assert closed == [("close", "o", {"k": ("cloned", False)})]  # the real result, kept and written
+        assert host.log.index(closed[0]) < host.log.index(("status", "o", "cloned"))  # before the hand-over
+        await m.stop()
+    run(go)
+
+
 @pytest.mark.parametrize("pairs", [[("c1", False)], [("c0", False), ("c1", False)]])
 def test_a_graft_machine_that_cannot_start_undoes_the_whole_clone_call(monkeypatch, pairs):
     """The machines are started before anything else learns of the grafts: if one cannot start,
@@ -740,7 +757,7 @@ def test_a_focus_graft_whose_failure_cannot_be_recorded_still_joins_failed():
     run(go)
 
 
-# ------------------------------------------------------------------ round-2 regressions
+# ------------------------------------------------------------------ cancel races, driven turns, blocks per request
 @pytest.mark.parametrize("order", ["cancel_first", "finish_first"])
 def test_a_cancel_that_loses_the_race_to_a_finish_blocks_nothing(order):
     """The two orders a cancel and a graft's own join can land in, each forced: a cancel that
@@ -785,6 +802,60 @@ def test_a_failed_graft_blocks_its_part_for_the_request_it_was_cloned_for_only(r
         if blocks:  # the same part for another request is not blocked (a refused call leaves the turn its clone)
             _, _, text = await clone(m=m, pairs=[("c3", False)], parts=[{"web"}], request=2)
             assert text == "cloned", text
+        await asyncio.wait_for(m.ask(tl="session", name="shutdown", build=lambda r: r), timeout=GUARD)
+        await m.stop()
+    run(go)
+
+
+def test_a_cancel_is_not_counted_as_a_hand_back_of_the_request_its_graft_was_cloned_for(monkeypatch):
+    import graft.machine as machine_module
+    one_handback = 1  # one hand-back would stop cloning for the request
+    monkeypatch.setattr(machine_module, "MAX_REQUEST_HANDBACKS", one_handback)
+    async def go():
+        host, m = await started()
+        await driven_turn(m=m)
+        await clone(m=m, pairs=[("c1", False)], parts=[{"web"}], request=1)
+        answer = await cancel(m=m, tl="o", ids=["c1"], request=1)
+        assert answer[0][1] is False  # cancelled
+        reporting = host.next("run", "o", "report")
+        await end_driven_turn(m=m)
+        await reporting  # its join (cancelled) is applied under request 1, the one it was cloned for
+        host.end(tl="o")
+        assert await at_rest(m=m) == "ended"
+        await driven_turn(m=m)
+        _, _, text = await clone(m=m, pairs=[("c2", False)], parts=[{"slides"}], request=1)
+        assert text == "cloned"  # not "handed it back too many times"
+        await asyncio.wait_for(m.ask(tl="session", name="shutdown", build=lambda r: r), timeout=GUARD)
+        await m.stop()
+    run(go)
+
+
+def test_a_cancel_accepted_while_its_graft_ends_for_another_reason_blocks_nothing():
+    """The cancel is accepted (the graft has not raised its join yet), but the graft is already
+    leaving its run, forced to join `done`: its join lands with that reason, so the part is not
+    blocked and the cancel's result says it had finished."""
+    async def go():
+        host, m = await started()
+        first = await say(m=m, text="go")
+        await clone(m=m, pairs=[("c1", False)], parts=[{"web"}], request=1)
+        host.end(tl="o")
+        assert await first == "ended"
+        host.hold = m.future()  # c1's run, once cancelled, waits here before it ends
+        stopping = host.next("run_cancelled", "c1")
+        forcing = asyncio.ensure_future(m.ask(tl="c1", name="join", build=lambda r: (
+            QueuedJoin(child="c1", reason="done", trigger=None), r)))
+        await stopping  # c1 is leaving its run for the forced join, mid-step
+        await driven_turn(m=m)
+        asking = asyncio.ensure_future(cancel(m=m, tl="o", ids=["c1"], request=1))
+        reached = host.next("reason", "c1")
+        host.hold.set_result(None)
+        await reached
+        answer = await asking
+        await forcing
+        assert answer == [(repr([("c1", "done")]), True)]  # accepted, and its join landed as done
+        _, _, text = await clone(m=m, pairs=[("c2", False)], parts=[{"web"}], request=1)
+        assert text == "cloned"  # its part is not blocked
+        await end_driven_turn(m=m)
         await asyncio.wait_for(m.ask(tl="session", name="shutdown", build=lambda r: r), timeout=GUARD)
         await m.stop()
     run(go)

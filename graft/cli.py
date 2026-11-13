@@ -7,33 +7,19 @@ import asyncio
 import os
 import sys
 import tempfile
-import threading
-from typing import Callable
 
 from .db import Store
-from .harness import Harness
+from .harness import Harness, in_daemon_thread
 from .providers import make_provider
 from .skills import install
 
 
-def _read_lines(loop: asyncio.AbstractEventLoop, deliver: Callable[[str | None], None]) -> None:
-    """Runs in a daemon thread: read stdin line by line and hand each line to the event loop (the
-    one thread hop, `call_soon_threadsafe`); None at end of input. A daemon thread blocked in
-    input() does not keep the process alive."""
-    while True:
-        try:
-            line = input()
-        except (EOFError, KeyboardInterrupt):
-            line = None
-        try:
-            loop.call_soon_threadsafe(deliver, line)
-        except RuntimeError:  # the loop is closed
-            return
-        if line is None:
-            return
-
-
-FIRST = 0  # lines are taken in the order they were read
+def _read_line() -> str | None:
+    """One line of input (called in a daemon thread, like a model call); None at end of input."""
+    try:
+        return input()
+    except EOFError:
+        return None
 
 
 def _prompt() -> None:
@@ -49,31 +35,13 @@ async def chat(db_path: str, trace: bool) -> None:
     await h.start()
     print(f"graft chat ({h.provider.name}:{h.provider.model}); db={db_path}. "
           "Commands: /dump, /quit")
-    loop = asyncio.get_running_loop()
-    arrived: list[str | None] = []  # lines read and handed over, not yet taken (on the loop)
-    waiting: list[asyncio.Future] = []  # the chat waiting for the next line: answered when one arrives
-
-    def deliver(line: str | None) -> None:  # on the loop: the reader thread's hand-over
-        arrived.append(line)
-        for reply in waiting:
-            if not reply.done():
-                reply.set_result(None)
-        waiting.clear()
-
-    async def next_line() -> str | None:
-        while not arrived:
-            reply = loop.create_future()
-            waiting.append(reply)
-            await reply
-        return arrived.pop(FIRST)
-
-    # Input is read off the event loop, so background clones keep running while we wait; the
-    # prompt is shown when the machine has answered the user's call.
-    threading.Thread(target=_read_lines, args=(loop, deliver), daemon=True, name="graft-chat-input").start()
     try:
         while True:
+            # The prompt is shown once the machine has answered the last call. Each line is read
+            # off the event loop, one read per request, in a daemon thread whose result comes back
+            # by the same hop as a model call's; background clones keep running meanwhile.
             _prompt()
-            line = await next_line()
+            line = await in_daemon_thread(_read_line)
             if line is None:
                 break
             text = line.strip()
