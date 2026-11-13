@@ -61,6 +61,10 @@ MAX_WAKE_CLONE_CALLS = 1
 # Joins that may hand one request back to a timeline (any part, any reason) before the timeline
 # stops cloning for that request altogether. A last bound under the per-part blocks.
 MAX_REQUEST_HANDBACKS = 8
+# Clone calls committed for one user message, by any timeline, across the whole chain of
+# hand-backs and wakes it sets off. Reset only by a user message. This bound depends on no key:
+# whatever a model seeds and however a hand-back is attributed, cloning stops here.
+MAX_CLONE_CALLS_PER_MESSAGE = 4
 # A join must leave the source's working view under this fraction of the model window:
 # estimate_tokens is chars / 4 (rough), and the reply needs room too.
 JOIN_WINDOW_FRACTION = 0.85
@@ -249,6 +253,7 @@ class Harness:
         # (timeline, request, skills) -> joins that handed that part back
         self.join_arrivals: dict[tuple[str, int | None, frozenset[str]], int] = {}
         self.request_handbacks: dict[tuple[str, int | None], int] = {}  # (timeline, request) -> all hand-backs
+        self.clone_calls_this_message = 0  # clone calls committed since the last user message, by anyone
 
     async def complete(self, tag: str, system: str, messages: list[dict], tools: list[dict], **kw
                        ) -> tuple[list[dict], dict | None]:
@@ -318,11 +323,13 @@ class Harness:
         texts, self._mark = self.out[self._mark:], len(self.out)
         return texts
 
-    def _names(self, clones: list[str]) -> str:
+    def _names(self, clones: list[str], named: bool = True) -> str:
+        """'background clones c1, c2' / 'clone c1'; with named=False just the noun."""
         if not clones:
             return "a clone"
         word = "background clone" if all(self.is_background(c) for c in clones) else "clone"
-        return f"{word}{'s' if len(clones) != 1 else ''} {', '.join(clones)}"
+        word += "s" if len(clones) != 1 else ""
+        return f"{word} {', '.join(clones)}" if named else word
 
     def _report_failure(self, *, kind: str, src: str, clones: list[str], error: Exception) -> None:
         """The one place a failed wake run, a failed join commit, or an unreported background
@@ -358,6 +365,7 @@ class Harness:
             await self.machines.begin_turn(leaf)  # refused unless leaf is at rest
             rid = self.store.add_turn(leaf, "user", "text", text)
             self.reclone_block.pop(leaf, None)  # a new request may clone again
+            self.clone_calls_this_message = 0
             self.wake_clone_calls.pop(leaf, None)
             self.trace(f"[{leaf}] user (row {rid}): {text}")
             failed_commits = len(self.commit_errors)
@@ -653,6 +661,7 @@ class Harness:
                                                               retry_left=clone_attempts < CLONE_ATTEMPTS)
                 self._store_results(tl, others + [(clone_use, text, children is None)])
                 if children:
+                    self.clone_calls_this_message += 1
                     if wake:
                         self.wake_clone_calls[tl] = self.wake_clone_calls.get(tl, 0) + 1
                     self._start_background(children)
@@ -750,12 +759,11 @@ class Harness:
         """A join handed its part of a request back to tl (out_of_scope or failed). Count it
         under the request the graft was working on and the graft's skills, and block re-cloning
         of that part if it failed or came back twice. A sibling's part is not touched. The
-        request is the user message the graft hands back (its trigger); a graft that never got
-        one was working on tl's current request at the time it was cloned. A request of None
-        (tl had no user message then) is counted like any other: a bound is never skipped."""
+        request is harness-owned (`request_of`). A request of None (tl had no user message when
+        it cloned) is counted like any other: a bound is never skipped."""
         if join.reason == "done":
             return
-        req = join.trigger if join.trigger is not None else self.request_at_clone.get(join.child)
+        req = self.request_of(join)
         part = self.part_of(join.child)
         self.request_handbacks[(tl, req)] = self.request_handbacks.get((tl, req), 0) + 1
         n = self.join_arrivals[(tl, req, part)] = self.join_arrivals.get((tl, req, part), 0) + 1
@@ -824,26 +832,32 @@ class Harness:
             if not complete:
                 return
 
+    def _ends_on_user_message(self, tl: str) -> bool:
+        rows = self.store.working_view(tl)
+        return bool(rows) and rows[-1]["role"] == "user" and seeder_mod.is_candidate(rows[-1])
+
     async def _after_commit(self, src: str, applied: list[QueuedJoin], contain: bool) -> None:
-        """Joins were applied to src and no user message is waiting. If the last one handed a
-        user message back, that message is src's last row and src answers it in a turn.
-        Otherwise, if background joins were among them, src is woken with a closing note. `contain`: this is a retry or an idle commit
-        point, with no caller to hand an error to, so a failure of the turn is reported like a
-        failed wake; a focus graft joining inside a user's turn passes False and the error
-        reaches the user's call as that turn's own failure."""
-        if applied[-1].trigger is None:
-            # A focus graft's own conversation was seen by the user: only background work is news.
-            background = [(j.child, j.reason) for j in applied if self.is_background(j.child)]
-            if background:
-                await self._wake(src, background)
+        """Joins were applied to src and no user message is waiting: decide whether src runs.
+        It runs if a focus graft handed its request back or failed (the user must be answered,
+        whether or not the graft had already spoken), or if background grafts joined (their work
+        is news). A focus graft's `done` join alone needs nothing: the user saw that
+        conversation. If a handed-back user message is now src's last row, src answers it in a
+        turn; otherwise src is woken with a closing harness note. `contain`: this is a retry or
+        an idle commit point, with no caller to hand an error to, so a failure of the turn is
+        reported like a failed wake; a focus graft joining inside a user's turn passes False and
+        the error reaches the user's call as that turn's own failure."""
+        news = [(j.child, j.reason) for j in applied if self.is_background(j.child) or j.reason != "done"]
+        if not news:
             return
-        if not contain:
+        if not self._ends_on_user_message(src):
+            await self._wake(src, news)
+        elif not contain:
             await self.run(src)
-            return
-        try:
-            await self.run(src)
-        except Exception as e:
-            self._report_failure(kind="wake", src=src, clones=[j.child for j in applied], error=e)
+        else:
+            try:
+                await self.run(src)
+            except Exception as e:
+                self._report_failure(kind="wake", src=src, clones=[c for c, _ in news], error=e)
 
     def still_running(self, src: str) -> str:
         """Harness-generated sentence for join records and wake notes: which of src's grafts are
@@ -856,11 +870,11 @@ class Harness:
                 else "No other clone of yours is still running.")
 
     async def _wake(self, src: str, joined: list[tuple[str, str]]) -> None:
-        """Background joins were applied and no user message is waiting: close the view with one harness
-        note (a user row, so src can continue) and run src once for all of them. If a request
-        was handed back and src has wake clone calls left, the run is a turn (it may route the
-        request); otherwise it is a report, in which the machine refuses a clone. A failure of
-        this run never propagates: the joins stay committed and the user is told."""
+        """Joins were applied and src's view does not end on a user message: close it with one
+        harness note (a user row, so src can continue) and run src once for all of them. If a
+        request was handed back and src has wake clone calls left, the run is a turn (it may
+        route the request); otherwise it is a report, in which the machine refuses a clone. A
+        failure of this run never propagates: the joins stay committed and the user is told."""
         names = ", ".join(f"{c} ({r})" for c, r in joined)
         dropped = [c for c, _ in joined if c in self.join_dropped]
         kept = [c for c, _ in joined if c not in self.join_dropped]
@@ -869,34 +883,38 @@ class Harness:
             where = (where + " " if where else "") + (
                 f"The result of {', '.join(dropped)} did not fit in your context and stays in the frozen "
                 f"timeline of {'that clone' if len(dropped) == 1 else 'those clones'}; say so if asked.")
-        routing = (any(r == "out_of_scope" for _, r in joined)
-                   and self.wake_clone_calls.get(src, 0) < MAX_WAKE_CLONE_CALLS)
-        task = ("A request was handed back: route it, unless a still-running clone is already doing it. "
-                if routing else "Do not clone now. ")
+        # A focus graft that hands back or fails leaves the user waiting on this run: it is a turn,
+        # as it is when the handed-back message is the last row. Background hand-backs are routed
+        # only while the source has a wake clone call left; otherwise the run only reports.
+        focus_back = any(r != "done" and not self.is_background(c) for c, r in joined)
+        routing = focus_back or (any(r == "out_of_scope" for _, r in joined)
+                                 and self.wake_clone_calls.get(src, 0) < MAX_WAKE_CLONE_CALLS)
+        task = ("A request came back: answer the user, and route what is still to do unless a "
+                "still-running clone is already doing it. " if routing else "Do not clone now. ")
         self.store.add_turn(src, "user", "text", harness=True, content=(
-                            f"(harness note: background clone{'s' if len(joined) > 1 else ''} {names} joined; "
+                            f"(harness note: {self._names([c for c, _ in joined], named=False)} {names} joined; "
                             f"{where} {self.still_running(src)} You hold the conversation: tell the user, "
                             f"in your own words, only the outcome of the clones that have joined. {task}"
                             "Do not describe still-running work as finished.)"))
         self.wakes.append({"source": src, "joined": joined, "report": not routing})
-        self.trace(f"[{src}] WAKE ({'route' if routing else 'report'}) for background joins: {names}")
+        self.trace(f"[{src}] WAKE ({'route' if routing else 'report'}) for joins: {names}")
         try:
             if routing:
                 await self.machines.begin_turn(src)
             else:
                 await self.machines.begin_report(src)
             self._mirror()
-            await self._turn(src, wake=True, report=not routing)
+            await self._turn(src, wake=not focus_back, report=not routing)
         except Exception as e:
             self._report_failure(kind="wake", src=src, clones=[c for c, _ in joined], error=e)
 
     # ------------------------------------------------------------ join event
     def replied(self, tl: str) -> bool:
-        """Has tl produced user-facing assistant text since the last user text message (in its
-        working view)?"""
+        """Has tl produced user-facing assistant text since the last user message in its working
+        view? A harness note is not a user message."""
         answered = False
         for r in self.store.working_view(tl):
-            if r["role"] == "user" and r["kind"] == "text":
+            if r["role"] == "user" and seeder_mod.is_candidate(r):
                 answered = False
             elif r["role"] == "assistant" and r["kind"] == "text":
                 answered = True
@@ -911,13 +929,17 @@ class Harness:
 
     def clone_blocked(self, tl: str, attempts: int, report: bool = False) -> str | None:
         """Why a whole clone call must not run, or None: tl is only reporting (the machine would
-        refuse the clone too); tl's current request has been handed back too many times; or this
-        message's clone calls are used up. Re-cloning one part that failed or bounced is refused
+        refuse the clone too); the clone calls for this user message are used up (a cap that
+        depends on no key); tl's current request has been handed back too many times; or this
+        run's clone attempts are used up. Re-cloning one part that failed or bounced is refused
         per entry, in `clone_call` (`part_blocked`). Without these bounds a source whose clone
         keeps failing or handing the same request back re-clones it forever."""
         if report:
             return ("you were woken to report background clones that just finished. Do not clone "
                     "now: tell the user the outcome, and wait for their next message.")
+        if self.clone_calls_this_message >= MAX_CLONE_CALLS_PER_MESSAGE:
+            return (f"the {MAX_CLONE_CALLS_PER_MESSAGE} clone calls for this user message are used up. Do not "
+                    "clone again: answer the user yourself, briefly saying what could not be done.")
         if self.request_handbacks.get((tl, self.current_request(tl)), 0) >= MAX_REQUEST_HANDBACKS:
             return ("clones for this message have failed or handed it back too many times. Do not clone "
                     "for it again: answer the user yourself, briefly saying what could not be done.")
@@ -926,11 +948,14 @@ class Harness:
         return None
 
     def compute_trigger(self, child: str, reason: str) -> int | None:
+        """The user message child did not handle, if any: the last user message in its working
+        view, when it is handing it back or never answered it. A harness note is never a user
+        message, so it is never a trigger."""
         rows = self.store.working_view(child)
         last_user = None
         answered = False
         for r in rows:
-            if r["role"] == "user" and r["kind"] == "text":
+            if r["role"] == "user" and seeder_mod.is_candidate(r):
                 last_user, answered = r["row_id"], False
             elif r["role"] == "assistant" and r["kind"] == "text":
                 answered = True
@@ -939,6 +964,18 @@ class Harness:
         if reason == "out_of_scope" or not answered:
             return last_user
         return None
+
+    def request_of(self, join: QueuedJoin) -> int | None:
+        """The request a joining graft was working on, as the harness knows it. If the graft hands
+        back a user message it received after it started (a row of its own, not a harness note),
+        that message. Otherwise the source's current request when the graft was cloned, recorded
+        then. Never a row the model chose to seed: a trigger that is merely the last user row of
+        a model-written seed says nothing about which request this is."""
+        if join.trigger is not None:
+            row = self.store.turn(join.trigger)
+            if row is not None and row["owner_timeline"] == join.child and not row["harness"]:
+                return join.trigger
+        return self.request_at_clone.get(join.child)
 
     async def do_join(self, child: str, reason: str) -> None:
         """Raise child's join event from outside its own loop (tests, the replay experiment).

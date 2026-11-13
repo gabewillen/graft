@@ -32,7 +32,9 @@ def clone_use(*entries, id="t"):
 
 
 def user_texts(messages):
-    return [b["text"] for m in messages if m["role"] == "user" for b in m["content"] if b["type"] == "text"]
+    """The user's own messages: harness notes are left out."""
+    return [b["text"] for m in messages if m["role"] == "user" for b in m["content"]
+            if b["type"] == "text" and not b.get("harness")]
 
 
 class Script:
@@ -655,7 +657,8 @@ def test_focus_join_record_names_live_background_grafts(tmp_path):
         store.add_turn("o", "assistant", "tool_use", {"id": "t", "input": {}}, "clone")
         store.add_turn("o", "user", "tool_result", {"tool_use_id": "t", "content": msg}, "clone")
         await h.do_join(c1, "out_of_scope")  # bounces at once, while both background grafts are live
-        assert len(seen["notes"]) == 1  # the source ran for the trigger and saw the record
+        assert len(seen["notes"]) == 2  # the source ran for the hand-back: the join record, then the closing note
+        assert "c1 (out_of_scope) joined" in seen["notes"][1] and "Still running: c2" in seen["notes"][1]
         assert seen["notes"][0].startswith("(harness note: clone c1 joined, reason=out_of_scope")
         assert "Still running: c2 (skills: slides), c3 (skills: calendar)" in seen["notes"][0]
         await h.machines.stop()
@@ -1708,3 +1711,131 @@ def test_chat_status_and_error_lines_go_to_stderr(tmp_path, monkeypatch, capsys)
     assert "waiting for background clones" in err and "waiting for background clones" not in out
     assert "error: ValueError: wake exploded" in err and "error: ValueError" not in out
     assert "(harness error: background clone c1 joined, but reporting the result failed" in out  # said to the user
+
+
+# ------------------------------------------------------------------ hand-backs are bounded whatever the seed says
+def _always_clones(seed, reason, stop=12):
+    """An original that clones one website focus graft for every request and hand-back, seeded
+    with `seed` (model-chosen), and a graft that joins `reason` at once."""
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" not in names:
+            return [{"type": "tool_use", "id": f"j{len(messages)}", "name": "join", "input": {"reason": reason}}]
+        if len(user_texts(messages)) < 2 or last["type"] == "tool_result" or policy.calls >= stop:
+            return text("ok")
+        policy.calls += 1
+        return [{"type": "tool_use", "id": f"k{policy.calls}", "name": "clone",
+                 "input": {"clone": [{"purpose": "p", "skills": ["website"], "focus": True, **seed}]}}]
+
+    policy.calls = 0
+    return policy
+
+
+def committed_clones(store):
+    return store.con.execute("SELECT count(*) FROM transactions WHERE kind='clone' AND status='committed'").fetchone()[0]
+
+
+@pytest.mark.parametrize("reason,most", [("out_of_scope", 2), ("failed", 1)])
+def test_a_focus_graft_seeded_on_an_older_message_cannot_loop(tmp_path, reason, most):
+    policy = _always_clones({"seed_quotes": ["first message"]}, reason)
+    store, h, _ = make(tmp_path, policy)
+
+    async def go():
+        await h.start()
+        await h.user_says("first message about the site")
+        out = await h.user_says("second message please do it")
+        assert out and out[-1] == "ok"  # the user is answered
+        await h.close()
+
+    asyncio.run(go())
+    assert committed_clones(store) == most  # not one per hand-back until the stack overflows
+
+
+def test_a_focus_graft_seeded_on_a_harness_row_cannot_loop(tmp_path):
+    store, h, _ = make(tmp_path, lambda *a: text("ok"))
+
+    async def go():
+        await h.start()
+        await h.user_says("first message about the site")
+        note = store.add_turn("o", "user", "text", "(harness note: something the harness wrote)", harness=True)
+        h.provider.policy = _always_clones({"seed_row_ids": [note]}, "out_of_scope")
+        out = await h.user_says("second message please do it")
+        assert out and out[-1] == "ok"
+        assert store.timeline("c1")["join_trigger"] is None  # a harness row is never a request
+        await h.close()
+
+    asyncio.run(go())
+    assert committed_clones(store) == 2
+
+
+def test_clone_calls_per_user_message_are_capped_whatever_the_keys(tmp_path):
+    """Every hand-back here is a different part, so no part block fires and the request is far
+    from its hand-back total: only the cap on clone calls per user message stops it."""
+    from graft.harness import MAX_CLONE_CALLS_PER_MESSAGE
+    parts = ["website", "slides", "calendar", "newsletter", "social", "recipes"]
+
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" not in names:
+            return [{"type": "tool_use", "id": f"j{len(messages)}", "name": "join",
+                     "input": {"reason": "out_of_scope"}}]
+        if last["type"] == "tool_result" and last.get("is_error"):
+            policy.refusals.append(str(last["content"]))
+            return text("That is all I can do.")
+        skill = parts[policy.calls % len(parts)]
+        policy.calls += 1
+        return [{"type": "tool_use", "id": f"k{policy.calls}", "name": "clone", "input": {"clone": [
+            {"purpose": "p", "skills": [skill], "focus": True, "seed_quotes": [REQUEST]}]}}]
+
+    policy.calls, policy.refusals = 0, []
+    store, h, _ = make(tmp_path, policy)
+
+    async def go():
+        await h.start()
+        assert (await h.user_says(REQUEST))[-1] == "That is all I can do."
+        assert h.clone_calls_this_message == MAX_CLONE_CALLS_PER_MESSAGE
+        assert committed_clones(store) == MAX_CLONE_CALLS_PER_MESSAGE
+        assert len(policy.refusals) == 1 and "clone calls for this user message" in policy.refusals[0]
+        await h.user_says(REQUEST + " Again.")  # a new user message has its own budget
+        assert committed_clones(store) == 2 * MAX_CLONE_CALLS_PER_MESSAGE
+        await h.close()
+
+    asyncio.run(go())
+
+
+# ------------------------------------------------------------------ a focus graft that fails after it has spoken
+def _fails_after_speaking(raises):
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" in names:
+            if last["type"] == "text" and last.get("harness"):
+                return text("Sorry, building the site failed.")
+            if last["type"] == "tool_result":
+                return text("(waiting)")
+            return [clone_use(entry(["website"], True), id="k1") | {"type": "tool_use"}]
+        if raises and any(m["role"] == "assistant" for m in messages):
+            raise ValueError("provider exploded")
+        return [{"type": "text", "text": "Working on it."},
+                {"type": "tool_use", "id": f"r{len(messages)}", "name": "site_read", "input": {"page": "home"}}]
+    return policy
+
+
+@pytest.mark.parametrize("raises", [True, False], ids=["its run raises", "its step budget runs out"])
+def test_a_focus_graft_that_fails_after_speaking_still_gets_the_user_an_answer(tmp_path, raises):
+    store, h, _ = make(tmp_path, _fails_after_speaking(raises), max_steps=3)
+
+    async def go():
+        await h.start()
+        out = await h.user_says(REQUEST)
+        assert out[0] == "Working on it." and out[-1] == "Sorry, building the site failed."
+        assert store.timeline("c1")["join_reason"] == "failed" and h.machines.state("c1") == "joined"
+        assert (h.machines.state("o"), h.machines.phase("o"), h.machines.holder()) == ("active", "idle", "o")
+        note = store.view("o")[-2]
+        assert note["harness"] and "c1 (failed)" in note["content"]  # what the source was woken with
+        await h.close()
+
+    asyncio.run(go())
+    assert validate(store.view("o"), "o", require_user_end=False) == []

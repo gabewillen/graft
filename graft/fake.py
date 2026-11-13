@@ -29,10 +29,15 @@ def _clone(purpose: str, skills: list[str], seed_quotes: list[str], focus: bool 
     return {"purpose": purpose, "skills": skills, "focus": focus, "seed_quotes": seed_quotes}
 
 
+# A wake note names the joined clones with their reasons ("... clone c1 (failed) joined; ...");
+# a join record does not ("... clone c1 joined, reason=..."). Both carry the harness mark.
+_WAKE_NOTE = re.compile(r"\(harness note: (background )?clones? \w+ \(")
+
+
 def woken(messages: list[dict]) -> str | None:
     """The harness wake note, if the last user message ends with one (background clones joined)."""
     last = _last_block(messages)
-    if last["type"] == "text" and last.get("harness") and last["text"].startswith("(harness note: background clone"):
+    if last["type"] == "text" and last.get("harness") and _WAKE_NOTE.match(last["text"]):
         return last["text"]
     return None
 
@@ -44,7 +49,7 @@ def _wake_reply(messages: list[dict]) -> list[dict]:
     for prev, m in zip(messages, messages[1:]):
         notes = [b["text"] for b in prev["content"] if b["type"] == "text" and b.get("harness")] \
             if prev["role"] == "user" else []
-        if any(n.startswith("(harness note: background clone") for n in notes):
+        if any(_WAKE_NOTE.match(n) for n in notes):
             replies = []  # an earlier wake: already reported
         if m["role"] == "assistant" and any(n.startswith("(harness note: clone ") for n in notes):
             replies += [b["text"] for b in m["content"] if b["type"] == "text"]
