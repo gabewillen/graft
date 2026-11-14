@@ -1480,9 +1480,16 @@ def clone_refused_written(ctx, inst, event) -> None:
 
 
 def clone_refusal_not_written(ctx, inst, event) -> None:
+    """The refusal's result row could not be written: kept, and written with the run's open calls.
+    The user is told, and the call's caller, the run, gets that error, so it ends (its closing
+    writes the row) instead of calling the model on a view without it."""
     clone, inst.clone = inst.clone, None
+    text = f"clone refused; no clone was created ({event.data})"
+    if clone.store:
+        inst.unstored[clone.use["id"]] = (text, True)
+    inst.reported = event.data
     _report(inst=inst, kind="task", clones=[], error=event.data)
-    _resolve(reply=clone.reply, value=(None, None, f"clone refused; no clone was created ({event.data})"))
+    _fail(reply=clone.reply, error=event.data)
 
 
 def attempt_clone(ctx, inst, event) -> None:
@@ -1521,9 +1528,24 @@ def committed(ctx, inst, event) -> None:
 
 def row_not_written(ctx, inst, event) -> None:
     """The clone call's result row could not be written: kept, and written with the run's open
-    calls, by the run's closing (`closing_calls`) or, before a hand-over, by `flushing`."""
+    calls, by the run's closing (`closing_calls`) or, before a hand-over, by `flushing`. The user
+    is told; a run that goes on ends with that error (its view would lack the row)."""
     inst.unstored[inst.clone.use["id"]] = (inst.clone_text, False)
+    inst.reported = event.data
     _report(inst=inst, kind="task", clones=[], error=event.data)
+
+
+def row_lost(ctx, inst, event) -> bool:
+    """The clone call's result row could not be written, and the run would go on (no hand-over)."""
+    return inst.focus is None and inst.clone is not None and inst.clone.use.get("id") in inst.unstored
+
+
+def clone_row_lost(ctx, inst, event) -> None:
+    """The clone call ran, but its result row is not in the view: its caller, the run, gets that
+    error, so the run ends (its closing writes the row it kept) instead of calling the model on a
+    view without it."""
+    clone, inst.clone = inst.clone, None
+    _fail(reply=clone.reply, error=inst.reported)
 
 
 def spawned(ctx, inst, event) -> None:
@@ -2030,6 +2052,7 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
         hsm.Choice(
             "clone_choice",  # a hand-over leaves the run: its open calls and kept rows are written first
             T(S("steps/cloning/flushing"), G(hands_over), hsm.Effect(take_hand_over)),
+            T(S("resume"), G(row_lost), hsm.Effect(clone_row_lost)),
             T(S("resume"), hsm.Effect(clone_done)),
         ),
         hsm.Choice(

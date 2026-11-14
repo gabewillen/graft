@@ -742,20 +742,47 @@ def test_a_request_row_that_cannot_be_written_fails_the_call_explicitly_and_runs
 @pytest.mark.parametrize("name, refused", [("commit_clone", True), ("store_result", False)])
 def test_a_clone_write_that_fails_ends_in_its_handled_state(name, refused):
     """The commit is `committing`'s activity: if it fails, the call is refused (`refusing`). The
-    result row is `recording`'s: if it fails, the clone stands and the row is kept for the run's
-    closing. Either way the original is back in its run, never stuck in the writing state."""
+    result row is `recording`'s: if it fails, the clone stands, the row is kept for the run's
+    closing, and the call's caller (the run) gets the error, so the run does not go on over a
+    view without that row. Either way the original is back in its run, never stuck in the
+    writing state."""
     async def go():
         host, m = await started()
         first = await say(m=m, text="go")
         _failing(host=host, name=name, error=OSError("disk full"))
-        children, _, text = await clone(m=m, pairs=[("c1", False)])
-        assert (children is None) == refused and "o" in host.runs
+        if refused:
+            children, _, text = await clone(m=m, pairs=[("c1", False)])
+            assert children is None
+        else:
+            with pytest.raises(OSError, match="disk full"):
+                await clone(m=m, pairs=[("c1", False)])
+        assert "o" in host.runs
         await withdraw(m=m, reply=first)  # the run goes on until it is ended
         assert ("run_cancelled", "o") in host.log and await first == "ended"
         kept = {} if refused else {"k": ("cloned", False)}  # the real result, written by the closing
         assert host.logged("close", "o") == [("close", "o", kept)]
         if not refused:
             assert host.status["c1"] == "background"
+        await m.stop()
+    run(go)
+
+
+def test_a_refused_clone_call_whose_result_row_cannot_be_written_ends_its_run():
+    """The commit fails, so the call is refused, and the refusal's result row cannot be written
+    either: the row is kept for the run's closing, and the call's caller (the run) gets the error,
+    so no model call reads a view without that row."""
+    async def go():
+        host, m = await started()
+        first = await say(m=m, text="go")
+        host.fail_commit = True
+        _failing(host=host, name="store_result", error=OSError("disk full"))
+        with pytest.raises(OSError, match="disk full"):
+            await clone(m=m, pairs=[("c1", False)])
+        assert "o" in host.runs  # the run's own failure ends it
+        await withdraw(m=m, reply=first)
+        assert await first == "ended"
+        (closed,) = host.logged("close", "o")
+        assert closed[2]["k"][1] is True and "no clone was created" in closed[2]["k"][0]  # the refusal, kept
         await m.stop()
     run(go)
 
