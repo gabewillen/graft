@@ -69,6 +69,8 @@ calls and its join reason; then each failure told, one per step, in `reporting`)
 The session machine knows whether anything is in flight (the original engaged, a background graft
 whose join has not reached it) and answers `settle` when nothing is; `close` is `shutdown`. It
 keeps the errors `settle` raises, each once, unless a user's call was waiting when it happened.
+At the end of `close` it stops every machine (`stopping`); one that cannot be stopped is reported
+(`telling`) and raised by `close`, and the rest are still stopped.
 
 Rules the graph enforces. Only the original clones, only in a turn or routing wake, never while
 closing, at most CLONE_TRIES clone calls per run (one, and one retry; a committed call is the
@@ -297,6 +299,7 @@ class SessionSM(hsm.Instance):
         self.root: str | None = None
         self.users: set[int] = set()
         self.to_shut: list[str] = []
+        self.stop_errors: list[BaseException] = []  # machines that could not be stopped at close
 
 
 class ScribeSM(hsm.Instance):
@@ -1963,20 +1966,69 @@ def s_stash_closer(ctx, inst, event) -> None:
 
 
 def s_closed(ctx, inst, event) -> None:
+    """Closed: every close and settle waiting is answered; a machine that could not be stopped
+    is the first close's error (the one error, or an ExceptionGroup of all of them)."""
     closers, inst.closers = inst.closers, []
     settles, inst.settles = inst.settles, []
+    errors, inst.stop_errors = inst.stop_errors, []
+    if closers and errors:
+        first, *closers = closers
+        _fail(reply=first, error=errors[0] if len(errors) == 1 else ExceptionGroup("stopping machines failed", errors))
     for reply in closers + settles:
         _resolve(reply=reply, value=None)
 
 
+def s_take_stop_errors(ctx, inst, event) -> None:
+    inst.stop_errors = list(event.data)
+
+
+def s_stop_crashed(ctx, inst, event) -> None:
+    inst.stop_errors = [event.data]
+
+
+def s_stops_clean(ctx, inst, event) -> bool:
+    return not event.data
+
+
 async def s_stop_machines(ctx, inst: SessionSM, event) -> None:
     """The original has closed: every timeline's machine and the scribe are stopped (each stop
-    waits for the step it is in), so nothing stays live after `close`. Later requests to them are
-    refused by the registry."""
+    waits for the step it is in), so nothing stays live after `close`. A machine that cannot be
+    stopped does not keep the others live: each failure is collected, the rest are still
+    stopped, and the outcome (`stopped`) carries the failures. Later requests to the stopped
+    machines are refused by the registry."""
+    errors: list[BaseException] = []
     for sm in [*inst.machines.timelines.values(), inst.machines.scribe]:
         if sm is not None and sm.state():
-            await hsm.Stop(sm)
-    inst.dispatch(inst.context(), hsm.Event(name="stopped"))
+            try:
+                await hsm.Stop(sm)
+            except Exception as e:  # noqa: BLE001 - the outcome event carries it
+                errors.append(e)
+    inst.dispatch(inst.context(), hsm.Event(name="stopped", data=errors))
+
+
+def _s_tell(inst, event):
+    """The machines that could not be stopped are told to the user (the scribe is stopped by now,
+    so the session's own activity calls the host), each whatever telling another one raised. The
+    outcome is what the user's callbacks raised meanwhile, which close raises with the rest."""
+    failed: list[BaseException] = []
+    for error in inst.stop_errors:
+        try:
+            inst.machines.host.report(kind="machine", src=None, clones=[], error=error, quiet=False,
+                                      background=False)
+        except Exception as e:  # noqa: BLE001 - the outcome event carries it
+            failed.append(e)
+    return failed
+
+
+def s_told(ctx, inst, event) -> None:
+    """Every stop failure was told: what telling them raised is added to what close raises."""
+    inst.stop_errors += list(event.data)
+    s_closed(ctx=ctx, inst=inst, event=event)
+
+
+def s_tell_crashed(ctx, inst, event) -> None:
+    inst.stop_errors.append(event.data)
+    s_closed(ctx=ctx, inst=inst, event=event)
 
 
 def s_answer_now(ctx, inst, event) -> None:
@@ -2048,8 +2100,14 @@ SESSION = hsm.Define(
         hsm.State("finishing"),
         hsm.State(
             "stopping", hsm.Activity(s_stop_machines),  # every machine but this one, then closed
-            _T(_On("stopped"), _S("../../closed"), hsm.Effect(s_closed)),
-            _T(_On(_E), _S("../../closed"), hsm.Effect(s_closed)),
+            _T(_On("stopped"), _S("../../closed"), _G(s_stops_clean), hsm.Effect(s_closed)),
+            _T(_On("stopped"), _S("../telling"), hsm.Effect(s_take_stop_errors)),
+            _T(_On(_E), _S("../telling"), hsm.Effect(s_stop_crashed)),
+        ),
+        hsm.State(
+            "telling", io(done="told", work=_s_tell),  # a machine that could not be stopped: reported
+            _T(_On("told"), _S("../../closed"), hsm.Effect(s_told)),
+            _T(_On(_E), _S("../../closed"), hsm.Effect(s_tell_crashed)),
         ),
     ),
     hsm.Final("closed"),

@@ -4,6 +4,7 @@ an activity the test ends. A test waits on a reply future or on a call the machi
 host (`Host.next`), never on loop turns, and asserts on what the host was asked to do."""
 
 import ast
+import contextlib
 import asyncio
 
 import pytest
@@ -883,5 +884,120 @@ def test_cancelling_a_held_graft_in_a_caller_driven_turn_returns():
         assert answer == [(repr([("c1", CANCELLED)]), False)]
         await asyncio.wait_for(m.ask(tl="o", name="driven_done", build=lambda r: r), timeout=GUARD)
         await asyncio.wait_for(m.ask(tl="session", name="shutdown", build=lambda r: r), timeout=GUARD)
+        await m.stop()
+    run(go)
+
+
+# ------------------------------------------------------------------ close
+def test_a_machine_that_cannot_be_stopped_is_reported_and_the_rest_are_still_stopped(monkeypatch):
+    import graft.machine as machine_module
+    real = machine_module.hsm.Stop
+
+    def stop(sm, ctx=None):
+        if getattr(sm, "timeline_id", None) == "o":
+            async def fails():
+                raise RuntimeError("cannot stop o")
+            return fails()
+        return real(sm, ctx)
+
+    async def go():
+        host, m = await started()
+        reply = await say(m=m, text="hi")
+        host.end("o")
+        await reply
+        monkeypatch.setattr(machine_module.hsm, "Stop", stop)
+        with pytest.raises(RuntimeError, match="cannot stop o"):
+            await asyncio.wait_for(m.ask(tl="session", name="shutdown", build=lambda r: r), GUARD)
+        monkeypatch.setattr(machine_module.hsm, "Stop", real)
+        assert ("machine", [], "cannot stop o") in host.reports
+        assert not m.scribe.state()  # stopped although o could not be
+        await m.stop()
+    run(go)
+
+
+def test_every_stop_failure_is_told_when_telling_one_raises_and_close_raises_that_too(monkeypatch):
+    """Two machines cannot be stopped and the user's callback raises while the first is told:
+    the second is still told, and close raises both stop failures and the callback's error."""
+    import graft.machine as machine_module
+    real = machine_module.hsm.Stop
+    callback_error = RuntimeError("emit failed")
+
+    class Reporter(Host):
+        def report(self, kind, src, clones, error, quiet, background):
+            super().report(kind=kind, src=src, clones=clones, error=error, quiet=quiet, background=background)
+            if len(self.reports) == 1:
+                raise callback_error
+
+    async def go():
+        host = Reporter()
+        m = Machines(host)
+        await m.start_root("o")
+
+        def stop(sm, ctx=None):
+            if getattr(sm, "timeline_id", None) == "o" or sm is m.scribe:
+                async def fails():
+                    raise RuntimeError(f"cannot stop {getattr(sm, 'timeline_id', 'scribe')}")
+                return fails()
+            return real(sm, ctx)
+
+        reply = await say(m=m, text="hi")
+        host.end("o")
+        await reply
+        monkeypatch.setattr(machine_module.hsm, "Stop", stop)
+        with pytest.raises(ExceptionGroup) as raised:
+            await asyncio.wait_for(m.ask(tl="session", name="shutdown", build=lambda r: r), GUARD)
+        monkeypatch.setattr(machine_module.hsm, "Stop", real)
+        assert [r for r in host.reports if r[0] == "machine"] == [
+            ("machine", [], "cannot stop o"), ("machine", [], "cannot stop scribe")]
+        assert [str(e) for e in raised.value.exceptions] == ["cannot stop o", "cannot stop scribe", "emit failed"]
+        await m.stop()
+    run(go)
+
+
+def test_the_original_stays_open_until_a_late_grafts_join_is_applied(monkeypatch):
+    """Close lands while a clone call is in flight: its graft is made after closing began and is
+    shut down late (its run is slow to end). The original, shut down meanwhile, waits at rest for
+    that graft's join, applies it, and only then closes."""
+    import graft.machine as machine_module
+    real = machine_module.hsm.Started
+
+    class SlowGraft(Host):
+        async def _run(self, tl):  # only c1's run waits for `hold` once it is ended
+            self.runs[tl] = asyncio.get_running_loop().create_future()
+            try:
+                return await self.runs[tl]
+            except asyncio.CancelledError:
+                self.record("run_cancelled", tl)
+                if tl == "c1" and self.hold is not None:
+                    await self.hold
+                raise
+
+    async def go():
+        host = SlowGraft()
+        m = Machines(host)
+        await m.start_root("o")
+        await say(m=m, text="go")
+        starting, release = m.future(), m.future()
+
+        async def held_start(ctx, sm, model, config=None):
+            if getattr(sm, "timeline_id", None) == "c1":
+                starting.set_result(None)
+                await release
+            return await real(ctx, sm, model, config)
+
+        monkeypatch.setattr(machine_module.hsm, "Started", held_start)
+        asking = asyncio.ensure_future(clone(m=m, pairs=[("c1", False)]))
+        await asyncio.wait_for(starting, GUARD)  # the clone call is in flight
+        closing = asyncio.ensure_future(m.ask(tl="session", name="shutdown", build=lambda r: r))
+        host.hold = m.future()  # c1's run, once shut down, is slow to end
+        stopping = host.next("run_cancelled", "c1")
+        release.set_result(None)
+        await asyncio.wait_for(stopping, GUARD)
+        await asyncio.wait_for(asking, GUARD)
+        with contextlib.suppress(TransitionRefused):
+            await at_rest(m)  # the original has done what it can before c1's join comes
+        host.hold.set_result(None)
+        await asyncio.wait_for(closing, GUARD)
+        assert ("apply", "c1", "failed") in host.log and host.status["c1"] == "joined"
         await m.stop()
     run(go)
