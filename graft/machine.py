@@ -792,7 +792,7 @@ def _record(inst, event):
     errors = []
     if inst.close_first:
         try:
-            inst.host.close_tool_uses(tl=inst.timeline_id, known={})
+            inst.host.close_tool_uses(tl=inst.timeline_id, known=dict(inst.unstored))
         except Exception as e:  # noqa: BLE001
             errors.append(e)
     try:
@@ -966,6 +966,13 @@ def interrupted_closing(ctx, inst, event) -> None:
 
 def calls_closed(ctx, inst, event) -> None:
     inst.unstored = {}
+
+
+def keep_unstored(ctx, inst, event) -> None:
+    """A tool its run executed whose result row could not be written: its real result is kept,
+    and written when the run's open calls are closed (it ran: it is never closed as not run)."""
+    use, content, is_error = event.data
+    inst.unstored[use["id"]] = (content, is_error)
 
 
 def calls_not_closed(ctx, inst, event) -> None:
@@ -1571,6 +1578,7 @@ def _timeline(name: str) -> hsm.Model:
             T(S("live/idle")),
         ),
         T(On(*REQUESTS, "when_queued"), hsm.Effect(refuse_request)),
+        T(On("result_unstored"), hsm.Effect(keep_unstored)),
         T(On("rest_request"), G(has_joined), hsm.Effect(answer_joined)),
         T(On("rest_request"), hsm.Effect(refuse_request)),  # closed, or its join abandoned
         T(On("graft_queued"), hsm.Effect(enqueue)),
@@ -1726,6 +1734,7 @@ BACKGROUND = hsm.Define(
     ),
     _T(_On(*REQUESTS, "rest_request"), hsm.Effect(refuse_request)),  # not a timeline that rests: see join_queued
     _T(_On("when_queued"), hsm.Effect(answer_true)),
+    _T(_On("result_unstored"), hsm.Effect(keep_unstored)),
     _T(_On("cancel_request"), hsm.Effect(refuse_cancel_call)),
     _T(_On("clone_request"), hsm.Effect(refuse_clone_call)),
     _T(_On("cancel", "shutdown", "finish", "closing"), hsm.Effect(ignore)),

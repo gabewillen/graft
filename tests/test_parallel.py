@@ -6,6 +6,7 @@ threading.Event gates, and assertions that span more than one graft are order-fr
 fixes the order."""
 
 import asyncio
+import contextlib
 import json
 import threading
 
@@ -17,7 +18,7 @@ from graft.harness import (MAX_CANCEL_IDS, NOT_RUN_BESIDE_CLONE, NOT_RUN_INTERRU
                            NotRun, _reason, cancel_ids, clone_entries)
 from graft.providers import FakeProvider
 from graft.machine import MAX_LIVE_BACKGROUND, TransitionRefused
-from graft.skills import CANCEL_TOOL, CATALOG, JOIN_TOOL, install
+from graft.skills import CANCEL_TOOL, CATALOG, JOIN_TOOL, World, install
 
 REQUEST = "Build a website and a slide deck for the dental practice."
 GATE_TIMEOUT = 5  # seconds a scripted model call waits for its gate before the test fails
@@ -3916,6 +3917,91 @@ def test_a_cancelled_call_ends_the_wake_run_that_follows_its_turn(tmp_path):
     asyncio.run(go())
     assert [name for name, _, _ in tool_results(store=store, tl="o")] == ["clone"]  # load_skill never ran
     assert violations(store=store, tl="o") == []
+
+
+def test_a_tool_that_ran_keeps_its_result_when_a_later_call_of_the_response_raises(tmp_path):
+    class Raising(World):
+        def execute(self, name, args):
+            if name == "site_read":
+                raise RuntimeError("backend down")
+            return super().execute(name=name, args=args)
+
+    def policy(system, messages, tools):
+        if "clone" in {t["name"] for t in tools}:
+            if messages[-1]["content"][-1]["type"] == "tool_result":
+                return text("Started.")
+            return [clone_use(clone_entry(skills=["website"], focus=False), id="t1") | {"type": "tool_use"}]
+        return [{"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "index", "content": "hi"}},
+                {"type": "tool_use", "id": "r1", "name": "site_read", "input": {"page": "index"}}]
+
+    store, h, _ = make(tmp_path=tmp_path, policy=policy, world=Raising())
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await h.join_queued("c1")  # its run raised on the second call: it joins failed
+        await h.settle()
+        await h.close()
+
+    asyncio.run(go())
+    assert h.graft_errors == [("c1", "RuntimeError: backend down")] and h.world.site == {"index": "hi"}
+    assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False),
+                                                  ("site_read", NOT_RUN_INTERRUPTED, True)]
+    assert h.tools_run("c1") == ["site_write"] and violations(store=store, tl="c1") == []
+
+
+@pytest.mark.parametrize("who", ["background", "focus", "original"])
+def test_a_tool_that_ran_keeps_its_real_result_when_its_row_cannot_be_written(tmp_path, who):
+    """The tool runs, and writing its result row fails once: the run ends with that error, and the
+    row written when its open calls are closed holds the real result (marked as run), not "not
+    executed". The original holds no capability tool: its load_skill call stands for one."""
+    use = ({"type": "tool_use", "id": "l1", "name": "load_skill", "input": {"name": "clone"}} if who == "original"
+           else {"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "index", "content": "hi"}})
+
+    def policy(system, messages, tools):
+        last = messages[-1]["content"][-1]
+        if "clone" in {t["name"] for t in tools}:
+            if who == "original":
+                return text("Sorry.") if last["type"] == "tool_result" else [use]
+            if last["type"] == "tool_result" or last.get("harness"):
+                return text("Started.")
+            return [clone_use(clone_entry(skills=["website"], focus=who == "focus"), id="t1") | {"type": "tool_use"}]
+        return text("website finished") if last["type"] == "tool_result" else [use]
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+    real_add, failed = store.add_turn, []
+
+    def add_turn(tl, role, kind, content, *rest, **kw):
+        if kind == "tool_result" and content["tool_use_id"] == use["id"] and not failed:
+            failed.append(content)
+            raise OSError("disk I/O error")
+        return real_add(tl, role, kind, content, *rest, **kw)
+
+    store.add_turn = add_turn
+    tl = "o" if who == "original" else "c1"
+
+    async def go():
+        await h.start()
+        if who == "original":
+            with pytest.raises(OSError, match="disk I/O error"):
+                await h.user_says(REQUEST)  # the error is the waiting call's
+        else:
+            await h.user_says(REQUEST)
+        with contextlib.suppress(OSError):
+            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert failed, "the result write never failed"
+    rows = [json.loads(r["content"]) for r in store.view(tl) if r["kind"] == "tool_result"
+            and r["owner_timeline"] == tl and json.loads(r["content"])["tool_use_id"] == use["id"]]
+    assert len(rows) == 1 and not rows[0].get("not_run"), rows
+    if who == "original":
+        assert rows[0]["content"] == failed[0]["content"] and "clone" in rows[0]["content"]
+    else:
+        assert (rows[0]["content"], rows[0].get("ran")) == ("wrote page index (2 chars)", True)
+        assert h.tools_run("c1") == ["site_write"] and h.world.site == {"index": "hi"}
+    assert violations(store=store, tl=tl) == []
 
 
 # ------------------------------------------------------------------ rows kept by the machine are written before a hand-over

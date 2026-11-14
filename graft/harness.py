@@ -54,7 +54,7 @@ import json
 import re
 import threading
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from . import callsites, compaction
 from . import seeder as seeder_mod
@@ -88,6 +88,14 @@ class Ran(str):
     """The result of a tool call the harness executed (a capability tool or load_skill).
     `_store_results` marks it in the stored block (`ran`); the cancel record lists only calls so
     marked, so no pairing by tool-use id is needed. The mark is not rendered to the model."""
+
+
+class ToolResult(NamedTuple):
+    """One tool call's result as the harness stores it: the model's tool call, the result's
+    content (a NotRun or Ran marks it), and whether it is an error."""
+    use: dict
+    content: str
+    is_error: bool
 
 
 NOT_RUN_INTERRUPTED = NotRun("not executed: the turn was interrupted")
@@ -513,7 +521,7 @@ class Harness:
         return batch.text
 
     def store_result(self, tl: str, use: dict, content: str, is_error: bool) -> None:
-        self._store_results(tl=tl, results=[(use, content, is_error)])
+        self._store_results(tl=tl, results=[ToolResult(use=use, content=content, is_error=is_error)])
 
     def close_tool_uses(self, tl: str, known: dict[str, tuple[str, bool]]) -> None:
         self._close_tool_uses(tl=tl, known=known)
@@ -612,7 +620,7 @@ class Harness:
 
 
     # ------------------------------------------------------------ main loop
-    def _store_results(self, tl: str, results: list[tuple[dict, str, bool]]) -> None:
+    def _store_results(self, tl: str, results: list[ToolResult]) -> None:
         for use, content, err in results:
             block = {"tool_use_id": use["id"], "content": content, "is_error": err}
             if isinstance(content, NotRun):
@@ -754,7 +762,7 @@ class Harness:
                 answered.remove(use_id)  # one result answers one call, also when an id repeats
                 continue
             content, err = (known or {}).get(use_id, (NOT_RUN_INTERRUPTED, True))
-            missing.append(({"id": use_id, "name": r["tool_name"]}, content, err))
+            missing.append(ToolResult(use={"id": use_id, "name": r["tool_name"]}, content=content, is_error=err))
         if missing:
             self._store_results(tl=tl, results=missing)
 
@@ -798,9 +806,9 @@ class Harness:
                 self.silent_done_refusals.append(tl)
                 self.trace(f"[{tl}] join(done) refused: no reply since the last user message")
             if join_use:
-                results = [(u, NOT_RUN_JOINING, True) for u in uses if u is not join_use]
-                results.append((join_use, "joined", False))
-                self._store_results(tl, results)
+                results = [ToolResult(use=u, content=NOT_RUN_JOINING, is_error=True) for u in uses if u is not join_use]
+                results.append(ToolResult(use=join_use, content="joined", is_error=False))
+                self._store_results(tl=tl, results=results)
                 return RunOutcome(kind="join", reason=_reason(str(join_use["input"].get("reason", "failed"))))
             if clone_use:
                 # this call's role was routing into a clone: account it as the clone transaction
@@ -811,7 +819,7 @@ class Harness:
                 # put them: a cancelled graft's place is free, and its part blocked, before the
                 # clone call is decided. Every other call is answered without being run.
                 cancels = [u for u in uses if u is not clone_use and u["name"] == "cancel"]
-                others = [(u, NOT_RUN_BESIDE_CLONE, True) for u in uses
+                others = [ToolResult(use=u, content=NOT_RUN_BESIDE_CLONE, is_error=True) for u in uses
                           if u is not clone_use and u["name"] != "cancel"]
                 self._store_results(tl=tl, results=others)
                 # one request carries the response's cancels and its clone: the machine runs the
@@ -821,8 +829,9 @@ class Harness:
                 if cancel is not None:
                     await self._settle_cancel(tl=tl, uses=cancels, reply=cancel.reply)
                 continue
-            results = []
             cancels = []
+            # Each result is stored as soon as its call returns, so a later call of the same
+            # response that raises never leaves a call that ran recorded as not run.
             for u in uses:
                 if u is refused_join:
                     if background:
@@ -832,26 +841,36 @@ class Harness:
                         msg = ("join(reason='done') refused: you have not replied to the user since "
                                "their last message. First tell the user, in one or two sentences, what "
                                "you did; then call join(reason='done').")
-                    results.append((u, msg, True))
+                    self._store_results(tl=tl, results=[ToolResult(use=u, content=msg, is_error=True)])
                 elif u["name"] == "cancel":  # whoever calls it, whatever tools it was shown: the machine decides
                     cancels.append(u)
                 elif u["name"] not in allowed:
-                    results.append((u, NotRun(f"tool '{u['name']}' is not available to you"), True))
+                    absent = NotRun(f"tool '{u['name']}' is not available to you")
+                    self._store_results(tl=tl, results=[ToolResult(use=u, content=absent, is_error=True)])
                 elif u["name"] == "load_skill":
                     content, err = self.load(tl, str(u["input"].get("name", "")))
                     self.trace(f"[{tl}] load_skill({u['input'].get('name')}) -> {'error' if err else 'ok'}")
-                    results.append((u, content, err))
+                    await self._store_ran(tl=tl, result=ToolResult(use=u, content=content, is_error=err))
                 else:
                     content, err = self.world.execute(u["name"], u["input"])
                     self.trace(f"[{tl}] tool {u['name']}({json.dumps(u['input'])[:120]}) -> {content[:80]}")
-                    results.append((u, Ran(content), err))
-            self._store_results(tl, results)
+                    await self._store_ran(tl=tl, result=ToolResult(use=u, content=Ran(content), is_error=err))
             # The cancel calls run after every other call's result is stored: one request to the
             # machine, which stores each call's real result once the grafts have stopped.
             if cancels:
                 await self._cancels(tl=tl, uses=cancels)
         self.trace(f"[{tl}] step budget exhausted")
         return RunOutcome(kind="exhausted")
+
+    async def _store_ran(self, tl: str, result: ToolResult) -> None:
+        """Store the result of a tool call that ran. If the row cannot be written, the real result
+        is first handed to tl's machine (`result_unstored`), which keeps it for the run's closing,
+        so the call is closed with what it returned, never as not run; then the error ends the run."""
+        try:
+            self._store_results(tl=tl, results=[result])
+        except Exception:
+            await self.machines.send(tl=tl, name="result_unstored", data=result)
+            raise
 
     def _cancel_request(self, tl: str, uses: list[dict]) -> Cancel:
         """The cancel calls of one response, as one request for tl's machine. It cancels what the
@@ -878,7 +897,7 @@ class Harness:
                 ids, problems = cancel_ids(u.get("input"))
                 content, err = self.cancel_text(call=CancelCall(use=u, ids=ids, problems=problems),
                                                 outcomes={c: answer for c in ids})
-                results.append((u, content, err))
+                results.append(ToolResult(use=u, content=content, is_error=err))
             self._store_results(tl=tl, results=results)
 
     # ------------------------------------------------------------ cancel record, parts, blocks
@@ -1220,7 +1239,7 @@ class Harness:
         children, focus, text = await self.machines.ask(tl=src, name="clone_request", build=lambda reply: Clone(
             use=use, reply=reply, store=store, request=self.current_request(src), cancels=cancels))
         if isinstance(text, Unwritten) and store:  # refused by a timeline that is not running: ours to write
-            self._store_results(tl=src, results=[(use, str(text), True)])
+            self._store_results(tl=src, results=[ToolResult(use=use, content=str(text), is_error=True)])
         return children, focus, text
 
     async def prepare_clone(self, src: str, clone: Clone, retry_left: bool) -> Prepared | str:
