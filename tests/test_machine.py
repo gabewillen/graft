@@ -79,6 +79,9 @@ class Host:
         self.record("request", tl, text)
         return len(self.log)
 
+    def mark_withdrawn(self, timelines, rows):
+        self.record("withdrawn", tuple(timelines), list(rows))
+
     async def prepare_clone(self, src, clone, retry_left):
         self.record("prepare", src, retry_left)
         return Prepared(pairs=clone.pairs, parts=clone.parts, data=None)
@@ -981,13 +984,15 @@ def test_no_wake_runs_for_a_turn_whose_request_was_withdrawn(method):
 
 @pytest.mark.parametrize("method", ["commit_clone", "store_result"])
 def test_a_request_withdrawn_during_a_focus_clone_never_lets_the_focus_graft_act(method):
-    """Withdrawn while the clone call commits (before the graft is made), the focus graft starts
-    at rest; withdrawn while its result row is written (after the graft started), the withdrawal
-    is forwarded and the graft's run ends. Either way the clone call is carried out whole and the
-    conversation is handed over."""
+    """Withdrawn while the clone call commits (before the graft is made), the focus graft never
+    starts a run; withdrawn while its result row is written (after the graft started), the
+    withdrawal is forwarded and the graft's run ends. Either way the clone call is carried out
+    whole, the conversation is handed over, and the request's written row is marked in the
+    graft's view and its source's before the graft is at rest."""
     async def go():
         host, m = await started()
         reply = await say(m=m, text="go")
+        row = host.log.index(("request", "o", "go")) + 1  # the row the host wrote for it
         _withdraws_inside(host=host, m=m, method=method, reply=reply)
         _, focus, _ = await clone(m=m, pairs=[("c1", True)])
         assert focus == "c1" and host.status["o"] == "cloned"
@@ -997,6 +1002,7 @@ def test_a_request_withdrawn_during_a_focus_clone_never_lets_the_focus_graft_act
             assert await asyncio.wait_for(reply, GUARD) == "ended"  # and its caller is answered at its rest
         else:
             assert ("run_cancelled", "c1") in host.log  # its run was ended
+        assert host.logged("withdrawn") == [("withdrawn", ("c1", "o"), [row])]
         await m.stop()
     run(go)
 
@@ -1525,12 +1531,13 @@ def _in_order(monkeypatch, order):
 @pytest.mark.parametrize("order", ORDERS)
 def test_a_withdrawn_hand_back_wakes_nothing_whatever_order_the_branches_are_declared_in(monkeypatch, order):
     """A focus graft hands its request back, and the request is withdrawn as it does: after the
-    joins, no wake note is written and no run answers it, with the branches of the choices in
-    either order."""
+    joins, no wake note is written and no run answers it (its row is marked instead), with the
+    branches of the choices in either order."""
     async def go():
         _in_order(monkeypatch=monkeypatch, order=order)
         host, m = await started()
         reply = await say(m=m, text="go")
+        row = host.log.index(("request", "o", "go")) + 1
         real = host.join_of
 
         def join_of(tl, reason):  # the caller goes away as the graft hands the request back
@@ -1543,6 +1550,7 @@ def test_a_withdrawn_hand_back_wakes_nothing_whatever_order_the_branches_are_dec
         await asyncio.wait_for(host.next("apply", "c1"), GUARD)
         assert await at_rest(m) == "ended"
         assert host.logged("note") == [] and host.logged("run", "o") == [("run", "o", "turn")]
+        assert host.logged("withdrawn") == [("withdrawn", ("o",), [row])]
         await m.stop()
     run(go)
 

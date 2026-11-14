@@ -8,7 +8,8 @@ Graft (spec: Compaction, One primitive), mode `turns`: one `compact` tool call (
 `<role>:compaction`) over the current working view before the fresh message returns an ordered
 list of items, each {keep: row_id} or a compressed message {role, text, begin_row_id,
 end_row_id}. Kept rows and windows must PARTITION that prefix: in order, contiguous, no gaps,
-no overlap. A compressed message becomes a new text row owned by the timeline (provenance in
+no overlap; a message the user withdrew is kept (marked in the index, never inside a window).
+A compressed message becomes a new text row owned by the timeline (provenance in
 `compressions`: its window), placed at its window's position, rendered as a normal turn in its
 role. New working view = the items in order + the fresh message, validated like a seed or a
 join (turn structure); on violations the model gets them back for one retry; if that fails too,
@@ -85,6 +86,7 @@ EXTRACT_INSTRUCTION = (
     "- {\"op\": \"compress\", \"role\": \"user\"|\"assistant\", \"text\": ..., \"begin_row_id\": a, "
     "\"end_row_id\": b} replaces the contiguous rows a..b (inclusive, in index order) with one condensed "
     "message. A user-role message must only restate what the user said in those rows.\n"
+    "A row marked withdrawn is a message the user withdrew: keep it (it may not be inside a window).\n"
     "Keep short rows and exact details (names, numbers, dates, quotes) verbatim; compress long or "
     "redundant rows (tool noise, superseded drafts, chit-chat). Keep every fact, requirement and "
     "preference the user gave and the results of work you still need.\n"
@@ -93,14 +95,20 @@ EXTRACT_INSTRUCTION = (
     "message (kept automatically), must start with a user turn.")
 
 
+WITHDRAWN_INDEX = " (withdrawn by the user: not a request; keep this row)"
+
+
 def index_text(rows: list[dict], width: int = 160) -> str:
+    """The index the compaction call partitions. A message the user withdrew carries its mark
+    here as in the rendered conversation, so it never reads as a live request."""
     ids = ", ".join(str(r["row_id"]) for r in rows)
     lines = [f"Row ids in order (not consecutive numbers; use these exact ids): {ids}",
              "Index of your conversation before the latest message (row_id role kind: content):"]
     for r in rows:
         body = r["content"].replace("\n", " ")
         tool = f" {r['tool_name']}" if r.get("tool_name") else ""
-        lines.append(f"row_id={r['row_id']} {r['role']} {r['kind']}{tool}: {body[:width]}")
+        mark = WITHDRAWN_INDEX if r.get("withdrawn") else ""
+        lines.append(f"row_id={r['row_id']} {r['role']} {r['kind']}{tool}{mark}: {body[:width]}")
     return "\n".join(lines)
 
 
@@ -135,8 +143,9 @@ def parse_items(blocks: list[dict]) -> list | None:
 
 def partition(prefix: list[dict], items: list) -> tuple[list[dict], list[str]]:
     """Check that items partition `prefix` (in order, contiguous, no gaps or overlap) and build
-    the new rows: kept row dicts, or virtual compressed rows (row_id None, with 'window').
-    Returns (rows, problems)."""
+    the new rows: kept row dicts, or virtual compressed rows (row_id None, with 'window'). A
+    message the user withdrew is kept, never inside a window: a compressed row would restate it
+    without its mark. Returns (rows, problems)."""
     ids = [r["row_id"] for r in prefix]
     at = {rid: i for i, rid in enumerate(ids)}
     out: list[dict] = []
@@ -181,6 +190,11 @@ def partition(prefix: list[dict], items: list) -> tuple[list[dict], list[str]]:
             break
         if e not in at or at[e] < at[b]:
             problems.append(f"item {k} window end row {e} is not at or after row {b} in the index")
+            break
+        withdrawn = [r["row_id"] for r in prefix[at[b]:at[e] + 1] if r.get("withdrawn")]
+        if withdrawn:
+            problems.append(f"item {k} window {b}..{e} covers rows {withdrawn}, which the user withdrew: keep "
+                            "each of them ({op: keep}) and compress only the rows around them")
             break
         out.append({"row_id": None, "owner_timeline": None, "role": role, "kind": "text", "tool_name": None,
                     "content": text, "window": (b, e)})

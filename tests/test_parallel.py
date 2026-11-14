@@ -3939,11 +3939,15 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
     started_after_cancel: list[tuple[str, str]] = []
     said_at_cancel: dict[str, int] = {}
     tasks: dict[str, asyncio.Task] = {}
+    later: list[list[str]] = []  # the user's messages a later turn's model call reads
 
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         request = user_texts(messages)[-1]
+        if request == "C":
+            later.append(user_texts(messages))
+            return text("c1 answers C")
         if "clone" in names:
             if is_wake(last):
                 entered["wake"].set()
@@ -4129,6 +4133,8 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
             cancel_inside(method="commit_clone", name="FOCUS go")
             tasks["FOCUS go"] = asyncio.create_task(h.user_says("FOCUS go"))
             await caller_gone("FOCUS go")
+            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+            assert await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT) == ["c1 answers C"]  # a later turn
         for gate in gates.values():
             gate.set()
         await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
@@ -4147,7 +4153,18 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
         if store.timeline(tl) is not None:
             assert violations(store=store, tl=tl) == [], (point, tl)
     if point == "focus graft starting":
-        assert [r for r in store.view("c1") if r["role"] == "assistant"] == []  # c1 never acted
+        assert [r for r in store.view("c1") if r["role"] == "assistant"
+                and r["content"] != "c1 answers C"] == []  # c1 never acted on it
+        for tl in ("o", "c1"):  # its row is marked in the conversation it was asked in
+            assert [r["withdrawn"] for r in store.view(tl) if r["content"] == "FOCUS go"] == [1], tl
+        assert later == [["C"]]  # the next turn reads it as withdrawn, not as a request
+    # a withdrawn request is marked in the view whose run never answered it; one its turn answered
+    # before the cancel (the joins, wake note and wake that follow the turn) is not
+    marks = {r["content"]: r["withdrawn"] for r in store.view("o") if r["kind"] == "text" and not r["harness"]}
+    if point in ("requesting", "requesting behind a run", "running", "returning", "saying", "hand-back"):
+        assert marks[{"hand-back": "FOCUS-OOS go"}.get(point, "B")] == 1, point
+    if point in ("joining", "noting", "wake"):
+        assert marks["BG go"] == 0, point
 
 
 WITHIN_A_RUN = ["a tool runs", "a tool result is stored", "the second model call", "a later model call",
@@ -4168,7 +4185,8 @@ def test_a_withdrawn_request_starts_nothing_more_wherever_its_run_is(tmp_path, p
     runs, as a tool's result is stored, in the run's second and a later model call and as a later
     response comes back, during its compaction and as a compaction call comes back, and (summary
     compaction) one loop step after its run started. From the cancel on, no model call (compaction included) and no tool call is
-    started and nothing is said; the run's view stays valid."""
+    started and nothing is said; the run's view stays valid and its request's row is marked
+    withdrawn."""
     gate, entered = threading.Event(), threading.Event()
     calls_after, loaded, task = [], [], {}
 
@@ -4254,13 +4272,14 @@ def test_a_withdrawn_request_starts_nothing_more_wherever_its_run_is(tmp_path, p
     assert len(loaded) == TOOL_CALLS_RUN[point], point
     assert "answer to B" not in said[task["cancelled"]:], point
     assert violations(store=store, tl="o") == [], point
+    assert [r["withdrawn"] for r in store.view("o") if r["content"] == "B"] == [1], point
 
 
 @pytest.mark.parametrize("mode", ["turns", "summary"])
 def test_a_compaction_that_comes_back_after_the_cancel_stores_nothing(tmp_path, mode):
     """B's call is cancelled as its run's compaction call comes back with a compaction that would
     be accepted: nothing of it is stored (no compressed row, no compaction mark), no model call
-    follows, and nothing is said for B."""
+    follows, nothing is said for B, and B's row is marked withdrawn."""
     long_a = "A " + "detail " * 300
     task, at_cancel, calls_after = {}, {}, []
 
@@ -4307,6 +4326,7 @@ def test_a_compaction_that_comes_back_after_the_cancel_stores_nothing(tmp_path, 
     assert "cancelled" in task, "no compaction call was made"
     assert counts()[1] == at_cancel["counts"][1] and counts()[0] == at_cancel["counts"][0], (at_cancel, counts())
     assert calls_after == [] and said[task["cancelled"]:] == [] and h.compactions == []
+    assert [r["withdrawn"] for r in store.view("o") if r["content"] == "B"] == [1]
     assert violations(store=store, tl="o") == []
 
 
@@ -4334,6 +4354,444 @@ def test_a_compaction_that_comes_back_before_any_cancel_is_stored(tmp_path):
 
     asyncio.run(go())
     assert h.compactions == ["o"] and violations(store=store, tl="o") == []
+
+
+WITHDRAWN_ROWS = ["its row is written", "its row is written behind a run", "its run is running", "it is handed back",
+                  "its wake is noted"]
+
+
+@pytest.mark.parametrize("point", WITHDRAWN_ROWS)
+def test_a_withdrawn_request_whose_row_was_written_never_reaches_a_later_turn_as_a_request(tmp_path, point):
+    """B's call is cancelled after its row was written: while it is written, while the run that
+    answers it runs, and when a focus graft hands it back (as its join is applied, and as the
+    wake note that would route it is written). The next message's model call sees B
+    only as a withdrawn message (marked, not the user's text), its view stays valid, and B is
+    never the request a later turn or a hand-back answers."""
+    gate, entered, task, seen = threading.Event(), threading.Event(), {}, {}
+
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        request = user_texts(messages)[-1]
+        if "clone" not in names:  # the focus graft hands B back at once
+            return [{"type": "tool_use", "id": "j", "name": "join", "input": {"reason": "out_of_scope"}}]
+        if request == "C":
+            seen["C"] = messages
+            return text("answer to C")
+        if request == "A":  # B waits behind A's run
+            entered.set()
+            assert gate.wait(GATE_TIMEOUT)
+            return text("answer to A")
+        if point in ("it is handed back", "its wake is noted") and not messages[-1]["content"][-1].get("harness") \
+                and messages[-1]["content"][-1]["type"] == "text":
+            return [clone_use(clone_entry(skills=["website"], focus=True, quotes=["B"]), id="t1") | {"type": "tool_use"}]
+        if point == "its run is running":
+            entered.set()
+            assert gate.wait(GATE_TIMEOUT)
+        return text("answer to B")
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+
+    def cancel_inside(method):
+        real = getattr(h, method)
+
+        def call(**kw):
+            result = real(**kw)
+            if "B" in task and not task["B"].cancelled():
+                task["B"].cancel()
+            return result
+        setattr(h, method, call)
+
+    if point in ("its row is written", "its row is written behind a run"):
+        cancel_inside("begin_request")
+    elif point == "it is handed back":
+        cancel_inside("apply_join")
+    elif point == "its wake is noted":
+        cancel_inside("wake_note")
+
+    async def go():
+        await h.start()
+        if point == "its row is written behind a run":
+            task["A"] = asyncio.create_task(h.user_says("A"))
+            await until(event=entered, what="A's model call")
+            task["B"] = now(h.user_says("B"))  # waits on the machine; withdrawn as its row is written
+            gate.set()
+            assert await asyncio.wait_for(task["A"], WAIT_TIMEOUT) == ["answer to A"]
+        else:
+            task["B"] = asyncio.create_task(h.user_says("B"))
+        if point == "its run is running":
+            await until(event=entered, what="B's model call")
+            task["B"].cancel()
+            gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task["B"]
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        assert await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT) == ["answer to C"]
+        await h.close()
+
+    asyncio.run(go())
+    assert "B" not in user_texts(seen["C"]) and user_texts(seen["C"])[-1] == "C", point  # B is no request
+    shown = [b for m in seen["C"] for b in m["content"] if b["type"] == "text" and b["text"].endswith("B")]
+    assert len(shown) == 1 and shown[0]["harness"] and "withdrew" in shown[0]["text"], point
+    assert "answer to B" not in said, point
+    assert violations(store=store, tl="o") == [], point
+
+
+def test_a_focus_graft_never_hands_back_a_message_that_was_withdrawn(tmp_path):
+    """B reaches the focus graft and is withdrawn while the graft's run answers it. When the graft
+    later joins, B is not the message it hands back (its trigger): a withdrawn row is never a
+    request, though it is the last user row in the graft's view; and B, joined into the
+    original's view, is marked there as well."""
+    gate, entered, task = threading.Event(), threading.Event(), {}
+
+    def policy(system, messages, tools):
+        last = messages[-1]["content"][-1]
+        if "clone" in {t["name"] for t in tools}:
+            if last["type"] == "text" and not last.get("harness") and last["text"] == "FOCUS go":
+                return [clone_use(clone_entry(skills=["website"], focus=True, quotes=["FOCUS go"]), id="t1")
+                        | {"type": "tool_use"}]
+            return text("original here")
+        if user_texts(messages)[-1] == "B":
+            entered.set()
+            assert gate.wait(GATE_TIMEOUT)
+        return text(f"c1 answers {user_texts(messages)[-1]}")
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+
+    async def go():
+        await h.start()
+        assert await h.user_says("FOCUS go") == ["c1 answers FOCUS go"]
+        task["B"] = asyncio.create_task(h.user_says("B"))
+        await until(event=entered, what="c1's model call for B")
+        task["B"].cancel()
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task["B"]
+        assert await h.until_rest("c1") == "ended"
+        await asyncio.wait_for(h.do_join(child="c1", reason="failed"), WAIT_TIMEOUT)
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert store.timeline("c1")["join_trigger"] is None  # B is not handed back
+    # B joined into the original's view with the graft's rows, marked there too: never a request
+    assert [r["withdrawn"] for r in store.view("o") if r["content"] == "B"] == [1]
+    assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
+
+
+def test_a_withdrawal_mark_binds_only_the_conversation_not_a_background_graft_seeded_with_it(tmp_path):
+    """The original's turn on "BG go" starts a background graft seeded with that message and is
+    then cut short by the caller's cancel: the message is marked withdrawn in the original's
+    view, while the background graft, still running, keeps it as the request it works on."""
+    gates = {name: threading.Event() for name in ("root", "c1")}
+    entered = {name: threading.Event() for name in gates}
+    seen, task = {}, {}
+
+    def policy(system, messages, tools):
+        last = messages[-1]["content"][-1]
+        if "clone" not in {t["name"] for t in tools}:
+            entered["c1"].set()
+            assert gates["c1"].wait(GATE_TIMEOUT)
+            seen["c1"] = messages
+            return text("website finished")
+        if last["type"] == "tool_result":
+            entered["root"].set()
+            assert gates["root"].wait(GATE_TIMEOUT)
+            return text("Started.")
+        if last.get("harness"):
+            seen["wake"] = messages
+            return text("report")
+        return [clone_use(clone_entry(skills=["website"], focus=False, quotes=["BG go"]), id="t1")
+                | {"type": "tool_use"}]
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+
+    async def go():
+        await h.start()
+        task["BG go"] = asyncio.create_task(h.user_says("BG go"))
+        await until(event=entered["root"], what="the turn's reply call")
+        await until(event=entered["c1"], what="the graft's model call")
+        task["BG go"].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task["BG go"]
+        gates["root"].set()
+        gates["c1"].set()
+        await h.join_queued("c1")
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert user_texts(seen["c1"]) == ["BG go"]  # the graft's request is unmarked in its own view
+    assert [r["withdrawn"] for r in store.view("c1") if r["content"] == "BG go"] == [0]
+    assert [r["withdrawn"] for r in store.view("o") if r["content"] == "BG go"] == [1]
+    assert store.timeline("c1")["join_reason"] == "done"
+    assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
+
+
+# ------------------------------------------------------------------ every reader of a withdrawn row
+WITHDRAWN = "DELETE the production site"
+
+
+def withdrawn_then(h, then, text_=WITHDRAWN):
+    """The user's call `text_` is cancelled as soon as its row is written (its row stays, marked
+    withdrawn in the original's view, and no run answers it); then `then()` runs, and the harness is
+    closed. Returns the withdrawn row's id."""
+    task, rows = {}, []
+    real = h.begin_request
+
+    def begin_request(**kw):
+        rid = real(**kw)
+        if kw["text"] == text_ and not rows:
+            rows.append(rid)
+            task["call"].cancel()
+        return rid
+    h.begin_request = begin_request
+
+    async def go():
+        await h.start()
+        task["call"] = asyncio.create_task(h.user_says(text_))
+        with pytest.raises(asyncio.CancelledError):
+            await task["call"]
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await then()
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    return rows[0]
+
+
+def _clones_on(entry_for, seen):
+    """The original clones on the user's message "C" with the entry `entry_for(seen)` makes, and
+    keeps the clone call's result in `seen`; a graft's model call is recorded."""
+    def policy(system, messages, tools):
+        last = messages[-1]["content"][-1]
+        if "clone" not in {t["name"] for t in tools}:
+            seen.setdefault("graft", []).append(messages)
+            return text("graft acted")
+        if last["type"] == "tool_result":
+            seen["result"] = last["content"]
+            return text("answered C")
+        if last["type"] == "text" and not last.get("harness") and last["text"] == "C":
+            return [clone_use(entry_for(seen), id="t1") | {"type": "tool_use"}]
+        return text("ok")
+    return policy
+
+
+@pytest.mark.parametrize("focus", [False, True])
+@pytest.mark.parametrize("by", ["quote", "row id"])
+def test_a_message_the_user_withdrew_is_refused_as_a_seed(tmp_path, by, focus):
+    """resolve_seed: a clone seeded with a message the user withdrew, by quote or by row id, is
+    refused; no graft is made and no model call is made for it."""
+    seen = {}
+
+    def entry(seen):
+        if by == "quote":
+            return clone_entry(skills=["website"], focus=focus, quotes=[WITHDRAWN])
+        return {"purpose": "p", "skills": ["website"], "focus": focus, "seed_row_ids": [seen["row"]]}
+
+    store, h, said = make(tmp_path=tmp_path, policy=_clones_on(entry_for=entry, seen=seen))
+    real = h.begin_request
+    h.begin_request = lambda **kw: seen.setdefault("row", real(**kw))
+
+    async def then():
+        assert await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT) == ["answered C"]
+
+    row = withdrawn_then(h=h, then=then)
+    assert seen["row"] == row
+    assert seen["result"].startswith("clone refused") and "withdrew" in seen["result"], seen["result"]
+    assert store.timeline("c1") is None and "graft" not in seen
+    assert [r["withdrawn"] for r in store.view("o") if r["row_id"] == row] == [1]
+
+
+def test_a_quote_of_a_message_withdrawn_and_sent_again_names_the_one_sent_again(tmp_path):
+    """resolve_seed by quote: the user withdraws a message and sends the same text again. A quote
+    of it seeds the one sent again (the withdrawn one is no match), and the graft sees it once,
+    as a live request."""
+    seen = {}
+
+    def policy(system, messages, tools):
+        last = messages[-1]["content"][-1]
+        if "clone" not in {t["name"] for t in tools}:
+            seen["graft"] = messages
+            return text("graft acted")
+        if last["type"] == "tool_result":
+            seen["result"] = last["content"]
+            return text("Started.")
+        if last["type"] == "text" and not last.get("harness") and last["text"] == WITHDRAWN:
+            return [clone_use(clone_entry(skills=["website"], focus=False, quotes=[WITHDRAWN]), id="t1")
+                    | {"type": "tool_use"}]
+        return text("ok")
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+
+    async def then():
+        await asyncio.wait_for(h.user_says(WITHDRAWN), WAIT_TIMEOUT)
+        await h.join_queued("c1")
+
+    row = withdrawn_then(h=h, then=then)
+    again = [r["row_id"] for r in store.view("o") if r["content"] == WITHDRAWN and not r["withdrawn"]]
+    assert len(again) == 1 and seen["result"].startswith("cloned"), seen.get("result")
+    assert [r["row_id"] for r in store.view("c1") if r["owner_timeline"] != "c1"] == again  # its seed
+    assert row not in store.pointed("c1")
+    assert user_texts(seen["graft"]) == [WITHDRAWN]
+
+
+def test_the_seed_index_of_a_refused_call_leaves_out_a_message_the_user_withdrew(tmp_path):
+    """seed_index: a refused clone call's result lists the messages a seed may name; a message the
+    user withdrew is not among them."""
+    seen = {}
+    store, h, said = make(tmp_path=tmp_path, policy=_clones_on(
+        entry_for=lambda seen: clone_entry(skills=["website"], focus=False, quotes=["no such message"]), seen=seen))
+
+    async def then():
+        await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT)
+
+    row = withdrawn_then(h=h, then=then)
+    index = seen["result"].split("Your messages (row_id role: text):", 1)[1]
+    assert f" {row} user:" not in index and " user: C" in index, index
+
+
+@pytest.mark.parametrize("seeder_answer", ["scores", "an error: the model's seed is the fallback"])
+def test_the_seeder_never_seeds_a_message_the_user_withdrew(tmp_path, seeder_answer):
+    """The seeder actor and its fallback: the withdrawn message is no candidate, and a model seed
+    naming it is no fallback (the seed falls back to the candidates instead)."""
+    from graft import seeder as sd
+    seen, offered = {}, []
+
+    class Seeder:
+        name = "fake"
+
+        async def score(self, purpose, cands, trigger):
+            offered.append([c["row_id"] for c in cands])
+            if seeder_answer == "scores":
+                return sd.SeedDecision(scores={c["row_id"]: 1.0 for c in cands}, model="fake-1")
+            return sd.SeedDecision(error="offline")
+
+    def entry(seen):
+        return {"purpose": "p", "skills": ["website"], "focus": False, "seed_row_ids": [seen["row"]]}
+
+    store = Store(str(tmp_path / "s.db"))
+    install(store)
+    h = Harness(store=store, provider=FakeProvider(_clones_on(entry_for=entry, seen=seen)), seeder=Seeder())
+    real = h.begin_request
+    h.begin_request = lambda **kw: seen.setdefault("row", real(**kw))
+
+    async def then():
+        await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT)
+        await h.join_queued("c1")
+
+    row = withdrawn_then(h=h, then=then)
+    assert offered and all(row not in o for o in offered)
+    assert seen["result"].startswith("cloned"), seen["result"]
+    assert row not in store.pointed("c1") and WITHDRAWN not in user_texts(seen["graft"][0])
+
+
+def test_a_final_seed_holding_a_message_the_user_withdrew_is_refused_whoever_chose_it(tmp_path):
+    """The commit condition on every entry's final seed: a seed the seeder step hands back with a
+    withdrawn row in it is refused before anything commits."""
+    from graft import seeder as sd
+    seen = {}
+
+    class Seeder:
+        name = "fake"
+
+        async def score(self, purpose, cands, trigger):
+            return sd.SeedDecision(error="unused")
+
+    store = Store(str(tmp_path / "g.db"))
+    install(store)
+    h = Harness(store=store, provider=FakeProvider(_clones_on(
+        entry_for=lambda seen: clone_entry(skills=["website"], focus=False, quotes=["C"]), seen=seen)),
+        seeder=Seeder())
+
+    async def seed_with_actor(src, purpose, model_seed, model_problems):
+        return [seen["row"]] + model_seed, [], {}
+    h.seed_with_actor = seed_with_actor
+
+    async def then():
+        await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT)
+
+    real = h.begin_request
+    h.begin_request = lambda **kw: seen.setdefault("row", real(**kw))
+    row = withdrawn_then(h=h, then=then)
+    assert seen["result"].startswith("clone refused") and f"row {row} is a message the user withdrew" in seen["result"]
+    assert store.timeline("c1") is None and "graft" not in seen
+
+
+def test_a_compaction_keeps_a_message_the_user_withdrew_marked(tmp_path):
+    """Compaction (turns): the index the compaction call reads marks the withdrawn message, and a
+    window that would compress it (writing a new row that restates it unmarked) is refused, so the
+    compacted view keeps the row with its mark and the next model call sees it only as withdrawn."""
+    long_a = "A " + "detail " * 300
+    seen = {"indexes": []}
+
+    def policy(system, messages, tools):
+        if {t["name"] for t in tools} == {"compact"}:
+            request = messages[-1]["content"][-1]["text"]
+            seen["indexes"].append(request)
+            ids = [int(x) for x in re.findall(r"row_id=(\d+) ", request)]
+            if "was refused" not in request:  # first: everything into one window
+                return [{"type": "tool_use", "id": "k", "name": "compact", "input": {"items": [
+                    {"op": "compress", "role": "user", "text": "the user asked for A, and more",
+                     "begin_row_id": ids[0], "end_row_id": ids[-1]}]}}]
+            return [{"type": "tool_use", "id": "k", "name": "compact", "input": {"items": [
+                {"op": "compress", "role": "user", "text": "A, answered", "begin_row_id": ids[0],
+                 "end_row_id": ids[1]}] + [{"op": "keep", "row_id": i} for i in ids[2:]]}}]
+        seen["last"] = messages
+        return text("answer to " + user_texts(messages)[-1][:1])
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy, compact_tokens=200)
+
+    async def then():
+        assert await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT) == ["answer to C"]
+
+    real = h.start
+
+    async def start():  # A is answered before the withdrawn message is sent
+        await real()
+        assert await h.user_says(long_a) == ["answer to A"]
+    h.start = start
+    row = withdrawn_then(h=h, then=then)
+    line = next(x for x in seen["indexes"][0].splitlines() if x.startswith(f"row_id={row} "))
+    assert "withdrawn by the user" in line, line
+    assert h.compactions == ["o"]
+    kept = [r for r in store.working_view("o") if r["row_id"] == row]
+    assert [r["withdrawn"] for r in kept] == [1]
+    assert WITHDRAWN not in user_texts(seen["last"]) and user_texts(seen["last"])[-1] == "C"
+    assert violations(store=store, tl="o") == []
+
+
+def test_a_summary_compaction_never_reads_a_message_the_user_withdrew(tmp_path):
+    """Compaction (summary): the summary is a new user-role row, so the conversation the summary
+    call reads leaves the withdrawn message out (it could only be restated unmarked); the
+    compacted view is the summary and the fresh message, with no trace of it as a request."""
+    long_a = "A " + "detail " * 300
+    seen = {}
+
+    def policy(system, messages, tools):
+        if not tools:
+            seen["summary"] = messages
+            return text("summary")
+        return text("answer to " + user_texts(messages)[-1][:1])
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy, compact_tokens=200, compaction_mode="summary")
+    real = h.start
+
+    async def start():
+        await real()
+        assert await h.user_says(long_a) == ["answer to A"]
+    h.start = start
+
+    async def then():
+        await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT)
+
+    row = withdrawn_then(h=h, then=then)
+    read = [b["text"] for m in seen["summary"] for b in m["content"] if b["type"] == "text"]
+    assert read and all(WITHDRAWN not in t for t in read), read
+    assert any("A " in t for t in read)  # what the user did ask is summarised
+    view = store.working_view("o")
+    assert [(r["role"], r["content"]) for r in view[1:]] == [("user", "C"), ("assistant", "answer to C")]
+    assert all(r["row_id"] != row for r in view) and violations(store=store, tl="o") == []
 
 
 def test_a_run_that_fails_while_a_clone_call_is_prepared_is_the_runs_failure(tmp_path):

@@ -30,22 +30,27 @@ Three rules hold everywhere in this module.
   run whose request is withdrawn ends (`_run_withdrawn`, the one rule). Every point that would
   start a run or let a graft act is guarded on its request being live (not withdrawn, reply not
   done): `requesting` -> busy, the next inbox message, the wake / hand-back / routing runs,
-  `noting` -> busy, the clone gate, a focus graft's start. Whether a run
+  `noting` -> busy, the clone gate, a focus graft's start (one whose request was withdrawn before
+  it could act marks its row in `withdrawing` and rests). Whether a run
   may go on is decided here too: the run asks (`may_continue`, a reply in the event) before every
   step that could act, and is answered while the request it answers, if any, is live; once it is
-  withdrawn, `busy` is left the way a withdrawal leaves it, which ends the run where it waits.
-  Nothing outside reads a machine's data: what the host needs to know (a
+  withdrawn, `busy` is left the way a withdrawal leaves it, which ends the run where it waits. A
+  withdrawn request whose row was written and that no run answered gets the withdrawal mark on
+  that row (`dropping`, `withdrawing`) in the views of the conversation it was asked in (the
+  timeline and, for a focus graft, its source), so no later turn, hand-back or seed there reads
+  it as a request. Nothing outside reads a machine's data: what the host needs to know (a
   timeline's kind, the grafts still running, whether clones are background grafts) is passed, by
   keyword, on the host call an activity makes.
 
 A timeline that can hold the conversation (the original; a focus graft, which starts in `busy`
-unless the request it answers was withdrawn before it could act: then at rest):
+unless the request it answers was withdrawn before it could act: then in `withdrawing`, which
+marks that request's row, and then at rest):
 
     live
       idle            at rest: holds the conversation, nothing in flight, nothing queued
       engaged
         requesting    writing a user message's row (activity); then busy if it is still live, else
-                      rest
+                      `dropping` (activity: the row gets the withdrawal mark), then rest
         busy          running, in one of four modes (turn, route, report, external); `may_continue`
                       is answered while the request the run answers, if any, is live, else busy is
                       left for `closing_calls`
@@ -70,7 +75,13 @@ unless the request it answers was withdrawn before it could act: then at rest):
                       its step budget hands back (`handing_back`, activity: its join event)
         unpreparing   the run was left while a clone call was prepared: the call is rolled back
                       (activity; then `unwound`, a choice: a driven turn rests, others close calls)
-        closing_calls the run ended early: its open tool calls get results (activity)
+        closing_calls the run ended early: its open tool calls get results (activity); then
+                      `withdrawn_choice`: if that run answered a request that was withdrawn,
+        withdrawing   the row of the withdrawn request it answers gets the withdrawal mark in its
+                      view and, for a focus graft, its source's (activity); also entered at a focus
+                      graft's start when that request was withdrawn before it could act, and after
+                      the joins (`after`) and the wake note (`noting`) when a focus graft handed back
+                      its request unanswered and it was withdrawn
         failing       (a focus graft) its run raised: it joins `failed` (activity; `unrecorded`,
                       a choice, if that failed)
         joining       applying the joins on its queue, one per step
@@ -78,7 +89,7 @@ unless the request it answers was withdrawn before it could act: then at rest):
           applying      one join (activity); a failure is kept for the next commit point, or,
                         on its last attempt, `giving_up` -> `abandoning` (choices) tell the user
                         and abandon it
-        noting        writing a wake note (activity); then busy, or rest if the request the
+        noting        writing a wake note (activity); then busy, or `withdrawing` if the request the
                       wake would answer was withdrawn (`unnoted`, a choice, if it failed)
         rest, after   choices: what follows a run, and what follows the joins
       receiving, shutting   choices: a graft's join that wakes it; closing the original
@@ -191,10 +202,13 @@ class Request:
     The original's machine holds it from arrival until it is answered or withdrawn, wherever it
     is (the inbox, the row being written, the run answering it, the waiters, a focus graft it was
     handed to). The caller withdraws it by id (`withdraw`); a request is live while it is not
-    withdrawn and its reply is not done."""
+    withdrawn and its reply is not done. `row`: its user row once written (a withdrawn request
+    whose row was written gets the withdrawal mark on it, so no later turn reads it as a live
+    request)."""
     id: int
     text: str
     reply: asyncio.Future
+    row: int | None = None
 
 
 class GraftPlan(NamedTuple):
@@ -261,6 +275,7 @@ class Host(Protocol):
     def trace(self, text: str) -> None: ...
     def graft_failed(self, tl: str, error: BaseException) -> None: ...
     def begin_request(self, tl: str, text: str) -> int: ...
+    def mark_withdrawn(self, timelines: list[str], rows: list[int]) -> None: ...
     async def prepare_clone(self, src: str, clone: Clone, retry_left: bool) -> "Prepared | str": ...
     def roll_back_clone(self, src: str) -> None: ...
     def commit_clone(self, src: str, clone: Clone) -> str: ...
@@ -589,6 +604,48 @@ def run_withdrawn(ctx, inst, event) -> bool:
     return _run_withdrawn(inst)
 
 
+def _withdrawn_rows(inst: TimelineSM) -> list[int]:
+    """The row of the request its run answers, if it was withdrawn after its row was written."""
+    request = inst.answering
+    return [request.row] if _run_withdrawn(inst) and request.row is not None else []
+
+
+def _answers_requests(inst: TimelineSM) -> bool:
+    """Its current run is the one that answers its request: a turn on it (a focus graft's run
+    included), or a routing run on a request a focus graft handed back. A report or a wake for
+    background grafts follows a turn that already answered it."""
+    return inst.mode.user or (inst.mode.name == "route" and not inst.mode.wake)
+
+
+def _handed_back(inst: TimelineSM) -> bool:
+    """The joins just applied include a focus graft that came back without answering (not done):
+    the request it answered is this timeline's to answer now."""
+    return any(r != "done" and inst.made.get(c) for c, r in inst.news)
+
+
+def cut_short(ctx, inst, event) -> bool:
+    """The run that ended early was answering a request that was withdrawn after its row was
+    written: that row is marked (the run never answered it)."""
+    return _answers_requests(inst) and bool(_withdrawn_rows(inst))
+
+
+def _marks_after(inst: TimelineSM) -> bool:
+    """After its joins: a focus graft handed back its request unanswered, and it was withdrawn
+    after its row was written (no run will answer it)."""
+    return _handed_back(inst) and bool(_withdrawn_rows(inst))
+
+
+def withdrawn_after(ctx, inst, event) -> bool:
+    """The handed-back request's row is marked before anything else is taken."""
+    return not inst.final and _marks_after(inst)
+
+
+def noted_withdrawn(ctx, inst, event) -> bool:
+    """The wake note is written, but the request the wake would answer was withdrawn meanwhile;
+    a routing wake for a request a focus graft handed back leaves it unanswered."""
+    return _marks_after(inst)
+
+
 def handed_live(ctx, inst, event) -> bool:
     inbox, withdrawn = event.data
     return any(r.id not in withdrawn and _live(inst=inst, request=r) for r in inbox)
@@ -759,11 +816,11 @@ def final_waits(ctx, inst, event) -> bool:
 
 
 # The `after` choice's guards are disjoint: each outcome is one case of the one before it left
-# open (not shut down; no live message waiting; something to answer), and the report wake is
-# the remainder, its one unguarded default.
+# open (not shut down; no handed-back withdrawn row to mark; no live message waiting; something
+# to answer), and the report wake is the remainder, its one unguarded default.
 def _after_open(inst: TimelineSM) -> bool:
-    """Not shut down."""
-    return not inst.final
+    """Not shut down, and no handed-back withdrawn row to mark first."""
+    return not inst.final and not _marks_after(inst)
 
 
 def inbox_after(ctx, inst, event) -> bool:
@@ -882,6 +939,24 @@ async def unspawn_activity(ctx, inst: TimelineSM, event) -> None:
 
 def _write_request(inst, event):
     return inst.host.begin_request(tl=inst.timeline_id, text=inst.request.text)
+
+
+def _viewers(inst: TimelineSM) -> list[str]:
+    """The timelines whose views a withdrawal mark binds: the one the request was asked of and, for
+    a focus graft, its source, which holds the same conversation and gets the graft's rows back."""
+    return [inst.timeline_id] + ([inst.source_id] if inst.kind == "focus" else [])
+
+
+def _mark_dropped(inst, event):
+    """The row just written for a request withdrawn meanwhile gets the withdrawal mark (the
+    activity of `dropping`; the event that entered it carries the row)."""
+    inst.host.mark_withdrawn(timelines=_viewers(inst), rows=[event.data])
+
+
+def _mark_withdrawn(inst, event):
+    """The row of the withdrawn request its run answered gets the withdrawal mark (the activity of
+    `withdrawing`, entered only when there is one)."""
+    inst.host.mark_withdrawn(timelines=_viewers(inst), rows=_withdrawn_rows(inst))
 
 
 def _unprepare(inst, event):
@@ -1028,6 +1103,7 @@ def request_written(ctx, inst, event) -> None:
     """The message's row is written: it is the run's request; the bounds of the last one are
     cleared (a new request may clone again)."""
     request, inst.request = inst.request, None
+    request.row = event.data
     inst.answering = request
     inst.mode, inst.clone_tries = TURN, 0
     inst.blocks, inst.clone_calls, inst.wake_clones = set(), 0, 0
@@ -1036,8 +1112,9 @@ def request_written(ctx, inst, event) -> None:
 
 def request_dropped(ctx, inst, event) -> None:
     """The message's row is written, but its caller withdrew it meanwhile: no run starts for it.
-    The row stays (rows are never removed): a user turn the next message joins. A new message
-    was written, so the bounds of the last one are cleared."""
+    The row stays (rows are never removed) and is marked withdrawn next (`dropping`), so no later
+    turn reads it as a live request. A new message was written, so the bounds of the last one
+    are cleared."""
     request, inst.request = inst.request, None
     inst.blocks, inst.clone_calls, inst.wake_clones = set(), 0, 0
     _prune(inst)
@@ -1229,6 +1306,10 @@ def run_failed_after_it_ended(ctx, inst, event) -> None:
 
 def interrupted_closing(ctx, inst, event) -> None:
     inst.closing = inst.final = True
+
+
+def mark_failed(ctx, inst, event) -> None:
+    _report(inst=inst, kind="task", clones=[], error=event.data)
 
 
 def calls_closed(ctx, inst, event) -> None:
@@ -1877,7 +1958,9 @@ def _timeline(name: str) -> hsm.Model:
         hsm.Choice(
             "start",  # a focus graft starts on its request, unless a caller drives the turn that made it
             T(S("live/engaged/busy/run"), G(starts_busy), hsm.Effect(engage)),
-            T(S("live/idle"), G(starts_withdrawn), hsm.Effect(come_to_rest)),  # it never acts on it
+            # its request was withdrawn before it could act: it never acts on it, and the request's
+            # written row is marked (in its view and its source's) before it is at rest
+            T(S("live/engaged/withdrawing"), G(starts_withdrawn), hsm.Effect(engage)),
             T(S("live/idle")),
         ),
         T(On(*REQUESTS, "when_queued", "may_continue"), hsm.Effect(refuse_request)),
@@ -1926,8 +2009,13 @@ def _timeline(name: str) -> hsm.Model:
                 hsm.State(
                     "requesting", mirrored("active"), io(done="request_written", work=_write_request),
                     T(On("request_written"), S("../busy/run"), G(request_live), hsm.Effect(request_written)),
-                    T(On("request_written"), S("../rest"), hsm.Effect(request_dropped)),  # withdrawn meanwhile
+                    T(On("request_written"), S("../dropping"), hsm.Effect(request_dropped)),  # withdrawn meanwhile
                     T(On(E), S("../rest"), hsm.Effect(request_failed)),
+                ),
+                hsm.State(
+                    "dropping", io(done="dropped", work=_mark_dropped),  # its row gets the withdrawal mark
+                    T(On("dropped"), S("../rest")),
+                    T(On(E), S("../rest"), hsm.Effect(mark_failed)),
                 ),
                 hsm.State(
                     "busy",
@@ -1969,8 +2057,19 @@ def _timeline(name: str) -> hsm.Model:
                 ),
                 hsm.State(
                     "closing_calls", io(done="calls_closed", work=_close_calls),
-                    T(On("calls_closed"), S("../rest"), hsm.Effect(calls_closed)),
-                    T(On(E), S("../rest"), hsm.Effect(calls_not_closed)),
+                    T(On("calls_closed"), S("../withdrawn_choice"), hsm.Effect(calls_closed)),
+                    T(On(E), S("../withdrawn_choice"), hsm.Effect(calls_not_closed)),
+                ),
+                hsm.Choice(
+                    "withdrawn_choice",  # the run it cut short answered a request that was withdrawn
+                    T(S("withdrawing"), G(cut_short)),
+                    T(S("rest")),
+                ),
+                hsm.State(
+                    # the withdrawn request it answered gets the withdrawal mark on its row
+                    "withdrawing", io(done="rows_marked", work=_mark_withdrawn),
+                    T(On("rows_marked"), S("../rest")),
+                    T(On(E), S("../rest"), hsm.Effect(mark_failed)),
                 ),
                 hsm.State(
                     "failing", io(done="failure_recorded", work=_focus_failure),
@@ -2001,7 +2100,8 @@ def _timeline(name: str) -> hsm.Model:
                 hsm.State(
                     "noting", mirrored("active"), io(done="noted", work=_wake_note),
                     T(On("noted"), S("../busy/run"), G(answering_live)),
-                    T(On("noted"), S("../rest")),  # its caller withdrew meanwhile
+                    T(On("noted"), S("../withdrawing"), G(noted_withdrawn)),  # its caller withdrew meanwhile
+                    T(On("noted"), S("../rest")),
                     T(On(E), S("../unnoted"), hsm.Effect(note_failed)),
                 ),
                 hsm.Choice("unnoted", T(S("../idle"), hsm.Effect(come_to_rest))),
@@ -2016,6 +2116,7 @@ def _timeline(name: str) -> hsm.Model:
                     "after",
                     T(S("../shutting"), G(is_final), into("active")),
                     T(S("../idle"), G(final_waits), hsm.Effect(come_to_rest)),
+                    T(S("withdrawing"), G(withdrawn_after)),  # closed out before anything else is taken
                     T(S("requesting"), G(inbox_after), hsm.Effect(take_inbox)),
                     T(S("../idle"), G(quiet_after), hsm.Effect(come_to_rest)),
                     T(S("busy/run"), G(answers_handback), hsm.Effect(answer_handback)),

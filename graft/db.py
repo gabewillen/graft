@@ -73,6 +73,16 @@ CREATE TABLE IF NOT EXISTS compactions(
   compaction_id INTEGER PRIMARY KEY AUTOINCREMENT, timeline_id TEXT NOT NULL REFERENCES timelines,
   view_row_ids TEXT NOT NULL, after_pos INTEGER NOT NULL, ts REAL NOT NULL);
 
+-- User messages whose callers withdrew them after the row was written (spec: State machine), per
+-- timeline that holds the conversation they were asked in. The row itself is never edited: in
+-- that timeline's view the mark shows it as a withdrawn message, never a request, trigger or seed
+-- candidate, and a marked row is never seeded. Another timeline points at the row only if it was
+-- seeded before the withdrawal (a background graft made for that request, which stops); it sees
+-- the row as it was.
+CREATE TABLE IF NOT EXISTS withdrawals(
+  timeline_id TEXT NOT NULL REFERENCES timelines, row_id INTEGER NOT NULL REFERENCES turns,
+  ts REAL NOT NULL, PRIMARY KEY(timeline_id, row_id));
+
 CREATE TRIGGER IF NOT EXISTS turns_no_update BEFORE UPDATE ON turns
   BEGIN SELECT RAISE(ABORT, 'turns is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS turns_no_delete BEFORE DELETE ON turns
@@ -84,6 +94,11 @@ CREATE TRIGGER IF NOT EXISTS context_no_delete BEFORE DELETE ON context
 """
 
 TURN_COLS = "row_id, owner_timeline, role, kind, tool_name, content, tokens, ts, harness"
+# The withdrawal mark, read with every row of a timeline's view (1: withdrawn in that timeline).
+WITHDRAWN_COL = ("EXISTS(SELECT 1 FROM withdrawals w WHERE w.timeline_id = c.timeline_id "
+                 "AND w.row_id = t.row_id) AS withdrawn")
+# How a withdrawn message is shown to the model: marked, so it is never read as a live request.
+WITHDRAWN_NOTE = "(harness note: the user withdrew the following message; do not answer it or act on it) "
 
 
 @dataclass
@@ -228,8 +243,20 @@ class Store:
     def view(self, tl: str) -> list[dict]:
         """The context view: SELECT t.* FROM context JOIN turns ... ORDER BY pos."""
         return [dict(r) for r in self.con.execute(
-            f"SELECT c.pos, t.{TURN_COLS.replace(', ', ', t.')} FROM context c "
+            f"SELECT c.pos, t.{TURN_COLS.replace(', ', ', t.')}, {WITHDRAWN_COL} FROM context c "
             "JOIN turns t USING(row_id) WHERE c.timeline_id=? ORDER BY c.pos", (tl,))]
+
+    def mark_withdrawn(self, timelines: list[str], rows: list[int]) -> None:
+        """Mark user messages whose callers withdrew them, in the views of `timelines` (append-only,
+        one transaction; marking twice is a no-op)."""
+        self.con.execute("BEGIN")
+        try:
+            self.con.executemany("INSERT OR IGNORE INTO withdrawals VALUES (?,?,?)",
+                                 [(tl, r, time.time()) for tl in timelines for r in rows])
+            self.con.execute("COMMIT")
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
 
     def mark_compaction(self, tl: str, view_row_ids: list[int]) -> int:
         """Record an extractive compaction of tl: its working view becomes exactly view_row_ids
@@ -366,6 +393,8 @@ def row_block(r: dict) -> dict:
     if kind == "text":
         # The mark travels with the block so a caller can tell a harness note from a user message
         # without reading its text. Provider adapters build their wire blocks from type and text.
+        if r.get("withdrawn"):  # never a live request: shown as withdrawn, marked like a note
+            return {"type": "text", "text": WITHDRAWN_NOTE + r["content"], "harness": True}
         return {"type": "text", "text": r["content"], "harness": True} if r.get("harness") \
             else {"type": "text", "text": r["content"]}
     data = json.loads(r["content"])

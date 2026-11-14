@@ -104,6 +104,8 @@ NOT_RUN_INTERRUPTED = NotRun("not executed: the turn was interrupted")
 NOT_RUN_JOINING = NotRun("not executed: this task is being joined")
 NOT_RUN_BESIDE_CLONE = NotRun("not executed: call clone on its own")
 _NONCE_TAG = re.compile(r"^\[conversation [^\]]*\]\s*")
+# Why a seed row is refused when the user withdrew the message it holds (spec: State machine).
+WITHDRAWN_SEED = "row {row} is a message the user withdrew; it is not a request and cannot be seeded"
 
 
 def check_skill_link(store: Store, source: str, skills: list[str]) -> list[str]:
@@ -427,8 +429,9 @@ class Harness:
         a cancel, wherever the request is in its lifecycle, cancels that reply at once and the
         caller withdraws the request by id. The machine then never starts a run, writes a row or
         lets a focus graft act for it; a run already answering it is ended by its machine before
-        its next step. If writing its row or the run answering it fails, the machine answers the reply
-        with that error, raised here."""
+        its next step, and a row already written for it is marked withdrawn. If writing its
+        row or the run answering it fails, the machine answers the reply with that error, raised
+        here."""
         root = self.machines.root
         request = self.machines.request(text)
         self.machines.post(tl=root, name="user_message", data=request)
@@ -518,6 +521,13 @@ class Harness:
         rid = self.store.add_turn(tl=tl, role="user", kind="text", content=text)
         self.trace(f"[{tl}] user (row {rid}): {text}")
         return rid
+
+    def mark_withdrawn(self, timelines: list[str], rows: list[int]) -> None:
+        """User messages whose callers withdrew them after their rows were written: marked in the
+        views of `timelines` (the machine names them), so those views show them as withdrawn and
+        nothing reads them there as a request again."""
+        self.store.mark_withdrawn(timelines=timelines, rows=rows)
+        self.trace(f"[{timelines[0]}] withdrawn: rows {rows}")
 
     def commit_clone(self, src: str, clone: Clone) -> str:
         """The clone call's store commit: one SQL transaction (made by the original's machine in
@@ -710,10 +720,12 @@ class Harness:
     async def _summary_compact(self, tl: str, rows: list[dict]) -> None:
         """Ablation (--compaction summary): one summary of everything before the fresh message,
         stored as a user-role compressed row whose window is the whole prefix; view = [summary,
-        fresh message]."""
+        fresh message]. A message the user withdrew is left out of what the summary call reads:
+        the summary is a user-role row, and must not restate it as something the user asked."""
         prefix, fresh = rows[:-1], rows[-1]
+        said = [r for r in prefix if not r["withdrawn"]]
         blocks, last = await self.complete(f"{self.role(tl)}:compaction", self.system(tl),
-                                           compaction.request(render(prefix)), [], max_tokens=2000)
+                                           compaction.request(render(said)), [], max_tokens=2000)
         await self.may_continue(tl)  # nothing of a summary that comes back after a cancel is stored
         sid = self.store.add_compressed_turn(tl, "user", compaction.summary_turn(blocks),
                                              prefix[0]["row_id"], prefix[-1]["row_id"])
@@ -1177,12 +1189,15 @@ class Harness:
         """Seed items -> row ids (pointers). A seed may only point at rows the source itself holds
         in its context: its own rows and what was joined into it. A descendant's other rows (a
         running sibling's work, tool output that never joined) are not reachable through a seed.
-        A quote must match exactly one text row in the source's view (exact text first, then
-        substring). Order: as given, ids then quotes,
-        re-sorted by position in the source's view so the seed reads in conversation order."""
+        A message the user withdrew (marked in the source's view) is never seeded: an id that
+        names one is refused, and quotes match only the other text rows, so a quote of a message
+        the user withdrew and then sent again names the one sent again. A quote must match
+        exactly one of those rows (exact text first, then substring). Order: as given, ids then
+        quotes, re-sorted by position in the source's view so the seed reads in conversation order."""
         view = self.store.view(src)
         held = {r["row_id"] for r in view}
-        texts = [r for r in view if r["kind"] == "text"]
+        withdrawn = {r["row_id"] for r in view if r["withdrawn"]}
+        texts = [r for r in view if r["kind"] == "text" and not r["withdrawn"]]
         out: list[int] = []
         problems: list[str] = []
         for x in row_ids:
@@ -1193,6 +1208,8 @@ class Harness:
                 continue
             if rid not in held:
                 problems.append(f"row {rid} is not in your conversation; seed only messages you hold")
+            elif rid in withdrawn:
+                problems.append(WITHDRAWN_SEED.format(row=rid))
             else:
                 out.append(rid)
         for q in quotes:
@@ -1203,6 +1220,9 @@ class Harness:
             hits = exact or [r for r in texts if qs in r["content"]]
             if len(hits) == 1:
                 out.append(hits[0]["row_id"])
+            elif not hits and any(qs in r["content"] for r in view if r["row_id"] in withdrawn):
+                problems.append(f"seed quote {qs[:60]!r} matches only a message the user withdrew; "
+                                "it is not a request and cannot be seeded")
             elif not hits:
                 problems.append(f"seed quote {qs[:60]!r} matches no message")
             else:
@@ -1214,9 +1234,11 @@ class Harness:
         return sorted(uniq, key=lambda r: pos.get(r, 1 << 30)), problems
 
     def seed_index(self, src: str) -> str:
+        """The text rows a seed may name, for a refused call's retry. A message the user withdrew
+        is left out: it cannot be seeded."""
         lines = [f"Your messages (row_id role: text):"]
         for r in self.store.view(src):
-            if r["kind"] == "text":
+            if r["kind"] == "text" and not r["withdrawn"]:
                 lines.append(f"  {r['row_id']} {r['role']}: {r['content'].replace(chr(10), ' ')[:100]}")
         return "\n".join(lines)
 
@@ -1351,9 +1373,13 @@ class Harness:
             seeded = [c.result() for c in calls]
             resolved = [(seed, problems) for seed, problems, _ in seeded]
             decisions = [d for _, _, d in seeded]
+        # the commit condition on every entry's final seed, whoever chose it (the model or the
+        # seeder actor): no row the user withdrew is seeded
+        withdrawn = {r["row_id"] for r in self.store.view(src) if r["withdrawn"]}
         per_entry: list[list[str]] = []
         for child, e, (seed, problems) in zip(ids, entries, resolved):
-            v = problems + check_skill_link(self.store, src, e.skills)
+            v = problems + [WITHDRAWN_SEED.format(row=r) for r in seed if r in withdrawn]
+            v += check_skill_link(store=self.store, source=src, skills=e.skills)
             rows = [t for t in (self.store.turn(r) for r in seed) if t]
             v += validate(rows, child) if rows else ["the seed is empty: seed at least the user message "
                                                      "that asks for the task"]
