@@ -374,6 +374,9 @@ class TimelineSM(hsm.Instance):
         self.spawn_error: BaseException | None = None
         # failures to tell the user, one per step: (kind, clones, error, the source it is told from)
         self.unreported: list[tuple[str, list[str], BaseException, str | None]] = []
+        # Rows of withdrawn requests still to be marked (a mark write that failed is written by
+        # whatever next reads the view).
+        self.unmarked: list[int] = []
 
 
 class SessionSM(hsm.Instance):
@@ -932,6 +935,7 @@ async def busy_activity(ctx, inst: TimelineSM, event) -> None:
     typed to be told apart from it. Like the library's own `hsm/error`, it is sent only while the
     run's state is still active: a run that raises as it is ended (its state left) is stale."""
     try:
+        _mark_pending(inst)
         outcome = await inst.host.run_busy(tl=inst.timeline_id, mode=inst.mode, kind=inst.kind)
     except Exception as error:  # noqa: BLE001 - the outcome event carries it
         if not ctx.is_done():
@@ -949,6 +953,7 @@ async def prepare_activity(ctx, inst: TimelineSM, event) -> None:
     """The harness seeds and validates the clone call (its seeder may take a while: a withdrawal
     or shutdown ends this activity, and `unpreparing` rolls the call's audit back). The outcome is
     `prepared`: a Prepared call, or the text of a refusal the harness already audited."""
+    _mark_pending(inst)  # the call's seeds are resolved from the view (a driven turn has no run start)
     prepared = await inst.host.prepare_clone(src=inst.timeline_id, clone=inst.clone,
                                              retry_left=inst.clone_tries < CLONE_TRIES)
     inst.dispatch(inst.context(), hsm.Event(name="prepared", data=prepared))
@@ -1003,16 +1008,20 @@ def _viewers(inst: TimelineSM) -> list[str]:
     return [inst.timeline_id] + ([inst.source_id] if inst.kind == "focus" else [])
 
 
-def _mark_dropped(inst, event):
-    """The row just written for a request withdrawn meanwhile gets the withdrawal mark (the
-    activity of `dropping`; the event that entered it carries the row)."""
-    inst.host.mark_withdrawn(timelines=_viewers(inst), rows=[event.data])
+def _mark_pending(inst: TimelineSM) -> None:
+    """Rows of withdrawn requests whose mark could not be written are marked before anything reads
+    the view they are in: a run (its compaction, seeds and seeder included), a clone call's
+    preparation (a driven turn's too) and a join's copy; a focus graft hands its own back with its
+    join. So no later turn, seed or join reads them as a request."""
+    if inst.unmarked:
+        inst.host.mark_withdrawn(timelines=_viewers(inst), rows=list(inst.unmarked))
 
 
-def _mark_withdrawn(inst, event):
-    """The row of the withdrawn request its run answered gets the withdrawal mark (the activity of
-    `withdrawing`, entered only when there is one)."""
-    inst.host.mark_withdrawn(timelines=_viewers(inst), rows=_withdrawn_rows(inst))
+def _mark_rows(inst, event):
+    """The rows of withdrawn requests that no run answered get the withdrawal mark (the activity of
+    `dropping` and `withdrawing`): the one the state was entered for, and any whose mark could
+    not be written before."""
+    inst.host.mark_withdrawn(timelines=_viewers(inst), rows=list(inst.unmarked))
 
 
 def _unprepare(inst, event):
@@ -1085,6 +1094,7 @@ def _focus_failure(inst, event):
 
 
 def _apply(inst, event):
+    _mark_pending(inst)  # the join copies rows into the view: rows still to be marked are marked first
     join = inst.queue[0]
     return inst.host.apply_join(src=inst.timeline_id, join=join, cloned_for=inst.cloned_for.get(join.child),
                                 running=_still_running(inst))
@@ -1173,6 +1183,7 @@ def request_dropped(ctx, inst, event) -> None:
     are cleared."""
     request, inst.request = inst.request, None
     inst.blocks, inst.clone_calls, inst.wake_clones = set(), 0, 0
+    inst.unmarked.append(event.data)
     _prune(inst)
     _session(inst=inst, name="user_answered", data=_answer_dead([request]))
 
@@ -1321,7 +1332,8 @@ def refuse_cancel_call(ctx, inst, event) -> None:
 
 # ------------------------------------------------------------------ effects: the end of a run
 def end_run(ctx, inst, event) -> None:
-    inst.reported = None
+    """The run ended on its own: the rows it marked as it started are marked."""
+    inst.reported, inst.unmarked = None, []
 
 
 def error_for_user(ctx, inst, event) -> None:
@@ -1364,7 +1376,18 @@ def interrupted_closing(ctx, inst, event) -> None:
     inst.closing = inst.final = True
 
 
+def rows_marked(ctx, inst, event) -> None:
+    inst.unmarked = []
+
+
+def to_mark(ctx, inst, event) -> None:  # entry of `withdrawing`
+    """The row of the withdrawn request its run answered is to be marked."""
+    inst.unmarked += [r for r in _withdrawn_rows(inst) if r not in inst.unmarked]
+
+
 def mark_failed(ctx, inst, event) -> None:
+    """The mark could not be written: the user is told, and the rows stay to be marked by whatever
+    next reads the view (`_mark_pending`)."""
     _report(inst=inst, kind="task", clones=[], error=event.data)
 
 
@@ -1672,8 +1695,9 @@ def close_and_engage(ctx, inst, event) -> None:
 def focus_back(ctx, inst, event) -> None:
     """Its focus graft joined: the conversation is back, with the calls waiting on the graft,
     the messages it never got to (in order, ahead of any that came back since), the request
-    it was answering and the withdrawals it recorded."""
-    join, waiters, inbox, answering, withdrawn = event.data
+    it was answering, the withdrawals it recorded and the rows it could not mark (marked here
+    before anything reads the conversation)."""
+    join, waiters, inbox, answering, withdrawn, unmarked = event.data
     _session(inst=inst, name="handed", data=(inst.focus, inst.timeline_id))
     inst.focus = None
     inst.queue.append(join)
@@ -1681,6 +1705,7 @@ def focus_back(ctx, inst, event) -> None:
     inst.inbox = list(inbox) + inst.inbox
     inst.answering = answering
     inst.withdrawn |= withdrawn
+    inst.unmarked += [r for r in unmarked if r not in inst.unmarked]
 
 
 def start_joining(ctx, inst, event) -> None:  # entry of `joining`: a commit point
@@ -1761,7 +1786,7 @@ def _hand_back(inst: TimelineSM, join: QueuedJoin, also: list[Waiter]) -> None:
     inbox, inst.inbox = inst.inbox, []
     answering, inst.answering = inst.answering, None
     _forward(target=inst.machines.timelines.get(inst.source_id), name="focus_joined",
-             data=(join, users, inbox, answering, set(inst.withdrawn)))
+             data=(join, users, inbox, answering, set(inst.withdrawn), list(inst.unmarked)))
 
 
 def focus_join(ctx, inst, event) -> None:
@@ -2077,8 +2102,8 @@ def _timeline(name: str) -> hsm.Model:
                     T(On(E), S("../rest"), hsm.Effect(request_failed)),
                 ),
                 hsm.State(
-                    "dropping", io(done="dropped", work=_mark_dropped),  # its row gets the withdrawal mark
-                    T(On("dropped"), S("../rest")),
+                    "dropping", io(done="dropped", work=_mark_rows),  # its row gets the withdrawal mark
+                    T(On("dropped"), S("../rest"), hsm.Effect(rows_marked)),
                     T(On(E), S("../rest"), hsm.Effect(mark_failed)),
                 ),
                 hsm.State(
@@ -2131,8 +2156,8 @@ def _timeline(name: str) -> hsm.Model:
                 ),
                 hsm.State(
                     # the withdrawn request it answered gets the withdrawal mark on its row
-                    "withdrawing", io(done="rows_marked", work=_mark_withdrawn),
-                    T(On("rows_marked"), S("../rest")),
+                    "withdrawing", hsm.Entry(to_mark), io(done="rows_marked", work=_mark_rows),
+                    T(On("rows_marked"), S("../rest"), hsm.Effect(rows_marked)),
                     T(On(E), S("../rest"), hsm.Effect(mark_failed)),
                 ),
                 hsm.State(

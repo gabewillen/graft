@@ -686,6 +686,45 @@ def _failing(host, name, error):
     return real
 
 
+@pytest.mark.parametrize("fails", [1, 2])
+def test_a_withdrawal_mark_that_cannot_be_written_is_written_before_the_view_is_read_again(fails):
+    """A withdrawn request's row whose mark cannot be written (`withdrawing` fails) does not stay a
+    live request for later readers: the failure is told once, and the row is kept to be marked,
+    by the next run before it reads the view (and, if that fails too, that run fails and the row
+    is marked by a later one)."""
+    async def go():
+        host, m = await started()
+        first = await say(m=m, text="go")
+        row = host.log.index(("request", "o", "go")) + 1
+        real, left = host.mark_withdrawn, [fails]
+
+        def mark_withdrawn(timelines, rows):
+            if left[0]:
+                left[0] -= 1
+                raise OSError("cannot mark")
+            real(timelines=timelines, rows=rows)
+        host.mark_withdrawn = mark_withdrawn
+        told = host.next("report", "task")
+        await withdraw(m=m, reply=first)
+        assert (await asyncio.wait_for(told, GUARD))[3] == "cannot mark"
+        await at_rest(m)
+        assert host.logged("withdrawn") == []
+        second = await say(m=m, text="next")
+        if fails == 2:  # the next run's mark fails too: that run fails, before it reads anything
+            with pytest.raises(OSError, match="cannot mark"):
+                await asyncio.wait_for(second, GUARD)
+            second = await say(m=m, text="again")
+        marked = host.logged("withdrawn")
+        assert marked == [("withdrawn", ("o",), [row])]
+        runs = [i for i, entry in enumerate(host.log) if entry[:2] == ("run", "o")]
+        assert runs[-2] < host.log.index(marked[0]) < runs[-1]  # written as the run that reads it begins
+        host.end("o")
+        assert await asyncio.wait_for(second, GUARD) == "ended"
+        assert len([r for r in host.reports if r[2] == "cannot mark"]) == 1  # the run's failure is its caller's
+        await m.stop()
+    run(go)
+
+
 def test_a_request_row_that_cannot_be_written_fails_the_call_explicitly_and_runs_nothing():
     async def go():
         host, m = await started()
@@ -1748,5 +1787,55 @@ def test_a_call_refused_in_its_preparation_gets_the_harness_refusal_whatever_ord
         assert host.logged("result", "o", "k") == [("result", "o", "k", "refused by the harness", True)]
         host.end("o")
         assert await reply == "ended"
+        await m.stop()
+    run(go)
+
+
+def _mark_fails_once(host):
+    real, failed = host.mark_withdrawn, []
+
+    def mark_withdrawn(timelines, rows):
+        if not failed:
+            failed.append(rows)
+            raise OSError("cannot mark")
+        real(timelines=timelines, rows=rows)
+    host.mark_withdrawn = mark_withdrawn
+    return failed
+
+
+def test_a_row_still_to_be_marked_is_marked_before_a_driven_turn_s_clone_call_reads_the_view():
+    """The mark failed; the next reader is a clone call in a turn its caller drives (no run starts
+    it): the call's preparation marks the row before it resolves any seed."""
+    async def go():
+        host, m = await started()
+        first = await say(m=m, text="go")
+        row = host.log.index(("request", "o", "go")) + 1
+        failed = _mark_fails_once(host=host)
+        await withdraw(m=m, reply=first)
+        await at_rest(m)
+        assert failed == [[row]]
+        await m.ask(tl="o", name="turn_request", build=lambda r: (Mode(name="external"), r))
+        await clone(m=m, pairs=[("c1", False)])
+        marked = host.log.index(("withdrawn", ("o",), [row]))
+        assert marked < host.log.index(("prepare", "o", True))
+        await m.stop()
+    run(go)
+
+
+def test_a_row_a_focus_graft_could_not_mark_is_marked_before_its_join_is_copied():
+    """A focus graft's run is cut short by a withdrawal and the row's mark fails: the row goes back
+    with its join, and the original marks it before the join copies the graft's rows into its view."""
+    async def go():
+        host, m = await started()
+        first = await say(m=m, text="go")
+        row = host.log.index(("request", "o", "go")) + 1
+        await clone(m=m, pairs=[("c1", True)])  # the original is suspended; c1 runs
+        failed = _mark_fails_once(host=host)
+        await withdraw(m=m, reply=first)  # reaches the focus graft: its run ends, the mark fails
+        assert await at_rest(m=m, tl="c1") == "ended" and failed == [[row]]
+        applied = host.next("apply", "c1")
+        await m.ask(tl="c1", name="join", build=lambda r: (QueuedJoin(child="c1", reason="done", trigger=None), r))
+        await asyncio.wait_for(applied, GUARD)
+        assert host.log.index(("withdrawn", ("o",), [row])) < host.log.index(("apply", "c1", "done"))
         await m.stop()
     run(go)

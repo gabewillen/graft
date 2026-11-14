@@ -4555,12 +4555,29 @@ def test_a_withdrawal_mark_binds_only_the_conversation_not_a_background_graft_se
 WITHDRAWN = "DELETE the production site"
 
 
-def withdrawn_then(h, then, text_=WITHDRAWN):
+@pytest.fixture(params=["written", "written after a failure"])
+def mark(request):
+    """How the withdrawal mark is written: at once, or after its first write failed (the row is
+    kept to be marked, and must not reach any reader unmarked meanwhile)."""
+    return request.param
+
+
+def withdrawn_then(h, then, text_=WITHDRAWN, mark="written"):
     """The user's call `text_` is cancelled as soon as its row is written (its row stays, marked
     withdrawn in the original's view, and no run answers it); then `then()` runs, and the harness is
-    closed. Returns the withdrawn row's id."""
+    closed. `mark`: "written after a failure" makes the mark's first write fail (it is told, and
+    `settle` raises it once). Returns the withdrawn row's id."""
     task, rows = {}, []
     real = h.begin_request
+    if mark != "written":
+        real_mark, failed = h.store.mark_withdrawn, []
+
+        def mark_withdrawn(**kw):
+            if not failed:
+                failed.append("the first write")
+                raise OSError("cannot mark")
+            return real_mark(**kw)
+        h.store.mark_withdrawn = mark_withdrawn
 
     def begin_request(**kw):
         rid = real(**kw)
@@ -4575,6 +4592,10 @@ def withdrawn_then(h, then, text_=WITHDRAWN):
         task["call"] = asyncio.create_task(h.user_says(text_))
         with pytest.raises(asyncio.CancelledError):
             await task["call"]
+        if mark != "written":
+            with pytest.raises(OSError, match="cannot mark"):
+                await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+            assert failed
         await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
         await then()
         await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
@@ -4603,7 +4624,7 @@ def _clones_on(entry_for, seen):
 
 @pytest.mark.parametrize("focus", [False, True])
 @pytest.mark.parametrize("by", ["quote", "row id"])
-def test_a_message_the_user_withdrew_is_refused_as_a_seed(tmp_path, by, focus):
+def test_a_message_the_user_withdrew_is_refused_as_a_seed(tmp_path, by, focus, mark):
     """resolve_seed: a clone seeded with a message the user withdrew, by quote or by row id, is
     refused; no graft is made and no model call is made for it."""
     seen = {}
@@ -4620,14 +4641,14 @@ def test_a_message_the_user_withdrew_is_refused_as_a_seed(tmp_path, by, focus):
     async def then():
         assert await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT) == ["answered C"]
 
-    row = withdrawn_then(h=h, then=then)
+    row = withdrawn_then(h=h, then=then, mark=mark)
     assert seen["row"] == row
     assert seen["result"].startswith("clone refused") and "withdrew" in seen["result"], seen["result"]
     assert store.timeline("c1") is None and "graft" not in seen
     assert [r["withdrawn"] for r in store.view("o") if r["row_id"] == row] == [1]
 
 
-def test_a_quote_of_a_message_withdrawn_and_sent_again_names_the_one_sent_again(tmp_path):
+def test_a_quote_of_a_message_withdrawn_and_sent_again_names_the_one_sent_again(tmp_path, mark):
     """resolve_seed by quote: the user withdraws a message and sends the same text again. A quote
     of it seeds the one sent again (the withdrawn one is no match), and the graft sees it once,
     as a live request."""
@@ -4652,7 +4673,7 @@ def test_a_quote_of_a_message_withdrawn_and_sent_again_names_the_one_sent_again(
         await asyncio.wait_for(h.user_says(WITHDRAWN), WAIT_TIMEOUT)
         await h.join_queued("c1")
 
-    row = withdrawn_then(h=h, then=then)
+    row = withdrawn_then(h=h, then=then, mark=mark)
     again = [r["row_id"] for r in store.view("o") if r["content"] == WITHDRAWN and not r["withdrawn"]]
     assert len(again) == 1 and seen["result"].startswith("cloned"), seen.get("result")
     assert [r["row_id"] for r in store.view("c1") if r["owner_timeline"] != "c1"] == again  # its seed
@@ -4660,7 +4681,7 @@ def test_a_quote_of_a_message_withdrawn_and_sent_again_names_the_one_sent_again(
     assert user_texts(seen["graft"]) == [WITHDRAWN]
 
 
-def test_the_seed_index_of_a_refused_call_leaves_out_a_message_the_user_withdrew(tmp_path):
+def test_the_seed_index_of_a_refused_call_leaves_out_a_message_the_user_withdrew(tmp_path, mark):
     """seed_index: a refused clone call's result lists the messages a seed may name; a message the
     user withdrew is not among them."""
     seen = {}
@@ -4670,13 +4691,13 @@ def test_the_seed_index_of_a_refused_call_leaves_out_a_message_the_user_withdrew
     async def then():
         await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT)
 
-    row = withdrawn_then(h=h, then=then)
+    row = withdrawn_then(h=h, then=then, mark=mark)
     index = seen["result"].split("Your messages (row_id role: text):", 1)[1]
     assert f" {row} user:" not in index and " user: C" in index, index
 
 
 @pytest.mark.parametrize("seeder_answer", ["scores", "an error: the model's seed is the fallback"])
-def test_the_seeder_never_seeds_a_message_the_user_withdrew(tmp_path, seeder_answer):
+def test_the_seeder_never_seeds_a_message_the_user_withdrew(tmp_path, seeder_answer, mark):
     """The seeder actor and its fallback: the withdrawn message is no candidate, and a model seed
     naming it is no fallback (the seed falls back to the candidates instead)."""
     from graft import seeder as sd
@@ -4704,13 +4725,13 @@ def test_the_seeder_never_seeds_a_message_the_user_withdrew(tmp_path, seeder_ans
         await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT)
         await h.join_queued("c1")
 
-    row = withdrawn_then(h=h, then=then)
+    row = withdrawn_then(h=h, then=then, mark=mark)
     assert offered and all(row not in o for o in offered)
     assert seen["result"].startswith("cloned"), seen["result"]
     assert row not in store.pointed("c1") and WITHDRAWN not in user_texts(seen["graft"][0])
 
 
-def test_a_final_seed_holding_a_message_the_user_withdrew_is_refused_whoever_chose_it(tmp_path):
+def test_a_final_seed_holding_a_message_the_user_withdrew_is_refused_whoever_chose_it(tmp_path, mark):
     """The commit condition on every entry's final seed: a seed the seeder step hands back with a
     withdrawn row in it is refused before anything commits."""
     from graft import seeder as sd
@@ -4737,12 +4758,12 @@ def test_a_final_seed_holding_a_message_the_user_withdrew_is_refused_whoever_cho
 
     real = h.begin_request
     h.begin_request = lambda **kw: seen.setdefault("row", real(**kw))
-    row = withdrawn_then(h=h, then=then)
+    row = withdrawn_then(h=h, then=then, mark=mark)
     assert seen["result"].startswith("clone refused") and f"row {row} is a message the user withdrew" in seen["result"]
     assert store.timeline("c1") is None and "graft" not in seen
 
 
-def test_a_compaction_keeps_a_message_the_user_withdrew_marked(tmp_path):
+def test_a_compaction_keeps_a_message_the_user_withdrew_marked(tmp_path, mark):
     """Compaction (turns): the index the compaction call reads marks the withdrawn message, and a
     window that would compress it (writing a new row that restates it unmarked) is refused, so the
     compacted view keeps the row with its mark and the next model call sees it only as withdrawn."""
@@ -4775,7 +4796,7 @@ def test_a_compaction_keeps_a_message_the_user_withdrew_marked(tmp_path):
         await real()
         assert await h.user_says(long_a) == ["answer to A"]
     h.start = start
-    row = withdrawn_then(h=h, then=then)
+    row = withdrawn_then(h=h, then=then, mark=mark)
     line = next(x for x in seen["indexes"][0].splitlines() if x.startswith(f"row_id={row} "))
     assert "withdrawn by the user" in line, line
     assert h.compactions == ["o"]
@@ -4785,7 +4806,7 @@ def test_a_compaction_keeps_a_message_the_user_withdrew_marked(tmp_path):
     assert violations(store=store, tl="o") == []
 
 
-def test_a_summary_compaction_never_reads_a_message_the_user_withdrew(tmp_path):
+def test_a_summary_compaction_never_reads_a_message_the_user_withdrew(tmp_path, mark):
     """Compaction (summary): the summary is a new user-role row, so the conversation the summary
     call reads leaves the withdrawn message out (it could only be restated unmarked); the
     compacted view is the summary and the fresh message, with no trace of it as a request."""
@@ -4809,7 +4830,7 @@ def test_a_summary_compaction_never_reads_a_message_the_user_withdrew(tmp_path):
     async def then():
         await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT)
 
-    row = withdrawn_then(h=h, then=then)
+    row = withdrawn_then(h=h, then=then, mark=mark)
     read = [b["text"] for m in seen["summary"] for b in m["content"] if b["type"] == "text"]
     assert read and all(WITHDRAWN not in t for t in read), read
     assert any("A " in t for t in read)  # what the user did ask is summarised
