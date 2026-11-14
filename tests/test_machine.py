@@ -1726,3 +1726,27 @@ def test_a_message_whose_caller_has_gone_starts_no_join_commit_whatever_order_th
         assert host.reports == reports and not host.logged("request", "o", "gone")
         await m.stop()
     run(go)
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_call_refused_in_its_preparation_gets_the_harness_refusal_whatever_order_the_branches_are_declared_in(
+        monkeypatch, order):
+    """The harness refuses a clone call while preparing it (no grafts were made): its result is
+    that refusal, never the graph's own, with the branches of the choices in either order."""
+    class Refusing(Host):
+        async def prepare_clone(self, src, clone, retry_left):
+            self.record("prepare", src, retry_left)
+            return "refused by the harness"
+
+    async def go():
+        _in_order(monkeypatch=monkeypatch, order=order)
+        host = Refusing()
+        m = Machines(host)
+        await m.start_root("o")
+        reply = await say(m=m, text="go")
+        await clone(m=m, pairs=[])
+        assert host.logged("result", "o", "k") == [("result", "o", "k", "refused by the harness", True)]
+        host.end("o")
+        assert await reply == "ended"
+        await m.stop()
+    run(go)

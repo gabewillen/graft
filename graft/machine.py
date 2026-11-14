@@ -3,11 +3,13 @@ graft decides what may happen, who waits, and in what order.
 
 Three rules hold everywhere in this module.
 
-* Decisions are guards and choices. Effects never decide what happens next: an effect only
-  changes its own instance's data, answers a reply future carried in the event that caused it,
-  and dispatches at most one event (to another machine, the scribe, or its own). A step that
-  must send more goes through states: a chain of choices, one send per transition, or a state
-  whose entry ticks once and whose choice sends the next one (`reporting`, below).
+* Decisions are guards and choices, and the guarded branches of a choice (or of one event's
+  transitions from one state) are disjoint: no outcome depends on their order, and one unguarded
+  default takes the rest. Effects never decide what happens next: an effect only changes its own
+  instance's data, answers a reply future carried in the event that caused it, and dispatches at
+  most one event (to another machine, the scribe, or its own). A step that must send more goes
+  through states: a chain of choices, one send per transition, or a state whose entry ticks once
+  and whose choice sends the next one (`reporting`, below).
 * Anything that can fail is a state's activity: a run of the model loop, every store write, the
   report lines and trace the user's callbacks receive, starting a graft's machine. The activity
   ends by dispatching its outcome as an event; if it raises, the library dispatches `hsm/error`,
@@ -752,7 +754,9 @@ def rejected_in_preparation(ctx, inst, event) -> bool:
 
 
 def graph_refuses(ctx, inst, event) -> bool:
-    return clone_why(inst=inst, clone=inst.clone) is not None
+    """A prepared call (not one the harness refused in its preparation) the graph refuses."""
+    prepared = not rejected_in_preparation(ctx=ctx, inst=inst, event=event)
+    return prepared and clone_why(inst=inst, clone=inst.clone) is not None
 
 
 def clone_waits(ctx, inst, event) -> bool:
