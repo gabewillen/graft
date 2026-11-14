@@ -14,6 +14,7 @@ from graft.machine import (CANCELLED, MAX_JOIN_ATTEMPTS, MAX_LIVE_BACKGROUND, Ca
                            Machines, Mode, QueuedJoin, TransitionRefused)
 
 GUARD = 5  # seconds: a wait that should end at once fails the test instead of hanging it
+HEAD = 0  # the first item of a list
 
 
 class Host:
@@ -775,11 +776,13 @@ def test_a_focus_clone_whose_result_row_fails_has_the_kept_row_written_before_th
     run(go)
 
 
-@pytest.mark.parametrize("pairs", [[("c1", False)], [("c0", False), ("c1", False)]])
+@pytest.mark.parametrize("pairs", [[("c1", False)], [("c0", False), ("c1", False)], [("c0", True), ("c1", False)]])
 def test_a_graft_machine_that_cannot_start_undoes_the_whole_clone_call(monkeypatch, pairs):
     """The machines are started before anything else learns of the grafts: if one cannot start,
     the ones made are stopped and forgotten, the committed grafts are marked abandoned, and the
-    result is a refusal. Settle, close and a cancel of the dead id all still return."""
+    result is a refusal. A focus graft is started last, so one whose call could not start every
+    background graft never ran and never told the session it was engaged.
+    Settle, close and a cancel of the dead id all still return."""
     import graft.machine as machine_module
     real = machine_module.hsm.Started
 
@@ -796,6 +799,8 @@ def test_a_graft_machine_that_cannot_start_undoes_the_whole_clone_call(monkeypat
         monkeypatch.setattr(machine_module.hsm, "Started", real)
         assert children is None and "refused" in text
         assert ("abandoned", tuple(g for g, _ in pairs)) in host.log
+        if pairs[HEAD][1]:  # a focus graft is started last: one that could not start leaves it unmade
+            assert host.logged("run", "c0") == [] and "c0" not in m.timelines and "c0" not in m.session.engaged
         for g, _ in pairs:  # forgotten
             with pytest.raises(TransitionRefused, match="no machine"):
                 await m.send(tl=g, name="cancel")

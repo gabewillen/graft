@@ -968,8 +968,12 @@ async def spawn_activity(ctx, inst: TimelineSM, event) -> None:
     (`spawning` defers it) and is then handled like any later one (forwarded to the focus graft by
     event; a background graft reads it from its request's reply, which a cancelled call cancels
     before it withdraws). The outcome is an event: `spawned`, or `spawn_failed` with the machines
-    made so far (they are undone in `unspawning`)."""
-    machines, source, plans = inst.machines, inst.timeline_id, list(inst.spawn_plan)
+    made so far (they are undone in `unspawning`). The focus graft, if any, is started last: it
+    starts on its request at once (it engages, and runs), so it is made only once every
+    background graft of the call has started, and a call undone because a graft could not start
+    never had a focus graft act."""
+    machines, source = inst.machines, inst.timeline_id
+    plans = sorted(inst.spawn_plan, key=lambda plan: plan.focus)  # the focus graft last
     held, withdrawn = inst.mode.name == "external", set(inst.withdrawn)
     made: list[str] = []
     try:
@@ -1547,6 +1551,12 @@ def spawn_failed(ctx, inst, event) -> None:
     inst.spawn_plan = []
 
 
+def undone(ctx, inst, event) -> None:
+    """The grafts of a clone call that could not all start are stopped and forgotten: the session
+    forgets them too, so nothing a graft told it before it was undone stays."""
+    _session(inst=inst, name="grafts_undone", data=[g for g, _ in inst.clone.pairs])
+
+
 def take_hand_over(ctx, inst, event) -> None:
     """The clone call hands the conversation over: it is finished below (the run's open calls,
     and any row kept, are written first), not answered as a call left pending."""
@@ -1963,7 +1973,7 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
                 ),
                 hsm.State(
                     "unspawning", hsm.Activity(unspawn_activity),
-                    T(On("unspawned"), S("../refusing")),
+                    T(On("unspawned"), S("../refusing"), hsm.Effect(undone)),
                     T(On(E), S("../refusing")),
                 ),
                 hsm.State(
@@ -2399,6 +2409,10 @@ def _apply_session(inst: SessionSM, name: str, data: Any) -> None:
         inst.users.update(data)
     elif name == "user_answered":
         inst.users.difference_update(data)
+    elif name == "grafts_undone":  # a clone call's grafts, stopped and forgotten
+        inst.engaged.difference_update(data)
+        inst.grafts.difference_update(data)
+        inst.held.difference_update(data)
 
 
 def _busy_after(inst: SessionSM, event) -> bool:
@@ -2597,7 +2611,7 @@ def is_root_event(ctx, inst, event) -> bool:
 
 
 RECORDS = ("engaged", "request_taken", "rested", "handed", "suspended", "grafts_made", "graft_received",
-           "user_waiting", "user_answered")
+           "user_waiting", "user_answered", "grafts_undone")
 
 SESSION = hsm.Define(
     "Session",
