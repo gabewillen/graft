@@ -5788,6 +5788,137 @@ def test_a_fault_that_recurs_every_time_never_hangs_the_harness(tmp_path, monkey
     asyncio.run(go())
 
 
+# ---------------------------------------------------------------- a cancel that lands after the answer
+def _cancelled_as_answered(monkeypatch, holder_, tl="o"):
+    """The caller's task is cancelled in the loop tick its reply is answered: right after the step
+    that answers it at rest returns, before the task resumes (asyncio throws the cancel into the
+    await of a reply that is already done)."""
+    import graft.machine as machine
+    real = machine.come_to_rest
+
+    def come_to_rest(ctx, inst, event):
+        real(ctx=ctx, inst=inst, event=event)
+        task = holder_.pop("task", None)
+        if task is not None and inst.timeline_id == tl:
+            task.cancel()
+    monkeypatch.setattr(machine, "come_to_rest", come_to_rest)
+
+
+def test_a_cancel_after_the_answer_is_a_withdrawal_its_background_graft_stops_and_nothing_more_is_said(
+        tmp_path, monkeypatch):
+    """A user_says cancelled in the tick its reply is answered raises CancelledError, and the cancel
+    wins: the background graft made for that request stops before its next step (its tool never
+    runs, no model call starts after the cancel) and joins `cancelled`, its join wakes nothing, no
+    line is said after the cancel, and the request's row is marked withdrawn."""
+    gate, entered, cancelled = threading.Event(), threading.Event(), threading.Event()
+    late = []
+
+    def policy(system, messages, tools):
+        last = messages[-1]["content"][-1]
+        if "clone" not in {t["name"] for t in tools}:  # c1
+            late.append(cancelled.is_set())
+            entered.set()
+            assert gate.wait(GATE_TIMEOUT)
+            if len(late) == 1:
+                return [{"type": "tool_use", "id": "w1", "name": "site_write",
+                         "input": {"page": "index", "content": "DELETED"}}]
+            return text("website finished")
+        if last["type"] == "tool_result":
+            assert entered.wait(GATE_TIMEOUT)  # c1's first model call is in flight
+            return text("Started.")
+        if last.get("harness"):
+            return text("report")
+        return [clone_use(clone_entry(skills=["website"], focus=False, quotes=["BG go"]), id="t1") | {"type": "tool_use"}]
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+    tasks = {}
+    _cancelled_as_answered(monkeypatch=monkeypatch, holder_=tasks)
+
+    async def go():
+        await h.start()
+        tasks["task"] = asyncio.create_task(h.user_says("BG go"))
+        with pytest.raises(asyncio.CancelledError):
+            await tasks["task"]
+        cancelled.set()
+        shown = len(said)
+        gate.set()
+        assert await asyncio.wait_for(h.settle(), WAIT_TIMEOUT) == ["Started."]
+        assert said[shown:] == []  # nothing said after the cancel: no wake for c1's join
+        assert await asyncio.wait_for(h.user_says("next"), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert late == [False]  # c1's one model call began before the cancel; none after it
+    assert "index" not in h.world.site  # its tool never ran
+    assert store.timeline("c1")["join_reason"] == "cancelled"
+    row = store.con.execute("SELECT row_id FROM turns WHERE content='BG go'").fetchone()[0]
+    assert [tuple(r) for r in store.con.execute("SELECT timeline_id FROM withdrawals WHERE row_id=?", (row,))] == [("o",)]
+    assert violations(store=store, tl="o") == []
+
+
+def test_a_cancel_after_the_answer_of_a_plain_turn_marks_its_row_and_keeps_its_error_for_settle(
+        tmp_path, monkeypatch):
+    """With no graft: the late cancel still wins, so the answered request's row is marked withdrawn
+    (the view stays valid, and the next turn reads it as withdrawn); a request answered with an
+    error its caller never took has that error told once, a line the next call's output shows
+    (with the answer the first caller never took), and settle does not raise it."""
+    calls = []
+
+    def policy(system, messages, tools):
+        calls.append(messages[-1]["content"][-1].get("text", ""))
+        if len(calls) == 2:
+            raise RuntimeError("the model call failed")
+        return text(f"answer {len(calls)}")
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+    tasks = {}
+    _cancelled_as_answered(monkeypatch=monkeypatch, holder_=tasks)
+
+    async def go():
+        await h.start()
+        for message in ("first", "second"):
+            tasks["task"] = asyncio.create_task(h.user_says(message))
+            with pytest.raises(asyncio.CancelledError):
+                await tasks["task"]
+        out = await asyncio.wait_for(h.user_says("third"), WAIT_TIMEOUT)
+        assert out == ["answer 1", "(harness error: RuntimeError: the model call failed)", "answer 3"]
+        assert await asyncio.wait_for(h.settle(), WAIT_TIMEOUT) == []
+        await h.close()
+
+    asyncio.run(go())
+    rows = [store.con.execute("SELECT row_id FROM turns WHERE content=?", (m,)).fetchone()[0] for m in ("first", "second")]
+    marked = {r for (r,) in store.con.execute("SELECT row_id FROM withdrawals WHERE timeline_id='o'")}
+    assert marked == set(rows)
+    assert violations(store=store, tl="o") == []
+
+
+def test_a_cancel_after_a_focus_graft_answered_marks_the_row_in_its_view_and_its_source_s(tmp_path, monkeypatch):
+    """The focus graft holding the conversation answers a message, and the call is cancelled in the
+    tick it is answered: the suspended original passes the withdrawal on, the graft that answered
+    marks the row in its view and its source's, and the conversation goes on there."""
+    script = FaultScript()
+    store, h, said = make(tmp_path=tmp_path, policy=script)
+    tasks = {}
+    _cancelled_as_answered(monkeypatch=monkeypatch, holder_=tasks, tl="c1")
+
+    async def go():
+        await h.start()
+        assert await asyncio.wait_for(h.user_says(STAY), WAIT_TIMEOUT) == ["site done"]
+        tasks["task"] = asyncio.create_task(h.user_says("B to the focus graft"))
+        with pytest.raises(asyncio.CancelledError):
+            await tasks["task"]
+        assert await asyncio.wait_for(h.settle(), WAIT_TIMEOUT) == ["answer to B to the focus graft"]
+        assert await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT) == ["answer to C"]
+        await h.close()
+
+    asyncio.run(go())
+    row = store.con.execute("SELECT row_id FROM turns WHERE content='B to the focus graft'").fetchone()[0]
+    marked = sorted(tuple(r) for r in store.con.execute("SELECT timeline_id FROM withdrawals WHERE row_id=?", (row,)))
+    assert marked == [("c1",), ("o",)]
+    for tl in ("o", "c1"):
+        assert violations(store=store, tl=tl) == []
+
+
 def test_a_withdrawal_whose_guard_raises_while_a_clone_call_is_prepared_ends_the_run_and_rolls_it_back(
         tmp_path, monkeypatch):
     """The user's call is cancelled while its clone call is being prepared (the seeder waits), and

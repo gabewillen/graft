@@ -91,7 +91,7 @@ HOST = ("run_busy", "run_background", "mirror", "report", "graft_failed", "begin
         "record_join", "apply_join", "wake_note", "cancel_text", "join_of", "abandon_clone", "recover")
 LONG = "LONG: " + "a detail of the request " * 60  # a message long enough that the next turn compacts
 
-SCENARIOS = ["plain", "BG", "FOCUS", "STAY", "BAD", "STOP", "withdrawn", "prepare", "AB", "close", "compaction",
+SCENARIOS = ["plain", "BG", "FOCUS", "STAY", "BAD", "STOP", "withdrawn", "late", "prepare", "AB", "close", "compaction",
              "spawn"]
 
 
@@ -125,6 +125,7 @@ class Case:
     fired: bool = False
     fired_second: bool = False
     injected: set[str] = dataclasses.field(default_factory=set)  # the targets that raised
+    late: dict[str, asyncio.Task] = dataclasses.field(default_factory=dict)  # the call the late scenario cancels
     seeding: asyncio.Event | None = None  # the prepare scenario: its clone call's seeder began
     graft_errors: list[tuple[str, str]] = dataclasses.field(default_factory=list)  # graft runs that raised (host)
     scenario: bool = True  # the scenario's calls are being made (only they are counted, and fault)
@@ -234,6 +235,16 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
         case.calls.append(("user_says", outcome))
         case.windows.append(("user_says", first, len(case.said)))
         script.open()
+    elif scenario == "late":  # the call is cancelled in the tick it is answered: the cancel wins
+        first = len(case.said)
+        task = case.late["task"] = asyncio.create_task(h.user_says(BG))
+        done, _ = await asyncio.wait({task}, timeout=WAIT + HANG)
+        if not done:
+            case.problems.append("user_says hung")
+        outcome = ("hung" if not done else "cancelled" if task.cancelled() else task.exception() or task.result())
+        case.calls.append(("user_says", outcome))
+        case.windows.append(("user_says", first, len(case.said)))
+        script.open()  # c1's model call returns: it stops before acting on it
     elif scenario == "prepare":  # cancelled while its clone call is prepared (the seeder waits): cut short
         case.seeding = asyncio.Event()
         first = len(case.said)
@@ -287,8 +298,8 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
 # The functions on the way of a state's store copy: a raise there loses that copy (not retried:
 # the next copy of the state overwrites it), so the store may lag the machines. (`_forward` and
 # `_send` carry every send, a state's copy among them.)
-STORE_COPY = {"_forward", "_send", "_note", "take_note", "_scribe_write", "keeps", "is_write", "s_keep",
-              "s_report_write", "s_keep_lost_line", "scribe_fault", "host.mirror",
+STORE_COPY = {"_forward", "_send", "_note", "take_note", "_scribe_write", "keeps", "is_write", "kept_after_report",
+              "told_after_write", "s_keep", "s_tell_kept", "s_report_write", "s_keep_lost_line", "scribe_fault", "host.mirror",
               "host.abandon_clone"}  # (an undone call's grafts not marked abandoned: told, and the store keeps them)
 
 
@@ -364,6 +375,14 @@ def run(tmp_path, monkeypatch, scenario: str, target: str | None = None, nth: in
         stashed.set()
         return real_stash(ctx=ctx, inst=inst, event=event)
     monkeypatch.setattr(machine, "stash_message", stash_message)
+    real_rest = machine.come_to_rest
+
+    def come_to_rest(ctx, inst, event):  # the late scenario's caller is cancelled as it is answered
+        real_rest(ctx=ctx, inst=inst, event=event)
+        task = case.late.pop("task", None)
+        if task is not None and inst.timeline_id == "o":
+            task.cancel()
+    monkeypatch.setattr(machine, "come_to_rest", come_to_rest)
     for name in ("forward_to_focus", "return_to_source"):
         monkeypatch.setattr(machine, name, forwarding(name=name, real=getattr(machine, name)))
     named = [t for t in (target, second) if t]

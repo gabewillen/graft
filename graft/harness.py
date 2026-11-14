@@ -436,8 +436,11 @@ class Harness:
         a cancel, wherever the request is in its lifecycle, cancels that reply at once and the
         caller withdraws the request by id. The machine then never starts a run, writes a row or
         lets a graft act for it; a run already answering it is ended by its machine before
-        its next step, and a row already written for it is marked withdrawn. If a step the
-        message sets off fails, the machine answers the reply with that error, raised here."""
+        its next step, and a row already written for it is marked withdrawn. A cancel that lands
+        after the machine answered but before this call took the answer wins too: CancelledError
+        is raised, and the withdrawal stops the background grafts made for the request and marks
+        its row (the machine honours it until it hears the call is done, `call_done`). If a step
+        the message sets off fails, the machine answers the reply with that error, raised here."""
         root = self.machines.root
         request = self.machines.request(text)
         self.machines.post(tl="session", name="call_began", data=request.id)
@@ -451,6 +454,8 @@ class Harness:
                 raise
             return self._take()
         finally:  # a failure told while this call was in flight is this call's: settle does not raise it
+            with contextlib.suppress(TransitionRefused):  # its answer is taken, or it was withdrawn
+                self.machines.post(tl=root, name="call_done", data=request.id)
             with contextlib.suppress(TransitionRefused):  # closed meanwhile: nothing is kept any more
                 self.machines.post(tl="session", name="call_done", data=request.id)
 
