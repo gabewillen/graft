@@ -46,6 +46,10 @@ dev = [
     "typesafe-sdk>=0.6.0,<1.0.0",
 ]
 
+[tool.pytest.ini_options]
+markers = ["sweep: the internal-faults sweep (slow: run it with -m sweep)"]
+addopts = "-m 'not sweep'"
+
 [project.scripts]
 graft = "graft.cli:main"
 

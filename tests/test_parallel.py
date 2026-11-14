@@ -6,6 +6,7 @@ threading.Event gates, and assertions that span more than one graft are order-fr
 fixes the order."""
 
 import asyncio
+import collections
 import contextlib
 import json
 import re
@@ -18,7 +19,7 @@ from graft.db import Store, render, validate
 from graft.harness import (MAX_CANCEL_IDS, NOT_RUN_BESIDE_CLONE, NOT_RUN_INTERRUPTED, NOT_RUN_JOINING, Harness,
                            NotRun, _reason, cancel_ids, clone_entries)
 from graft.providers import FakeProvider
-from graft.machine import MAX_LIVE_BACKGROUND, TransitionRefused
+from graft.machine import MAX_LIVE_BACKGROUND, DecisionFault, TransitionRefused
 from graft.skills import CANCEL_TOOL, CATALOG, JOIN_TOOL, World, install
 
 REQUEST = "Build a website and a slide deck for the dental practice."
@@ -2086,6 +2087,8 @@ NESTING = 100_000  # depth of a nested list no repr can be built of
 
 def cancel_use(ids, id="x"):
     return {"type": "tool_use", "id": id, "name": "cancel", "input": {"cancel": ids}}
+
+
 
 
 def violations(store, tl):
@@ -5271,17 +5274,571 @@ def test_a_focus_graft_whose_join_can_never_be_applied_ends_abandoned(tmp_path, 
     assert len(told) == 2 and "will be retried" in told[0] and "is abandoned" in told[1]
 
 
-# ------------------------------------------------------------------ a step that fails is never lost
-def _send_fails_once(sm, name):
-    """Fault injection: the next `name` event sent to sm's machine raises in the step that sends
-    it (an effect of another machine). Returns the error it raises."""
-    real, error = sm.dispatch, RuntimeError(f"cannot send {name}")
-    fired: list[str] = []
+# ------------------------------------------------------------------ harnesses on separate threads
+def test_harnesses_on_two_threads_never_mix_their_steps_sends(tmp_path, monkeypatch):
+    """Each harness on its own thread and loop (as experiments/bench.py runs them), each held half
+    way through a step's behavior: the first before it sends, the second after it sent. The first
+    then finishes its step and its whole turn while the second still waits. The sends of a step
+    belong to that step alone, so neither step takes the other's send (no MultipleSends, nothing
+    lost), and both turns are answered normally."""
+    import graft.machine as machine
+    first_in, first_go = threading.Event(), threading.Event()
+    second_in, second_go = threading.Event(), threading.Event()
+    real = machine.take_message
+    roles: dict[int, str] = {}
 
-    def dispatch(ctx, event):
-        if event.name == name and not fired:
-            fired.append(name)
+    def take_message(ctx, inst, event):
+        role = roles.get(id(inst.host))
+        if role == "first":
+            first_in.set()
+            assert first_go.wait(GATE_TIMEOUT), "the first harness was never let go"
+        result = real(ctx=ctx, inst=inst, event=event)
+        if role == "second":
+            second_in.set()
+            assert second_go.wait(GATE_TIMEOUT), "the second harness was never let go"
+        return result
+    monkeypatch.setattr(machine, "take_message", take_message)
+    results: dict[str, object] = {}
+
+    def run(name):
+        store = Store(str(tmp_path / f"{name}.db"))  # a store is used on the thread that made it
+        install(store)
+        said: list[str] = []
+        h = Harness(store=store, provider=FakeProvider(policy=lambda system, messages, tools: text(f"answer {name}")),
+                    seeder=None, emit=said.append)
+        roles[id(h)] = name
+
+        async def go():
+            await h.start()
+            out = await asyncio.wait_for(h.user_says("hello"), WAIT_TIMEOUT)
+            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+            await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+            return out, said_errors(said)
+        try:
+            results[name] = asyncio.run(go())
+        except BaseException as e:  # noqa: BLE001 - the assertion below names it
+            results[name] = e
+
+    first = threading.Thread(target=run, kwargs=dict(name="first"))
+    first.start()
+    assert first_in.wait(GATE_TIMEOUT), "the first harness never reached its step"
+    second = threading.Thread(target=run, kwargs=dict(name="second"))
+    second.start()
+    assert second_in.wait(GATE_TIMEOUT), "the second harness never reached its step"
+    first_go.set()
+    first.join(GATE_TIMEOUT * 2)
+    assert results.get("first") == (["answer first"], []), results.get("first")
+    second_go.set()
+    second.join(GATE_TIMEOUT * 2)
+    assert results.get("second") == (["answer second"], []), results.get("second")
+
+
+# ------------------------------------------------------------------ a step that fails is recovered from
+class Faults:
+    """Fault injection into graft's own code, the faults a bug there would cause: a session send
+    raises once, or a function a guard reads raises once (armed now, or when `arm` is called, from
+    any thread). `fired` holds what raised; `acts` what had happened when it did (model calls,
+    clone commits), to tell what happened after it."""
+
+    def __init__(self, h, store, monkeypatch):
+        self.h, self.store, self.monkeypatch = h, store, monkeypatch
+        self.fired: list[str] = []
+        self.armed = threading.Event()
+        self.acts: tuple[int, int] | None = None
+
+    def done_so_far(self):
+        return len(self.h.provider.calls), len(self.store.con.execute(
+            "SELECT 1 FROM transactions WHERE kind='clone' AND status='committed'").fetchall())
+
+    def send(self, name, nth=1):
+        """The session's `nth` event named `name` cannot be sent (its send raises, once)."""
+        real = self.h.machines.session.dispatch
+        error = RuntimeError(f"cannot send {name}")
+        seen = []
+
+        def dispatch(ctx, event):
+            seen.extend([event.name] if event.name == name else [])
+            if event.name == name and len(seen) == nth and not self.fired:
+                self.fired.append(name)
+                self.acts = self.done_so_far()
+                raise error
+            return real(ctx, event)
+        self.h.machines.session.dispatch = dispatch
+        return error
+
+    def guard(self, name, armed=True, when=lambda *args, **kw: True):
+        """The machine module's function `name` raises once (when armed, and `when` its arguments):
+        every guard and effect that reads it calls it through the module, so the injection reaches it."""
+        import graft.machine as machine
+        real, error = getattr(machine, name), RuntimeError(f"{name} raised")
+        if armed:
+            self.armed.set()
+
+        def raising(*args, **kw):
+            if self.armed.is_set() and not self.fired and when(*args, **kw):
+                self.fired.append(name)
+                self.acts = self.done_so_far()
+                raise error
+            return real(*args, **kw)
+        self.monkeypatch.setattr(machine, name, raising)
+        return error
+
+
+BG, FOCUS, STAY = "BG: build a website.", "FOCUS: build a website.", "STAY: build a website and stay."
+BAD = "BAD: build a website."  # the original clones with a seed quote that matches nothing: refused
+STOP = "STOP"  # the original cancels c1
+
+
+class FaultScript:
+    """The original answers each message, or clones one website graft for BG (background) and
+    FOCUS and STAY (focus); a graft replies "site done" to BG, FOCUS (it then joins) and STAY (it
+    stays, holding the conversation), and answers any other message. A model call is keyed by its message, with "graft:" in front for a
+    graft's: `gate(key)` holds that call until `gates[key]` is set (`entered[key]` says it began);
+    `arm_on` keys arm the Faults (`faults.armed`) when their call is made."""
+
+    def __init__(self):
+        self.gates: dict[str, threading.Event] = {}
+        self.entered: dict[str, threading.Event] = {}
+        self.arm_on: set[str] = set()
+        self.faults: Faults | None = None
+
+    def gate(self, key):
+        self.gates[key], self.entered[key] = threading.Event(), threading.Event()
+
+    def open(self):
+        for gate in self.gates.values():
+            gate.set()
+
+    def __call__(self, system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        request = user_texts(messages)[-1]
+        key = request if "clone" in names else f"graft:{request}"
+        if key in self.entered:
+            self.entered[key].set()
+            assert self.gates[key].wait(GATE_TIMEOUT)
+        if key in self.arm_on:
+            self.faults.armed.set()
+        if "clone" in names:
+            if last["type"] == "tool_result":
+                return text("Started.")
+            if is_wake(last):
+                return text("Reported.")
+            if request in (BG, FOCUS, STAY, BAD) and last["type"] == "text" and last["text"] == request:
+                quotes = ["no message says this"] if request == BAD else [request]
+                entry = clone_entry(skills=["website"], focus=request in (FOCUS, STAY), quotes=quotes)
+                return [clone_use(entry, id=f"k{len(messages)}") | {"type": "tool_use"}]
+            if request == STOP and last["type"] == "text" and last["text"] == request:
+                return [{"type": "tool_use", "id": f"x{len(messages)}", "name": "cancel", "input": {"cancel": ["c1"]}}]
+            return text(f"answer to {request}")
+        if request == FOCUS:
+            return [{"type": "text", "text": "site done"},
+                    {"type": "tool_use", "id": f"j{len(messages)}", "name": "join", "input": {"reason": "done"}}]
+        return text("site done" if request in (BG, STAY) else f"answer to {request}")
+
+
+# Each row: the fault (a session send that raises once, or a module function that raises once:
+# a guard, a rule a gate's step works out, or a helper of either), the calls that set it off,
+# what its caller sees, and which error. "raises": the call waiting on the failed work raises the
+# error and nothing else reports it; "told": no caller waits on it, so it is told once (a line)
+# and `settle` raises it at most once; "unchanged": the guard that raised was not the branch its
+# decision takes (it holds nothing and writes nothing), so the decision and the answer are as
+# without it. The error is the injected one, or, where a guard raised (it cannot tell what it
+# raised), the DecisionFault its decision's safe branch reports, naming the guard that held.
+FAULT_ROWS = [
+    # the sends that keep the session's record, each at the step that sends it first (or, `#n`,
+    # the nth time it is sent)
+    ("engaged", ["plain"], "raises", "injected"),  # taking the message
+    ("engaged#2", [BG], "told", "injected"),  # the graft's join wakes the idle original
+    ("rested", ["plain"], "told", "injected"),
+    ("root_closed", ["plain", "close"], "told", "injected"),
+    ("handed", [FOCUS], "told", "injected"),  # the focus graft's answer had reached its caller
+    ("suspended", [FOCUS], "told", "injected"),
+    ("suspended while the focus graft stays", [STAY], "told", "injected"),
+    ("grafts_made", [BG], "raises", "injected"),
+    ("graft_received", [BG], "told", "injected"),
+    # the clone rules, worked out by the step before each gate
+    ("decline_why", [BG], "raises", "injected"),  # clone_gate
+    ("clone_why", [BG], "raises", "injected"),  # the prepared gate
+    # guards, each raising once where it is the branch its decision takes
+    ("may_try", [BG], "raises", "decision"),  # clone_gate
+    ("graph_allows", [BG], "raises", "decision"),  # the prepared gate
+    ("rejected_in_preparation", [BAD], "raises", "decision"),  # the prepared gate, a refused call
+    ("arrives_to_answer", ["plain"], "raises", "decision"),  # a message's arrival (a call's step)
+    ("request_live", ["plain"], "raises", "decision"),  # requesting -> busy
+    ("run_goes_on", ["A asks"], "raises", "decision"),  # the run's may_continue after its model call
+    ("_run_withdrawn", ["A asks"], "raises", "decision"),  # a helper of that guard
+    ("cancels_only", [BG, STOP], "raises", "decision"),  # after the cancels: the run goes on
+    ("hands_over", [FOCUS], "told", "decision"),  # clone_choice: the hand-over finishes in recovery
+    ("starts_running", [BG], "told", "decision"),  # a background graft's start
+    ("_made_for_withdrawn", [BG], "told", "decision"),  # a helper of that guard
+    ("made_for_live", [BG], "told", "decision"),  # a background graft's may_continue
+    ("own_graft", [BG], "told", "decision"),  # a graft's join reaching the original at rest
+    # guards raising once where their branch is not the one taken
+    ("_live", ["plain"], "unchanged", "none"),  # the first read at arrival: arrives_withdrawn
+    ("is_held", [BG], "unchanged", "none"),  # a graft not held
+    # effects raising
+    ("stash_message", ["A", "B behind A"], "raises", "injected"),  # B's step alone: A is answered
+    ("stash_message at a focus graft", [FOCUS, "B to the focus graft"], "raises", "injected"),
+    ("take_inbox", ["A", "B after A"], "told", "injected"),  # before B is taken: B is taken after the recovery
+    ("note_withdrawn", ["A withdrawn"], "told", "injected"),
+    ("_drop_dead", ["plain"], "told", "injected"),  # before its send (`come_to_rest`)
+    # steps that carry a join, grafts or a caller's reply in their event: the recovery keeps them
+    ("enqueue", [BG], "told", "injected"),  # the graft's join, arriving at the idle original
+    ("cancel_landed", [BG, STOP], "raises", "injected"),  # the cancelled graft's join, in the cancel step
+    ("focus_back", [FOCUS], "told", "injected"),  # the focus graft's join, taken by the original
+    ("hand_back_join", [FOCUS], "told", "injected"),  # the focus graft's join, made by the graft
+    ("_hand_back", [FOCUS], "told", "injected"),
+    ("spawned", [BG], "raises", "injected"),  # the clone call's grafts had started
+    ("spawned for a focus graft", [FOCUS], "told", "injected"),
+    ("no_cancels", [BG], "raises", "decision"),  # a clone call's own step: its reply gets the error
+    # the session's own steps
+    ("s_answer", ["plain"], "settle", "injected"),  # answering the settle waiting: it gets the error
+    ("_apply_session at rested", ["plain"], "told", "decision"),  # read by the session's guards
+]
+SENDS = {"engaged", "rested", "root_closed", "handed", "suspended", "grafts_made", "graft_received"}
+# rows whose failed step lets work it did not gate go on (a graft already started, a focus graft's run,
+# a cancelled graft's join reported by a wake)
+GOES_ON = {"grafts_made", "stash_message at a focus graft", "cancels_only", "cancel_landed", "spawned"}
+ARMED_AT_START = {"decline_why", "clone_why", "_live", "_made_for_withdrawn", "_drop_dead", "may_try",
+                  "graph_allows", "rejected_in_preparation", "arrives_to_answer", "cancels_only", "hands_over",
+                  "starts_running", "own_graft", "is_held", "stash_message", "take_inbox", "note_withdrawn", "enqueue",
+                  "focus_back", "hand_back_join", "_hand_back", "spawned", "no_cancels"}
+
+
+@pytest.mark.parametrize("fault,calls,seen,expect", FAULT_ROWS, ids=[r[0] for r in FAULT_ROWS])
+def test_a_fault_in_a_step_is_recovered_from_and_nothing_it_gated_acts(tmp_path, monkeypatch, fault, calls, seen,
+                                                                     expect):
+    """A guard or effect of the machines that raises (a bug in graft's own code; here a fault
+    injected once) never lets what it gated act, is reported once (or, a guard whose branch was
+    not the one to take, changes nothing), and is recovered from inside the machines: whoever
+    waits on the failed work gets the error once, and no one else does; nothing waits for ever,
+    the session's record is right, the store is valid, and the next `user_says`, `settle` and
+    `close` behave normally."""
+    import graft.machine as machine
+    script = FaultScript()
+    store, h, said = make(tmp_path=tmp_path, policy=script)
+    faults = Faults(h=h, store=store, monkeypatch=monkeypatch)
+    script.faults = faults
+    raised: list[tuple[str, BaseException]] = []  # (which call raised it, the error)
+    outputs: list[tuple[str, list[str]]] = []  # (which call returned them, the lines)
+    name, _, nth = fault.split(" ")[0].partition("#")
+    held = asyncio.Event()  # a message is held by a timeline's machine, behind the run in progress
+    real_stash = machine.stash_message
+
+    def stash_message(ctx, inst, event):
+        held.set()
+        return real_stash(ctx=ctx, inst=inst, event=event)
+    monkeypatch.setattr(machine, "stash_message", stash_message)
+
+    async def call(coro, label="user_says"):
+        try:
+            outputs.append((label, await asyncio.wait_for(coro, WAIT_TIMEOUT)))
+        except Exception as e:  # noqa: BLE001 - the error the fault gave this caller
+            raised.append((label, e))
+
+    async def go():
+        await h.start()
+        if name in SENDS:
+            error = faults.send(name=name, nth=int(nth or 1))
+        elif name == "_apply_session":
+            error = faults.guard(name=name, when=lambda **kw: kw["name"] == "rested")
+        elif name == "s_answer":  # when a settle waits for the answer
+            error = faults.guard(name=name, when=lambda **kw: bool(kw["inst"].settles))
+        else:
+            error = faults.guard(name=name, armed=name in ARMED_AT_START)
+        if fault == "request_live":
+            real = h.begin_request
+
+            def begin_request(**kw):
+                faults.armed.set()
+                return real(**kw)
+            h.begin_request = begin_request
+        script.arm_on |= {"A asks"} if name in ("run_goes_on", "_run_withdrawn") else set()
+        script.arm_on |= {f"graft:{BG}"} if name == "made_for_live" else set()
+        if name == "cancels_only":
+            faults.armed.clear()
+        first, *rest = calls
+        for key in (BG, FOCUS, STAY):
+            script.gate(f"graft:{key}")  # a graft's call waits until the first call is done
+        if first in ("A", "A withdrawn"):
+            script.gate(first)
+        if first == "A withdrawn":
+            task = asyncio.create_task(h.user_says(first))
+            await until(event=script.entered[first], what="A's model call")
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif rest and rest[0].startswith("B"):
+            gated = first if first == "A" else f"graft:{first}"
+            if gated != first:
+                script.gates[gated].clear()
+            task = asyncio.create_task(call(h.user_says(first)))
+            await until(event=script.entered[gated], what="the first model call")
+            if name == "stash_message":
+                await call(h.user_says(rest[0]))  # B's step failed: it raises at once
+                script.open()
+            else:
+                later = asyncio.create_task(call(h.user_says(rest[0])))
+                await asyncio.wait_for(held.wait(), WAIT_TIMEOUT)  # B is held, behind the first call's run
+                assert not task.done() and not later.done(), fault  # the interleaving the row names
+                script.open()
+                await asyncio.wait_for(later, WAIT_TIMEOUT)
+            await asyncio.wait_for(task, WAIT_TIMEOUT)
+        elif rest and rest[0] == STOP:
+            await call(h.user_says(first))  # c1 runs, held at its model call
+            faults.armed.set()
+            await call(h.user_says(STOP))
+        else:
+            if name in ("engaged", "graft_received", "own_graft", "made_for_live", "is_held") \
+                    or first in (FOCUS, STAY):
+                script.open()
+            await call(h.user_says(first))
+        script.open()
+        if "close" in rest:
+            try:
+                await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+            except Exception as e:  # noqa: BLE001
+                raised.append(("close", e))
+        else:
+            for _ in range(2):  # the first settle raises a kept error, once; the second returns
+                before = len(raised)
+                await call(h.settle(), label="settle")
+                if len(raised) == before:
+                    break
+        assert faults.fired, f"{fault}: the injection never fired"
+        if seen == "raises" and fault not in GOES_ON:  # nothing it gated acted: no model call, no commit
+            assert faults.done_so_far() == faults.acts, (fault, faults.acts, faults.done_so_far())
+        graft_calls = [c for c in h.provider.calls if "clone" not in {t["name"] for t in c["tools"]}]
+        if name in ("starts_running", "_made_for_withdrawn"):  # the graft whose start failed never ran
+            assert graft_calls == [], fault
+        if name == "cancel_landed":  # the cancel ran (c1 stopped): its result is the real one, not "not run"
+            (content, is_error), = [(c, e) for n, c, e in tool_results(store=store, tl="o") if n == "cancel"]
+            assert content.startswith("cancelled -> c1") and not is_error, (fault, content)
+        if name == "made_for_live":  # nothing of its response is stored
+            assert len(graft_calls) == 1 and all(r["content"] != "site done" for r in store.view("c1")), fault
+        if "close" not in rest:
+            session = h.machines.session
+            assert (session.engaged, session.grafts) == (set(), set()), (fault, session.state())
+            running = [r[0] for r in store.con.execute(  # settled: no background graft still runs unseen
+                "SELECT timeline_id FROM timelines WHERE status IN ('background', 'queued')")]
+            assert running == [], (fault, running)
+            nxt = await asyncio.wait_for(h.user_says("next"), WAIT_TIMEOUT)
+            assert nxt[-1] == "answer to next", (fault, nxt)
+            assert await asyncio.wait_for(h.settle(), WAIT_TIMEOUT) == []
+            await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+        if expect == "decision":
+            def is_it(e):
+                return isinstance(e, DecisionFault) and f"{_guard_of(name)} held" in str(e)
+            text_of = f"{_guard_of(name)} held"
+        else:
+            def is_it(e):
+                return e is error
+            text_of = str(error)
+        told = [line for line in said_errors(said) if text_of in line]  # every line the user was shown
+        mine = [label for label, e in raised if is_it(e)]
+        assert len(mine) == len(raised), (fault, raised)  # no other error reached a caller
+        in_a_call = any(text_of in line for label, lines in outputs if label == "user_says" for line in lines)
+        if seen == "raises":
+            assert len(mine) == 1 and mine != ["settle"] and not told, (fault, raised, told)
+        elif seen == "settle":  # the settle waiting on the failed step gets the error, and no one else
+            assert mine == ["settle"] and not told, (fault, raised, told)
+        elif seen == "told":  # one line: a user call's output shows it (settle does not raise it), or
+            # it reached no user call's output and settle raises it, once (close raises it never)
+            assert len(told) == 1, (fault, told)
+            assert mine == ([] if in_a_call or "close" in rest else ["settle"]), (fault, raised, outputs)
+        else:
+            assert not raised and said_errors(said) == [], (fault, raised, said_errors(said))
+        if fault == "stash_message":  # A did not depend on B's step: it was answered
+            assert ("user_says", ["answer to A"]) in outputs and mine == ["user_says"], (fault, outputs, raised)
+        if fault == "take_inbox":  # both answered, B once the original had recovered
+            answers = [line for label, lines in outputs if label == "user_says" for line in lines]
+            assert answers.count("answer to A") == answers.count("answer to B after A") == 1, outputs
+        if fault == "stash_message at a focus graft":
+            assert any(lines and lines[-1] in ("answer to FOCUS: build a website.", "site done")
+                       for _, lines in outputs), outputs
+        for tl in [r[0] for r in store.con.execute("SELECT timeline_id FROM timelines")]:
+            assert violations(store=store, tl=tl) == [], (fault, tl)
+        assert store.con.execute("SELECT count(*) FROM transactions WHERE status='open'").fetchone()[0] == 0, fault
+        marks = store.con.execute("SELECT count(*) FROM withdrawals").fetchone()[0]
+        assert marks == (1 if first == "A withdrawn" else 0), (fault, marks)  # only a row the user withdrew
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("fault", [None, "focus_back", "hand_back_join"])
+def test_a_message_goes_to_a_focus_graft_and_back_at_most_once(tmp_path, monkeypatch, fault):
+    """A user message goes from the original to its focus graft at most once, and back at most
+    once: a frozen focus graft passes a message that reached it back to its source, which keeps it
+    and never sends it on again. So no message bounces between the two, with or without a fault
+    in the hand-back before it (one that once left the original suspended under a frozen graft)."""
+    import graft.machine as machine
+    sent = collections.Counter()
+
+    def counting(name):
+        real = getattr(machine, name)
+
+        def wrapper(ctx, inst, event):
+            sent[(name, event.data.text)] += 1
+            assert sent[(name, event.data.text)] <= 1, f"{name} sent {event.data.text!r} again"
+            return real(ctx=ctx, inst=inst, event=event)
+        monkeypatch.setattr(machine, name, wrapper)
+    for name in ("forward_to_focus", "return_to_source"):
+        counting(name)
+    script = FaultScript()
+    script.open()
+    store, h, said = make(tmp_path=tmp_path, policy=script)
+    faults = Faults(h=h, store=store, monkeypatch=monkeypatch)
+    if fault is not None:
+        faults.guard(name=fault)
+    real_apply, failed = h.apply_join, []
+
+    def apply_join(**kw):  # the focus graft's join waits for the next commit point: it stays frozen
+        if not failed:
+            failed.append(kw["join"].child)
+            raise OSError("cannot commit the join yet")
+        return real_apply(**kw)
+    h.apply_join = apply_join
+
+    async def go():
+        await h.start()
+        with contextlib.suppress(Exception):  # the hand-back's fault, if any, is reported its own way
+            await asyncio.wait_for(h.user_says(FOCUS), WAIT_TIMEOUT)
+        assert status(store=store, tl="c1") == "queued"
+        late = h.machines.request("late")  # a message that reached the focus graft after it froze
+        h.machines.post(tl="c1", name="user_message", data=late)
+        assert await asyncio.wait_for(late.reply, WAIT_TIMEOUT) == "ended"
+        assert (await asyncio.wait_for(h.user_says("next"), WAIT_TIMEOUT))[-1] == "answer to next"
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+
+    asyncio.run(go())
+    assert sent[("return_to_source", "late")] == 1 and sent[("forward_to_focus", "late")] == 0, sent
+    assert sent[("forward_to_focus", "next")] == 0, sent  # the conversation came back: no focus graft to send to
+    assert "answer to late" in h.out and (fault is None or faults.fired)
+
+
+def _guard_of(name):
+    """The guard a DecisionFault names for an injected function (a helper names the guard it serves)."""
+    return {"_run_withdrawn": "run_goes_on", "_made_for_withdrawn": "starts_running",
+            "_apply_session": "s_quiet_after"}.get(name, name)
+
+
+def test_one_failure_read_by_every_guard_of_a_message_is_reported_once(tmp_path, monkeypatch):
+    """The function every guard of one message reads raises each time it is read for that message
+    (one bug, many guards): the message's caller raises the error once, nothing else reports or
+    keeps it (`settle` returns), and the next message is answered."""
+    import graft.machine as machine
+    real, error = machine._live, RuntimeError("live check failed")
+
+    def live(inst, request):
+        if request.text == "plain":
             raise error
-        return real(ctx, event)
-    sm.dispatch = dispatch
-    return error
+        return real(inst=inst, request=request)
+    monkeypatch.setattr(machine, "_live", live)
+    store, h, said = make(tmp_path=tmp_path, policy=FaultScript())
+
+    async def go():
+        await h.start()
+        with pytest.raises(RuntimeError) as raised:
+            await asyncio.wait_for(h.user_says("plain"), WAIT_TIMEOUT)
+        assert raised.value is error
+        assert await asyncio.wait_for(h.settle(), WAIT_TIMEOUT) == []
+        assert await asyncio.wait_for(h.user_says("next"), WAIT_TIMEOUT) == ["answer to next"]
+        await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+
+    asyncio.run(go())
+    assert said_errors(said) == []
+
+
+RECURRING = [("rested", "plain"), ("engaged", "plain"), ("take_message", "plain"), ("suspended", STAY), ("root_closed", "plain"),
+             ("engaged", BG), ("_prune", "plain"), ("_prune", STAY), ("_record_of", "plain"), ("_live", "plain"),
+             ("_answer_dead", "plain"), ("_still_running", BG)]
+
+
+@pytest.mark.parametrize("name,first", RECURRING, ids=[f"{n} {f.split(':')[0]}" for n, f in RECURRING])
+def test_a_fault_that_recurs_every_time_never_hangs_the_harness(tmp_path, monkeypatch, name, first):
+    """A bug that raises every time (a session send, or a function the machines call) is recovered
+    from a bounded number of times, and a fault while a fault is handled is never one of its own:
+    every call returns or raises, none waits for ever, and `close` returns."""
+    import graft.machine as machine
+    script = FaultScript()
+    script.open()
+    store, h, said = make(tmp_path=tmp_path, policy=script)
+
+    async def go():
+        await h.start()
+        if name in SENDS:
+            real = h.machines.session.dispatch
+
+            def dispatch(ctx, event):
+                if event.name == name:
+                    raise RuntimeError(f"cannot send {name}")
+                return real(ctx, event)
+            h.machines.session.dispatch = dispatch
+        else:
+            def raising(*args, **kw):
+                raise RuntimeError(f"{name} raised")
+            monkeypatch.setattr(machine, name, raising)
+        for call in (lambda: h.user_says(first), h.settle, lambda: h.user_says("next"), h.settle, h.close):
+            with contextlib.suppress(RuntimeError, ExceptionGroup, TransitionRefused):
+                await asyncio.wait_for(call(), WAIT_TIMEOUT)  # a TimeoutError here is a hang
+
+    asyncio.run(go())
+
+
+def test_a_withdrawal_whose_guard_raises_while_a_clone_call_is_prepared_ends_the_run_and_rolls_it_back(
+        tmp_path, monkeypatch):
+    """The user's call is cancelled while its clone call is being prepared (the seeder waits), and
+    the guard that decides whether the withdrawal ends the run raises once. The decision has its
+    own safe branch in `preparing` (it never falls through to `busy`'s): the withdrawal is recorded,
+    the raise is reported (a DecisionFault naming the guard, raised by settle), and the recovery
+    ends the run and rolls the call's audit back."""
+    import graft.machine as machine
+    from graft import seeder as seeding
+
+    class Waiting:
+        name = "waiting"
+        entered: asyncio.Future | None = None
+
+        async def score(self, purpose, cands, trigger):
+            self.entered.set_result(None)
+            await asyncio.get_running_loop().create_future()
+            return seeding.SeedDecision()
+
+    def policy(system, messages, tools):
+        if "clone" in {t["name"] for t in tools}:
+            return [clone_use(clone_entry(skills=["website"], focus=False)) | {"type": "tool_use"}]
+        return text("hi")
+
+    waiting = Waiting()
+    store = Store(str(tmp_path / "w.db"))
+    install(store)
+    h = Harness(store=store, provider=FakeProvider(policy), seeder=waiting)
+    real, raised = machine.ends_run, []
+    once = True  # the guard raises the first time it is read
+
+    def ends_run(ctx, inst, event):
+        if not raised:
+            raised.append(once)
+            raise RuntimeError("the guard raised")
+        return real(ctx=ctx, inst=inst, event=event)
+
+    async def go():
+        await h.start()
+        waiting.entered = asyncio.get_running_loop().create_future()
+        call = asyncio.create_task(h.user_says(REQUEST))
+        await asyncio.wait_for(waiting.entered, WAIT_TIMEOUT)  # the clone call is being prepared
+        monkeypatch.setattr(machine, "ends_run", ends_run)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        with pytest.raises(DecisionFault, match="ends_run held"):
+            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        monkeypatch.setattr(machine, "ends_run", real)
+        await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+
+    asyncio.run(go())
+    assert raised == [True]
+    assert [tuple(r) for r in store.con.execute("SELECT kind, status FROM transactions")] == [("clone", "rolled_back")]

@@ -133,6 +133,9 @@ class Host:
     def join_of(self, tl, reason):
         return QueuedJoin(child=tl, reason=reason, trigger=None)
 
+    def recover(self, tl, known, close_calls, viewers, rows, cancels):
+        self.record("recover", tl, dict(known), close_calls, list(rows))
+
     def trace(self, text):
         pass
 
@@ -722,6 +725,112 @@ def test_a_withdrawal_mark_that_cannot_be_written_is_written_before_the_view_is_
         host.end("o")
         assert await asyncio.wait_for(second, GUARD) == "ended"
         assert len([r for r in host.reports if r[2] == "cannot mark"]) == 1  # the run's failure is its caller's
+        await m.stop()
+    run(go)
+
+
+def _session_sends_fail(m, names):
+    """Fault injection: each event named is raised once when the session is sent it (in order)."""
+    real, left = m.session.dispatch, list(names)
+    errors = {name: RuntimeError(f"cannot send {name}") for name in names}
+
+    def dispatch(ctx, event):
+        if left and event.name == left[0]:
+            raise errors[left.pop(HEAD)]
+        return real(ctx, event)
+    m.session.dispatch = dispatch
+    return errors, left
+
+
+
+def test_a_fault_in_the_recovery_s_own_step_is_folded_into_it():
+    """The original's `rested` send fails (a fault), and so does the first record its recovery
+    sends: the recovery is entered again, closes out, and the two errors are told together, once;
+    settle raises them, and the next message is answered."""
+    async def go():
+        host, m = await started()
+        errors, left = _session_sends_fail(m=m, names=["rested", "resync"])
+        reply = await say(m=m, text="hi")
+        host.end("o")
+        assert await asyncio.wait_for(reply, GUARD) == "ended"  # answered before the send failed
+        assert await at_rest(m) == "ended" and left == []
+        assert len(host.logged("recover", "o")) == 1
+        with pytest.raises(ExceptionGroup) as kept:
+            await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
+        assert list(kept.value.exceptions) == [errors["rested"], errors["resync"]]
+        assert await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD) is None
+        nxt = await say(m=m, text="two")
+        host.end("o")
+        assert await asyncio.wait_for(nxt, GUARD) == "ended"
+        await m.stop()
+    run(go)
+
+
+def test_a_message_whose_step_fails_while_a_clone_call_starts_its_grafts_fails_alone(monkeypatch):
+    """A message arrives while the original starts a clone call's graft, and the step that takes
+    it fails (keeping it behind the run raises): only that call took part in the step, so only its
+    caller gets the error, at once. The clone call goes on (the graft starts and runs), the turn
+    is answered normally, and the session's record holds the graft."""
+    import graft.machine as machine_module
+    real, error = machine_module.stash_message, RuntimeError("cannot keep the message")
+
+    def stash_message(ctx, inst, event):
+        monkeypatch.setattr(machine_module, "stash_message", real)  # once
+        raise error
+
+    async def go():
+        host, m = await started()
+        first = await say(m=m, text="go")
+        starting, release = _held_start_of(monkeypatch=monkeypatch, child="c1")
+        asking = asyncio.ensure_future(clone(m=m, pairs=[("c1", False)]))
+        await asyncio.wait_for(starting, GUARD)
+        monkeypatch.setattr(machine_module, "stash_message", stash_message)
+        second = await say(m=m, text="two")
+        with pytest.raises(RuntimeError, match="cannot keep the message"):
+            await asyncio.wait_for(second, GUARD)
+        ran = host.next("run", "c1")
+        release.set_result(None)
+        assert (await asyncio.wait_for(asking, GUARD))[0] == ["c1"]
+        await asyncio.wait_for(ran, GUARD)
+        assert m.session.grafts == {"c1"} and host.logged("recover") == []
+        host.end("o")
+        assert await asyncio.wait_for(first, GUARD) == "ended"
+        woken = host.next("run", "o")
+        host.end("c1")
+        await asyncio.wait_for(woken, GUARD)  # its join is applied, and the original reports it
+        host.end("o")
+        await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
+        await m.stop()
+    run(go)
+
+
+def test_a_fault_after_a_focus_graft_hands_its_request_back_fails_that_call(monkeypatch):
+    """A focus graft joins without answering (`out_of_scope`): the request is the original's to
+    answer, by a routing run. The guard of that branch raises once: it does not hold (a guard
+    writes nothing), the decision's safe branch finds it held and reports the broken decision, and
+    the user's call gets that error, never "ended" with nothing answered."""
+    import graft.machine as machine_module
+    real, armed = machine_module._routing, []
+
+    def raising(*args, **kw):
+        if armed:
+            armed.clear()
+            raise RuntimeError("guard bug")
+        return real(*args, **kw)
+    monkeypatch.setattr(machine_module, "_routing", raising)
+
+    async def go():
+        host, m = await started()
+        reply = await say(m=m, text="go")
+        await clone(m=m, pairs=[("c1", True)])
+        applied = host.next("apply", "c1")
+        armed.append("armed")  # the guard's next read raises
+        host.end(tl="c1", result=RunOutcome(kind="join", reason="out_of_scope"))
+        await asyncio.wait_for(applied, GUARD)
+        with pytest.raises(machine_module.DecisionFault, match="wakes_to_route held"):
+            await asyncio.wait_for(reply, GUARD)
+        assert host.logged("note") == [] and host.logged("run", "o") == [("run", "o", "turn")]
+        assert await at_rest(m) == "ended"
         await m.stop()
     run(go)
 
@@ -1823,6 +1932,146 @@ def test_a_call_refused_in_its_preparation_gets_the_harness_refusal_whatever_ord
     run(go)
 
 
+# ------------------------------------------------------------------ a behavior's events: one, or its fault
+def _counting(sm, names, seen=None):
+    """Record every event sent to sm's machine whose name is in `names` (into `seen`, if given)."""
+    real, seen = sm.dispatch, ([] if seen is None else seen)
+
+    def dispatch(ctx, event):
+        if event.name in names:
+            seen.append(event.name)
+        return real(ctx, event)
+    sm.dispatch = dispatch
+    return seen
+
+
+@pytest.mark.parametrize("how", ["sends, then raises", "sends twice"])
+def test_a_behavior_that_fails_sends_nothing_but_its_one_fault(monkeypatch, how):
+    """An effect's sends are made when it returns. One that raises after its send, or that sends
+    twice, sends none of them: its one event is the fault (BH-06), and the machine recovers."""
+    import graft.machine as machine_module
+    real, armed = machine_module.come_to_rest, [True]
+
+    def come_to_rest(ctx, inst, event):
+        if not armed:
+            return real(ctx=ctx, inst=inst, event=event)
+        armed.clear()
+        machine_module._session(inst=inst, name="rested", data=(inst.timeline_id, []))
+        if how == "sends, then raises":
+            raise RuntimeError("after the send")
+        machine_module._session(inst=inst, name="rested", data=(inst.timeline_id, []))
+
+    async def go():
+        host, m = await started()
+        reply = await say(m=m, text="hi")
+        seen = _counting(sm=m.session, names={"rested"})
+        _counting(sm=m.timelines["o"], names={machine_module.FAULT, machine_module.CALL_FAULT}, seen=seen)
+        monkeypatch.setattr(machine_module, "come_to_rest", come_to_rest)
+        host.end("o")
+        await asyncio.wait_for(host.next("recover", "o"), GUARD)
+        # the failed step's event is its fault alone; the one `rested` is the recovery's, at rest
+        assert seen == [machine_module.FAULT, "rested"], seen
+        assert await asyncio.wait_for(reply, GUARD) == "ended"
+        await m.stop()
+    run(go)
+
+
+def test_no_generated_behavior_shadows_a_rule_of_the_module():
+    """Guards and behaviors are read through the module by name when they run (`_rule`): a
+    generated one (a closure) must not share its name with another definition there."""
+    import graft.machine as machine_module
+    for model in (machine_module.TIMELINE, machine_module.BACKGROUND, machine_module.SCRIBE, machine_module.SESSION):
+        for element in model.members.values():
+            run_ = getattr(element, "operation", None) or getattr(element, "expression", None)
+            inner = getattr(run_, "__wrapped__", None)
+            if inner is not None:
+                found = vars(machine_module).get(inner.__name__)
+                assert found is None or found is inner, inner.__name__
+
+
+def test_a_raising_guard_of_a_join_from_a_graft_it_does_not_hold_is_reported_and_drops_it(monkeypatch):
+    """A join from a graft the original does not hold (one of a clone call undone at its start)
+    reaches it while the guard that tells it so raises: no branch holds, the safe branch keeps the
+    join and reports the broken decision, and the recovery drops it (it is not one of its own)."""
+    import graft.machine as machine_module
+    real, armed = machine_module.foreign_graft, [True]
+
+    def raising(**kw):
+        if armed:
+            armed.clear()
+            raise RuntimeError("guard bug")
+        return real(**kw)
+    monkeypatch.setattr(machine_module, "foreign_graft", raising)
+
+    async def go():
+        host, m = await started()
+        told = host.next("report", "machine")
+        await m.send(tl="o", name="graft_queued", data=QueuedJoin(child="cX", reason="done", trigger=None))
+        assert "foreign_graft held" in (await asyncio.wait_for(told, GUARD))[3]
+        assert host.logged("apply") == [] and await at_rest(m) == "ended"
+        await m.stop()
+    run(go)
+
+
+def test_a_raising_guard_of_a_held_graft_s_start_stops_it_and_reports(monkeypatch):
+    """A background graft made in a turn its caller drives starts `held`. If that guard raises it
+    does not hold: the safe branch stops the graft (it never runs, and joins failed) and reports
+    the broken decision."""
+    import graft.machine as machine_module
+    real, armed = machine_module.is_held, [True]
+
+    def raising(**kw):
+        if armed:
+            armed.clear()
+            raise RuntimeError("guard bug")
+        return real(**kw)
+    monkeypatch.setattr(machine_module, "is_held", raising)
+
+    async def go():
+        host, m = await started()
+        await m.ask(tl="o", name="turn_request", build=lambda r: (Mode(name="external"), r))
+        told = host.next("report", "task")
+        await clone(m=m, pairs=[("c1", False)])
+        assert "is_held held" in (await asyncio.wait_for(told, GUARD))[3]
+        assert host.logged("run", "c1") == [] and ("reason", "c1", "failed") in host.log
+        await m.stop()
+    run(go)
+
+
+def test_a_raising_recovery_guard_is_reported_and_its_fault_handled_again(monkeypatch):
+    """The guard that lets a timeline recover raises (in the step that handles a fault): it does
+    not hold, so the timeline gives up, and the safe branch reports the decision the raise changed
+    (a DecisionFault, part of the fault it handles); the fault is handled again, and recovered
+    from. Both are told together, once, and the timeline goes on."""
+    import graft.machine as machine_module
+    real, armed = machine_module.may_recover, [True]
+
+    def raising(**kw):
+        if armed:
+            armed.clear()
+            raise RuntimeError("guard bug")
+        return real(**kw)
+    monkeypatch.setattr(machine_module, "may_recover", raising)
+
+    async def go():
+        host, m = await started()
+        errors, _ = _session_sends_fail(m=m, names=["rested"])
+        reply = await say(m=m, text="hi")
+        host.end("o")
+        assert await asyncio.wait_for(reply, GUARD) == "ended"
+        with pytest.raises(ExceptionGroup) as kept:
+            await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
+        rested, decision = kept.value.exceptions
+        assert rested is errors["rested"] and isinstance(decision, machine_module.DecisionFault)
+        assert "may_recover held" in str(decision)
+        assert len(host.logged("recover", "o")) == 1  # handled again: closed out once
+        nxt = await say(m=m, text="two")
+        host.end("o")
+        assert await asyncio.wait_for(nxt, GUARD) == "ended"
+        await m.stop()
+    run(go)
+
+
 def _mark_fails_once(host):
     real, failed = host.mark_withdrawn, []
 
@@ -1873,13 +2122,88 @@ def test_a_row_a_focus_graft_could_not_mark_is_marked_before_its_join_is_copied(
     run(go)
 
 
-# ---------------------------------------------------------------- the activities
+# ---------------------------------------------------------------- the graphs' shape
+def _cell(fn, name):
+    for free, cell in zip(fn.__code__.co_freevars, fn.__closure__ or ()):
+        if free == name:
+            return cell.cell_contents
+    return None
+
+
+def _guard_name(model, guard):
+    expression = model.members[guard].expression
+    return (getattr(expression, "__wrapped__", None) or _cell(fn=expression, name="expression") or expression).__name__
+
+
+def _behavior(model, effect):
+    operation = getattr(model.members[effect], "operation", None)
+    return (_cell(fn=operation, name="behavior") or operation) if operation is not None else None
+
+
+def test_every_decision_has_one_safe_branch_that_re_checks_exactly_its_guards():
+    """In all four graphs, every choice and every group of one event's transitions from one state
+    that has a guarded branch has exactly one unguarded branch at the same level, whose effect
+    re-checks exactly the guards of that decision (`checked`). So a guard that raises never lets
+    the decision fall through to an ancestor's transitions, and the decision it changed is
+    reported."""
+    import collections
+    import hsm
+    import graft.machine as machine_module
+    problems = []
+    for name in ("TIMELINE", "BACKGROUND", "SESSION", "SCRIBE"):
+        model = getattr(machine_module, name)
+        groups = collections.defaultdict(list)
+        for element in model.members.values():
+            if isinstance(element, hsm.hsm.TransitionElement):
+                groups[(element.source, tuple(sorted(element.events)))].append(element)
+        for (source, events), transitions in sorted(groups.items()):
+            guards = {_guard_name(model=model, guard=t.guard) for t in transitions if t.guard}
+            if not guards:
+                continue
+            defaults = [t for t in transitions if not t.guard]
+            if len(defaults) != 1:
+                problems.append(f"{name} {source} {events}: {len(defaults)} unguarded branches for {sorted(guards)}")
+                continue
+            behaviors = [_behavior(model=model, effect=e) for e in defaults[0].effect]
+            rechecked = [{g.__name__ for g in _cell(fn=b, name="guarded")} for b in behaviors
+                         if b is not None and b.__name__.startswith("checked_")]
+            if set().union(*rechecked) != guards:
+                problems.append(f"{name} {source} {events}: guards {sorted(guards)}, re-checked "
+                                f"{sorted(set().union(*rechecked))}")
+    assert problems == []
+
+
 def _reads(function_name):
     import ast
     import inspect
     import graft.machine as machine_module
     tree = ast.parse(inspect.getsource(getattr(machine_module, function_name)).lstrip())
     return tree.body[0]
+
+
+def test_no_behavior_or_activity_decides_by_whether_its_step_failed():
+    """Whether the step in progress has failed is read only by the plumbing (guards, the safe
+    branch's re-check, the step's sends, the activities' hold-back) and by the guards that let a
+    decision tell a failed step apart (`step_intact`); the safe branch a failed step takes names
+    its error (`_pending`). No effect, entry, exit or activity reads the pending fault to choose
+    what is sent, answered or done next."""
+    import ast
+    import inspect
+    import graft.machine as machine_module
+    allowed = {"_failed", "_held_back", "_take_fault", "_pending", "_keep_fault", "_signal", "_handling_failed",
+               "_guard", "_holds", "_step", "Activity", "io", "step_intact", "decline_failed_step",
+               "spawn_not_started"}
+    readers = []
+    for name, function in vars(machine_module).items():
+        if not inspect.isfunction(function) or function.__module__ != machine_module.__name__ or name in allowed:
+            continue
+        for node in ast.walk(_reads(name)):
+            reads_fault = isinstance(node, ast.Attribute) and node.attr == "fault" and isinstance(node.ctx, ast.Load)
+            calls = isinstance(node, ast.Name) and node.id in ("_failed", "_pending", "_held_back")
+            if reads_fault or calls:
+                readers.append(name)
+                break
+    assert readers == []
 
 
 def test_no_activity_reads_its_machine_s_data_after_it_first_awaits():

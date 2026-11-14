@@ -272,6 +272,13 @@ class CloneBatch:
     retry_left: bool
 
 
+def _described(error: BaseException) -> str:
+    """An error as one line tells it: its type and text, and each error of a group, in order."""
+    if isinstance(error, BaseExceptionGroup):
+        return f"{type(error).__name__}: {error.message}: " + "; ".join(_described(e) for e in error.exceptions)
+    return f"{type(error).__name__}: {error}"
+
+
 class Harness:
     def __init__(self, store: Store, provider: Provider, world: World | None = None,
                  trace: Callable[[str], None] | None = None, max_steps: int = 10,
@@ -370,7 +377,7 @@ class Harness:
         through `emit`). The errors `settle` raises are the session machine's; this is the line
         the user sees at once, and the record kept for the experiments. `background`: the clones
         are all background grafts (the machine says so: it made them)."""
-        err = f"{type(error).__name__}: {error}"
+        err = _described(error)
         record = (src, clones, err)
         names = self._names(clones=clones, background=background)
         if kind == "wake":
@@ -429,19 +436,23 @@ class Harness:
         a cancel, wherever the request is in its lifecycle, cancels that reply at once and the
         caller withdraws the request by id. The machine then never starts a run, writes a row or
         lets a graft act for it; a run already answering it is ended by its machine before
-        its next step, and a row already written for it is marked withdrawn. If writing its
-        row or the run answering it fails, the machine answers the reply with that error, raised
-        here."""
+        its next step, and a row already written for it is marked withdrawn. If a step the
+        message sets off fails, the machine answers the reply with that error, raised here."""
         root = self.machines.root
         request = self.machines.request(text)
-        self.machines.post(tl=root, name="user_message", data=request)
+        self.machines.post(tl="session", name="call_began", data=request.id)
         try:
-            await request.reply
-        except asyncio.CancelledError:  # the reply it awaited is cancelled with it
-            with contextlib.suppress(TransitionRefused):  # closed meanwhile: nothing left to withdraw from
-                self.machines.post(tl=root, name="withdraw", data=request.id)
-            raise
-        return self._take()
+            self.machines.post(tl=root, name="user_message", data=request)
+            try:
+                await request.reply
+            except asyncio.CancelledError:  # the reply it awaited is cancelled with it
+                with contextlib.suppress(TransitionRefused):  # closed meanwhile: nothing left to withdraw from
+                    self.machines.post(tl=root, name="withdraw", data=request.id)
+                raise
+            return self._take()
+        finally:  # a failure told while this call was in flight is this call's: settle does not raise it
+            with contextlib.suppress(TransitionRefused):  # closed meanwhile: nothing is kept any more
+                self.machines.post(tl="session", name="call_done", data=request.id)
 
     async def settle(self) -> list[str]:
         """Wait until nothing is in flight: no background graft running, no join waiting that can
@@ -574,6 +585,25 @@ class Harness:
         for g in grafts:
             self.store.set_status(tl=g, status="abandoned")
         self.trace(f"[{src}] clone undone: {grafts} abandoned")
+
+    def recover(self, tl: str, known: dict[str, tuple[str, bool]], close_calls: bool, viewers: list[str],
+                rows: list[int], cancels: list[tuple[CancelCall, dict[str, str]]]) -> None:
+        """What a step of tl's machine that failed left open is closed out (the activity of its
+        `recovering` state): a clone call's open audit transactions are rolled back, the run's
+        open tool calls get results (`known`: the real results of calls that ran; `cancels`: the
+        cancel calls of a step cut short after they stopped grafts, each with what became of its
+        ids, whose real result is written; every other call was not executed; `close_calls` False
+        for a turn its caller drives, whose calls are its own), and the rows of withdrawn requests
+        still to be marked are marked in the views of `viewers`."""
+        txs = self.store.open_txs(tl=tl, kind="clone")
+        if txs:
+            self._roll_back(src=tl, txs=txs, scratch={"error": "a step of the machine failed while the call was open"})
+            self.trace(f"[{tl}] clone not executed: a step of the machine failed")
+        if close_calls:
+            ran = {call.use["id"]: self.cancel_text(call=call, outcomes=outcomes) for call, outcomes in cancels}
+            self._close_tool_uses(tl=tl, known=ran | known)
+        if rows:
+            self.mark_withdrawn(timelines=viewers, rows=rows)
 
     def join_of(self, tl: str, reason: str) -> QueuedJoin:
         return QueuedJoin(child=tl, reason=reason, trigger=self.compute_trigger(child=tl, reason=reason))
@@ -935,7 +965,7 @@ class Harness:
 
     async def _cancels(self, tl: str, uses: list[dict]) -> None:
         cancel = self._cancel_request(tl=tl, uses=uses)
-        await self.machines.send(tl=tl, name="cancel_request", data=cancel)
+        self.machines.post(tl=tl, name="cancel_request", data=cancel)  # the run's only await is the reply
         await self._settle_cancel(tl=tl, uses=uses, reply=cancel.reply)
 
     async def _settle_cancel(self, tl: str, uses: list[dict], reply: asyncio.Future) -> None:
