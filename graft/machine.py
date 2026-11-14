@@ -13,32 +13,52 @@ Three rules hold everywhere in this module.
   ends by dispatching its outcome as an event; if it raises, the library dispatches `hsm/error`,
   and a transition of that state handles it. So a failed write can never leave a machine stuck:
   the state that does the write is left by its outcome event or by its error event, and both are
-  transitions. Fire-and-forget writes (the store copy of each state, report lines, trace) go to
-  the scribe machine, which does them one at a time in its `writing` state.
+  transitions. Fire-and-forget writes (the store copy of each state, report
+  lines, trace) go to the scribe machine, which does them one at a time in its `writing` state.
 * Machines talk only by events. A caller outside the machines (`user_says`, `settle`, `close`, a
   clone or cancel call made by a model loop) gets its answer from a future carried in the event's
-  data, which an effect resolves. Nothing outside reads a machine's data: what the host needs to
-  know (a timeline's kind, the grafts still running, whether clones are background grafts) is
-  passed, by keyword, on the host call an activity makes.
+  data, which an effect resolves.
+* A user's call is a Request (id, text, reply) the original's machine owns from arrival until it
+  is answered or withdrawn, wherever it is (inbox, `requesting`, the request a run answers, the
+  waiters, handed to a focus graft with the conversation). `withdraw` (by id) is handled in every
+  state: recorded while the request is held (the record is pruned as requests leave), a waiting
+  message dropped and answered (one shared response, which the session hears of in the event
+  the step sends anyway), forwarded to a focus graft (also one made in `cloning`, once its machine is started), and a
+  run whose request is withdrawn ends (`_run_withdrawn`, the one rule). Every point that would
+  start a run or let a graft act is guarded on its request being live (not withdrawn, reply not
+  done): `requesting` -> busy, the next inbox message, the wake / hand-back / routing runs,
+  `noting` -> busy, the clone gate, a focus graft's start. Whether a run
+  may go on is decided here too: the run asks (`may_continue`, a reply in the event) before every
+  step that could act, and is answered while the request it answers, if any, is live; once it is
+  withdrawn, `busy` is left the way a withdrawal leaves it, which ends the run where it waits.
+  Nothing outside reads a machine's data: what the host needs to know (a
+  timeline's kind, the grafts still running, whether clones are background grafts) is passed, by
+  keyword, on the host call an activity makes.
 
-A timeline that can hold the conversation (the original; a focus graft, which starts in `busy`):
+A timeline that can hold the conversation (the original; a focus graft, which starts in `busy`
+unless the request it answers was withdrawn before it could act: then at rest):
 
     live
       idle            at rest: holds the conversation, nothing in flight, nothing queued
       engaged
-        requesting    writing a user message's row (activity); then busy
-        busy          running, in one of four modes (turn, route, report, external)
+        requesting    writing a user message's row (activity); then busy if it is still live, else
+                      rest
+        busy          running, in one of four modes (turn, route, report, external); `may_continue`
+                      is answered while the request the run answers, if any, is live, else busy is
+                      left for `closing_calls`
           run         a run of the model loop: its activity
           driven      a turn its caller drives (tests, replay): no activity
             running
             clone_gate  (choice) may the clone call be tried at all; decided before seeding
-            preparing   the harness seeds and validates the call (activity; an interrupt ends it)
-            prepared_gate, clone_choice, handed, cancels_done   choices (cancels whose rows
-                        failed end the run with that error: a clone call with them is not run)
+            preparing   the harness seeds and validates the call (activity; leaving the run ends it)
+            prepared_gate, clone_choice, handed, cancels_done, resume   choices (cancels whose rows
+                        failed end the run with that error: a clone call with them is not run; a
+                        run whose request was withdrawn during a step ends after it)
             leaving the run (exit) answers any clone or cancel request it still holds
             steps       one clone or cancel request (shutdown and a driven end wait):
               cloning: rejecting, or committing / spawning / recording, or refusing (unspawning
-                        first if a machine could not start)   a clone call, step by step; a call
+                        first if a machine could not start)   a clone call, step by step (a
+                        withdrawal waits while `spawning` starts the grafts' machines); a call
                         that hands over writes the run's open calls and kept rows (`flushing`,
                         then the choice `handed`) before the original is suspended
               cancels: checking / waiting / writing / reporting   cancel calls, id by id; then
@@ -53,9 +73,11 @@ A timeline that can hold the conversation (the original; a focus graft, which st
           applying      one join (activity); a failure is kept for the next commit point, or,
                         on its last attempt, `giving_up` -> `abandoning` (choices) tell the user
                         and abandon it
-        noting        writing a wake note (activity); then busy (`unnoted`, a choice, if it failed)
+        noting        writing a wake note (activity); then busy, or rest if the request the
+                      wake would answer was withdrawn (`unnoted`, a choice, if it failed)
         rest, after   choices: what follows a run, and what follows the joins
       receiving, shutting   choices: a graft's join that wakes it; closing the original
+      passing         (choice) a hand-over: the waiting messages go to the focus graft first
       cloned          suspended while its focus graft holds the conversation
       releasing       closed while suspended: its focus graft is shut down first
     queued, joined, abandoned, closed
@@ -66,11 +88,11 @@ A background graft: `background` (its run, or `held` when a caller drives the tu
 calls and its join reason; then each failure told, one per step, in `reporting`) --> `queued`
 --join commit | rollback--> `joined`, --join abandon--> `abandoned`.
 
-The session machine knows whether anything is in flight (the original engaged, a background graft
-whose join has not reached it) and answers `settle` when nothing is; `close` is `shutdown`. It
-keeps the errors `settle` raises, each once, unless a user's call was waiting when it happened.
-At the end of `close` it stops every machine (`stopping`); one that cannot be stopped is reported
-(`telling`) and raised by `close`, and the rest are still stopped.
+The session machine knows whether anything is in flight (the original or a running focus graft
+engaged, a background graft whose join has not reached it) and answers `settle` when nothing is;
+`close` is `shutdown`. It keeps the errors `settle` raises, each once, unless a user's call was
+waiting when it happened. At the end of `close` it stops every machine (`stopping`); one that
+cannot be stopped is reported (`telling`) and raised by `close`, and the rest are still stopped.
 
 Rules the graph enforces. Only the original clones, only in a turn or routing wake, never while
 closing, at most CLONE_TRIES clone calls per run (one, and one retry; a committed call is the
@@ -144,7 +166,8 @@ TURN = Mode(name="turn", user=True)
 class RunOutcome(NamedTuple):
     """How a run of the model loop ended, as its activity reports it; each graph routes it.
     `kind`: replied (a reply with no tool call), empty (a response with nothing in it), join (the
-    model called join, with `reason`), exhausted (the step budget ran out)."""
+    model called join, with `reason`), exhausted (the step budget ran out). A run whose request
+    is withdrawn does not report an outcome: its machine leaves the run's state, which ends it."""
     kind: str
     reason: str | None = None
 
@@ -157,13 +180,36 @@ class Prepared(NamedTuple):
     data: Any
 
 
+@dataclass(eq=False)
+class Request:
+    """One user's call (`user_says`): its id, its text, and the future that carries its answer.
+    The original's machine holds it from arrival until it is answered or withdrawn, wherever it
+    is (the inbox, the row being written, the run answering it, the waiters, a focus graft it was
+    handed to). The caller withdraws it by id (`withdraw`); a request is live while it is not
+    withdrawn and its reply is not done."""
+    id: int
+    text: str
+    reply: asyncio.Future
+
+
+class GraftPlan(NamedTuple):
+    """A graft of a committed clone call, to be made in `spawning`: a focus graft is made with
+    the user's calls waiting on the run and the request it answers (`answering`)."""
+    child: str
+    focus: bool
+    waiters: list["Waiter"]
+    answering: "Request | None"
+
+
 @dataclass
 class Waiter:
     """A caller waiting for a timeline to come to rest: a user's call (it follows the
-    conversation) or a run started by `run` (answered with how the run ended)."""
+    conversation; `request` is that call) or a run started by `run` (answered with how the run
+    ended)."""
     reply: asyncio.Future
     user: bool
     error: BaseException | None = None
+    request: Request | None = None
 
 
 @dataclass
@@ -229,7 +275,8 @@ class Host(Protocol):
 class TimelineSM(hsm.Instance):
     def __init__(self, machines: "Machines", timeline_id: str, source_id: str | None, kind: str,
                  held: bool = False, waiters: list[Waiter] | None = None,
-                 current: asyncio.Future | None = None):
+                 answering: Request | None = None,
+                 withdrawn: set[int] | None = None):
         super().__init__()
         self.machines = machines
         self.host = machines.host
@@ -243,12 +290,17 @@ class TimelineSM(hsm.Instance):
         self.made: dict[str, bool] = {}  # every graft it made -> focus (kept after its join)
         self.cloned_for: dict[str, int | None] = {}  # graft -> the request it was made for
         self.mode = TURN  # the mode of its current or next run
-        self.inbox: list[tuple[str, asyncio.Future]] = []  # user messages not yet begun
-        self.request: tuple[str, asyncio.Future | None] | None = None  # the message being written
-        self.request_row: int | None = None  # its current request's row
+        self.inbox: list[Request] = []  # user messages not yet begun, in arrival order
+        self.request: Request | None = None  # the message whose row is being written
         self.waiters: list[Waiter] = list(waiters or [])
         self.watchers: list[asyncio.Future] = []  # background: callers waiting for its join event
-        self.current = current  # the reply of the user request this run answers (a focus graft: its source's)
+        # The user request its current or next run answers (a focus graft: its source's), kept
+        # through the joins and the wake that follow a turn, until it is at rest. A run answers at
+        # most one: its turn's message, the one its source answered when it was made, or the one
+        # a focus graft handed back.
+        self.answering: Request | None = answering
+        # Ids of withdrawn requests it holds: pruned as requests leave it.
+        self.withdrawn: set[int] = set(withdrawn or ())
         self.focus: str | None = None
         self.closing = False  # nothing is woken from now on
         self.final = False  # shut down: once nothing is left to apply, close
@@ -258,7 +310,7 @@ class TimelineSM(hsm.Instance):
         self.ends_on_request = False  # the last join applied left a handed-back message last
         self.clone: Clone | None = None  # the clone call being carried out
         self.clone_text = ""
-        self.spawn_plan: list[tuple[str, bool, list[Waiter], asyncio.Future | None]] = []
+        self.spawn_plan: list[GraftPlan] = []
         self.rejection = ""  # the result text of a clone call refused before or in its preparation
         self.handing: Clone | None = None  # a clone call that hands the conversation over, being finished
         self.ended = ""  # the final state it reached: joined | abandoned | active (closed)
@@ -278,7 +330,6 @@ class TimelineSM(hsm.Instance):
         self.close_first = False  # background: its run ended early (its open calls need results)
         self.forced: asyncio.Future | None = None
         self.claims_next: list[tuple[int, str]] = []
-        self.interrupted = False  # the run's caller went away while its cancels were carried out
         self.clone_tries = 0  # clone calls tried in the current run (see CLONE_TRIES)
         self.spawned_ids: list[str] = []  # grafts of a clone call whose machines must be undone
         self.spawn_error: BaseException | None = None
@@ -407,6 +458,8 @@ def decline_why(inst: TimelineSM, clone: Clone) -> str | None:
     """Why the whole call is not tried at all, or None: decided before anything is seeded."""
     if inst.closing:
         return "the harness is closing; answer the user instead"
+    if _run_withdrawn(inst):
+        return "the user's call this turn answers was withdrawn"
     if inst.source_id is not None:
         return "only the original clones (grafts are one level deep)"
     if inst.clone_tries >= CLONE_TRIES:
@@ -456,6 +509,31 @@ def cancel_refusal(inst: TimelineSM, child: str) -> str:
     return "it has already finished or was already cancelled; nothing to cancel"
 
 
+def _live(inst: TimelineSM, request: Request) -> bool:
+    """Not withdrawn (by this machine's record) and not answered or given up by its caller: a
+    caller that went away cancels its reply before its withdrawal reaches the machine."""
+    return request.id not in inst.withdrawn and not request.reply.done()
+
+
+def _run_withdrawn(inst: TimelineSM, withdrawing: int | None = None) -> bool:
+    """The one rule for ending a run on a withdrawal: the run answers a user request, and that
+    request is not live (or is the one being withdrawn now, `withdrawing`)."""
+    request = inst.answering
+    return request is not None and (request.id == withdrawing or not _live(inst=inst, request=request))
+
+
+def _held(inst: TimelineSM) -> list[Request]:
+    """Every request this machine holds: waiting, being written, answered by its run, waiting at rest."""
+    held = list(inst.inbox) + [w.request for w in inst.waiters if w.request is not None]
+    return held + [r for r in (inst.answering, inst.request) if r is not None]
+
+
+def _prune(inst: TimelineSM) -> None:
+    """The withdrawal record keeps only ids of requests it still holds: it is bounded by them."""
+    kept = {r.id for r in _held(inst)}
+    inst.withdrawn &= kept
+
+
 # ------------------------------------------------------------------ guards
 def has_queue(ctx, inst, event) -> bool:
     return bool(inst.queue)
@@ -473,19 +551,67 @@ def not_external(ctx, inst, event) -> bool:
     return not is_external(ctx=ctx, inst=inst, event=event)
 
 
-def answers(ctx, inst, event) -> bool:
-    """The interrupt is from a caller this run answers: the request it began with, or any user's
-    call waiting on it (a handed-back message, or the turn a wake run follows)."""
-    return event.data is not None and (inst.current is event.data
-                                       or any(w.user and w.reply is event.data for w in inst.waiters))
+def ends_run(ctx, inst, event) -> bool:
+    """The withdrawal leaves the request this run answers withdrawn: the run ends."""
+    return _run_withdrawn(inst=inst, withdrawing=event.data)
 
 
-def waits_in_inbox(ctx, inst, event) -> bool:
-    return any(reply is event.data for _, reply in inst.inbox)
+def arrives_withdrawn(ctx, inst, event) -> bool:
+    return not _live(inst=inst, request=event.data)
+
+
+def arrives_behind_joins(ctx, inst, event) -> bool:
+    """A live message arrives while joins are queued: they are applied first."""
+    return _live(inst=inst, request=event.data) and bool(inst.queue)
+
+
+def arrives_to_answer(ctx, inst, event) -> bool:
+    return _live(inst=inst, request=event.data) and not inst.queue
+
+
+def request_live(ctx, inst, event) -> bool:
+    return _live(inst=inst, request=inst.request)
+
+
+def answering_live(ctx, inst, event) -> bool:
+    """A run may start: it answers no user request (a wake for grafts that finished while it
+    was idle), or at least one it answers is live."""
+    return not _run_withdrawn(inst)
+
+
+def run_withdrawn(ctx, inst, event) -> bool:
+    return _run_withdrawn(inst)
+
+
+def handed_live(ctx, inst, event) -> bool:
+    inbox, withdrawn = event.data
+    return any(r.id not in withdrawn and _live(inst=inst, request=r) for r in inbox)
+
+
+def handed_withdraws_run(ctx, inst, event) -> bool:
+    """The withdrawals handed over with the conversation include the request this run answers
+    (one that reached the original while this graft was being started)."""
+    _, withdrawn = event.data
+    request = inst.answering
+    return request is not None and (request.id in withdrawn or not _live(inst=inst, request=request))
+
+
+def handed_live_with_queue(ctx, inst, event) -> bool:
+    return bool(inst.queue) and handed_live(ctx=ctx, inst=inst, event=event)
+
+
+def handed_live_to_answer(ctx, inst, event) -> bool:
+    return not inst.queue and handed_live(ctx=ctx, inst=inst, event=event)
 
 
 def starts_busy(ctx, inst, event) -> bool:
-    return inst.kind == "focus" and not inst.held
+    """A focus graft starts on its request at once, unless a caller drives the turn that made it
+    or the request was withdrawn before it could act."""
+    return inst.kind == "focus" and not inst.held and not _run_withdrawn(inst)
+
+
+def starts_withdrawn(ctx, inst, event) -> bool:
+    return inst.kind == "focus" and not inst.held and _run_withdrawn(inst)
 
 
 def is_held(ctx, inst, event) -> bool:
@@ -517,15 +643,15 @@ def graph_refuses(ctx, inst, event) -> bool:
 
 
 def clone_waits(ctx, inst, event) -> bool:
-    """A clone call carried with the cancels, no interrupt came meanwhile, and their rows were
-    written."""
-    return inst.clone is not None and not inst.interrupted and inst.reported is None
+    """A clone call carried with the cancels, the run's request was not withdrawn meanwhile,
+    and their rows were written."""
+    return inst.clone is not None and not _run_withdrawn(inst) and inst.reported is None
 
 
 def clone_dropped(ctx, inst, event) -> bool:
     """A clone call carried with cancels whose rows could not be written: the run ends with that
     error, so the clone call is not run."""
-    return inst.clone is not None and not inst.interrupted and inst.reported is not None
+    return inst.clone is not None and not _run_withdrawn(inst) and inst.reported is not None
 
 
 def hands_over(ctx, inst, event) -> bool:
@@ -597,8 +723,12 @@ def closes_now(ctx, inst, event) -> bool:
     return inst.final and not drains_now(ctx=ctx, inst=inst, event=event) and not _still_running(inst)
 
 
+def _inbox_live(inst: TimelineSM) -> bool:
+    return any(_live(inst=inst, request=r) for r in inst.inbox)
+
+
 def answers_inbox(ctx, inst, event) -> bool:
-    return bool(inst.inbox) and not inst.final and not drains_now(ctx=ctx, inst=inst, event=event)
+    return _inbox_live(inst) and not inst.final and not drains_now(ctx=ctx, inst=inst, event=event)
 
 
 def applies_next(ctx, inst, event) -> bool:
@@ -622,16 +752,34 @@ def final_waits(ctx, inst, event) -> bool:
     return inst.final and bool(_still_running(inst))
 
 
+# The `after` choice's guards are disjoint: each outcome is one case of the one before it left
+# open (not shut down; no live message waiting; something to answer), and the report wake is
+# the remainder, its one unguarded default.
+def _after_open(inst: TimelineSM) -> bool:
+    """Not shut down."""
+    return not inst.final
+
+
 def inbox_after(ctx, inst, event) -> bool:
-    return not inst.final and bool(inst.inbox)
+    return _after_open(inst) and _inbox_live(inst)
+
+
+def _nothing_waits(inst: TimelineSM) -> bool:
+    return _after_open(inst) and not _inbox_live(inst)
 
 
 def quiet_after(ctx, inst, event) -> bool:
-    return not inst.final and not inst.inbox and (not inst.news or inst.closing)
+    """Nothing to answer: no news (or closing), or every request a run would answer withdrawn."""
+    return _nothing_waits(inst) and (not inst.news or inst.closing or _run_withdrawn(inst))
+
+
+def _wakes(inst: TimelineSM) -> bool:
+    """Joins brought news to act on, and no request a run would answer is withdrawn."""
+    return _nothing_waits(inst) and bool(inst.news) and not inst.closing and not _run_withdrawn(inst)
 
 
 def answers_handback(ctx, inst, event) -> bool:
-    return not inst.final and not inst.inbox and bool(inst.news) and not inst.closing and inst.ends_on_request
+    return _wakes(inst) and inst.ends_on_request
 
 
 def _routing(inst: TimelineSM) -> bool:
@@ -641,12 +789,7 @@ def _routing(inst: TimelineSM) -> bool:
 
 
 def wakes_to_route(ctx, inst, event) -> bool:
-    return (not inst.final and not inst.inbox and bool(inst.news) and not inst.closing
-            and not inst.ends_on_request and _routing(inst))
-
-
-def was_interrupted(ctx, inst, event) -> bool:
-    return inst.interrupted
+    return _wakes(inst) and not inst.ends_on_request and _routing(inst)
 
 
 # ------------------------------------------------------------------ activities
@@ -658,7 +801,10 @@ def _still_running(inst: TimelineSM) -> list[str]:
 
 async def busy_activity(ctx, inst: TimelineSM, event) -> None:
     """A run of the model loop. It ends by raising `turn_done` on its own machine with how the run
-    ended (a RunOutcome); the graph decides what follows (leaving the state ends this activity)."""
+    ended (a RunOutcome); the graph decides what follows (leaving the state ends this activity).
+    Before each step that could act (a model call, a tool, the next text) the run asks its
+    machine (`may_continue`); a run whose request was withdrawn is answered by leaving
+    this state, so it is ended there and then."""
     outcome = await inst.host.run_busy(tl=inst.timeline_id, mode=inst.mode, kind=inst.kind)
     await inst.dispatch(inst.context(), hsm.Event(name="turn_done", data=outcome))
 
@@ -669,9 +815,9 @@ async def background_activity(ctx, inst: TimelineSM, event) -> None:
 
 
 async def prepare_activity(ctx, inst: TimelineSM, event) -> None:
-    """The harness seeds and validates the clone call (its seeder may take a while: an interrupt
-    ends this activity, and the harness rolls the call's audit back). The outcome is `prepared`:
-    a Prepared call, or the text of a refusal the harness already audited."""
+    """The harness seeds and validates the clone call (its seeder may take a while: a withdrawal
+    or shutdown ends this activity, and the harness rolls the call's audit back). The outcome is
+    `prepared`: a Prepared call, or the text of a refusal the harness already audited."""
     prepared = await inst.host.prepare_clone(src=inst.timeline_id, clone=inst.clone,
                                              retry_left=inst.clone_tries < CLONE_TRIES)
     inst.dispatch(inst.context(), hsm.Event(name="prepared", data=prepared))
@@ -679,17 +825,24 @@ async def prepare_activity(ctx, inst: TimelineSM, event) -> None:
 
 async def spawn_activity(ctx, inst: TimelineSM, event) -> None:
     """Make and start the machines of the grafts the clone call committed, awaiting each start.
-    The outcome is an event: `spawned`, or `spawn_failed` with the machines made so far (they are
-    undone in `unspawning`)."""
+    Its inputs are taken when it starts, before its first await: the grafts to make, whether a
+    caller drives the turn, and the withdrawals recorded so far, which every graft is made with
+    (one whose request was withdrawn before it could act never acts on it). It reads nothing of
+    its machine after that: a withdrawal that comes while it runs waits for its outcome
+    (`spawning` defers it) and is then handled like any later one (forwarded to the focus graft by
+    event). The outcome is an event: `spawned`, or `spawn_failed` with the machines made so far
+    (they are undone in `unspawning`)."""
+    machines, source, plans = inst.machines, inst.timeline_id, list(inst.spawn_plan)
+    held, withdrawn = inst.mode.name == "external", set(inst.withdrawn)
     made: list[str] = []
     try:
-        for child, focus, waiters, current in inst.spawn_plan:
-            sm = TimelineSM(machines=inst.machines, timeline_id=child, source_id=inst.timeline_id,
-                            kind="focus" if focus else "background",
-                            held=inst.mode.name == "external", waiters=waiters, current=current)
-            inst.machines.timelines[child] = sm
-            made.append(child)
-            await hsm.Started(None, sm, TIMELINE if focus else BACKGROUND, hsm.Config(ID=child))
+        for plan in plans:
+            sm = TimelineSM(machines=machines, timeline_id=plan.child, source_id=source,
+                            kind="focus" if plan.focus else "background", held=held,
+                            waiters=plan.waiters, answering=plan.answering, withdrawn=withdrawn)
+            machines.timelines[plan.child] = sm
+            made.append(plan.child)
+            await hsm.Started(None, sm, TIMELINE if plan.focus else BACKGROUND, hsm.Config(ID=plan.child))
     except Exception as e:  # noqa: BLE001 - the outcome event carries it
         inst.dispatch(inst.context(), hsm.Event(name="spawn_failed", data=(made, e)))
         return
@@ -708,7 +861,7 @@ async def unspawn_activity(ctx, inst: TimelineSM, event) -> None:
 
 
 def _write_request(inst, event):
-    return inst.host.begin_request(tl=inst.timeline_id, text=inst.request[0])
+    return inst.host.begin_request(tl=inst.timeline_id, text=inst.request.text)
 
 
 def _commit(inst, event):
@@ -808,67 +961,145 @@ def _scribe_write(inst, event):
 
 
 # ------------------------------------------------------------------ effects: user requests
-def _waiting(inst: TimelineSM, reply: asyncio.Future | None) -> list[int]:
-    return [id(reply)] if reply is not None else []
+def _waiting(inst: TimelineSM, request: Request) -> list[int]:
+    return [id(request.reply)]
+
+
+def _answer_dead(requests: list[Request]) -> list[int]:
+    """The one response to a request dropped because it is no longer live: it is answered (nothing
+    is run for it); returns the ids the session counts it by, for the one event the caller sends."""
+    for r in requests:
+        _resolve(reply=r.reply, value="ended")
+    return [id(r.reply) for r in requests]
+
+
+def _drop_dead(inst: TimelineSM) -> list[int]:
+    """The waiting messages whose callers have gone leave the inbox, each answered; their ids for
+    the session."""
+    dead = [r for r in inst.inbox if not _live(inst=inst, request=r)]
+    inst.inbox = [r for r in inst.inbox if all(r is not d for d in dead)]
+    return _answer_dead(dead)
 
 
 def take_message(ctx, inst, event) -> None:
-    text, reply = event.data
-    _session(inst=inst, name="request_taken", data=(inst.timeline_id, _waiting(inst=inst, reply=reply)))
-    inst.request = (text, reply)
+    inst.request = event.data
+    _session(inst=inst, name="request_taken", data=(inst.timeline_id, _waiting(inst=inst, request=event.data), []))
+
+
+def drop_message(ctx, inst, event) -> None:
+    """A message whose caller had gone before it arrived: nothing is written or run for it."""
+    _session(inst=inst, name="user_answered", data=_answer_dead([event.data]))
 
 
 def take_inbox(ctx, inst, event) -> None:
+    """The first live waiting message is taken (a guard saw one); the dead ones are dropped."""
+    dead = _drop_dead(inst)
     inst.request = inst.inbox.pop(HEAD)
+    _session(inst=inst, name="user_answered", data=dead)
 
 
 def request_written(ctx, inst, event) -> None:
     """The message's row is written: it is the run's request; the bounds of the last one are
     cleared (a new request may clone again)."""
-    text, reply = inst.request
-    inst.request, inst.request_row, inst.current = None, event.data, reply
+    request, inst.request = inst.request, None
+    inst.answering = request
     inst.mode, inst.clone_tries = TURN, 0
     inst.blocks, inst.clone_calls, inst.wake_clones = set(), 0, 0
-    if reply is not None:
-        inst.waiters.append(Waiter(reply=reply, user=True))
+    inst.waiters.append(Waiter(reply=request.reply, user=True, request=request))
+
+
+def request_dropped(ctx, inst, event) -> None:
+    """The message's row is written, but its caller withdrew it meanwhile: no run starts for it.
+    The row stays (rows are never removed): a user turn the next message joins. A new message
+    was written, so the bounds of the last one are cleared."""
+    request, inst.request = inst.request, None
+    inst.blocks, inst.clone_calls, inst.wake_clones = set(), 0, 0
+    _prune(inst)
+    _session(inst=inst, name="user_answered", data=_answer_dead([request]))
 
 
 def request_failed(ctx, inst, event) -> None:
     """The message's row could not be written: its caller gets the error, the user is told, and no
     run starts for it."""
-    text, reply = inst.request
-    inst.request = None
-    inst.waiters.append(Waiter(reply=reply, user=True, error=event.data))
+    request, inst.request = inst.request, None
+    inst.waiters.append(Waiter(reply=request.reply, user=True, error=event.data, request=request))
     _report(inst=inst, kind="request", clones=[], error=event.data, keep=False)
 
 
 def stash_message(ctx, inst, event) -> None:
-    _session(inst=inst, name="user_waiting", data=_waiting(inst=inst, reply=event.data[1]))
     inst.inbox.append(event.data)
+    _session(inst=inst, name="user_waiting", data=_waiting(inst=inst, request=event.data))
 
 
 def stash_and_engage(ctx, inst, event) -> None:
-    _session(inst=inst, name="request_taken", data=(inst.timeline_id, _waiting(inst=inst, reply=event.data[1])))
     inst.inbox.append(event.data)
+    _session(inst=inst, name="request_taken", data=(inst.timeline_id, _waiting(inst=inst, request=event.data), []))
 
 
-def withdraw(ctx, inst, event) -> None:
-    inst.inbox = [(t, r) for t, r in inst.inbox if r is not event.data]
-    event.data.cancel()
-    _session(inst=inst, name="user_answered", data=[id(event.data)])
+def note_withdrawn(ctx, inst, event) -> None:
+    """A caller withdrew its request (by id): recorded if this machine holds it, wherever it is;
+    a waiting message is dropped and answered at once. An unknown or already answered id changes
+    nothing."""
+    gone = [r for r in _held(inst) if r.id == event.data]
+    inst.withdrawn |= {event.data} if gone else set()
+    dead = _drop_dead(inst)
+    _prune(inst)
+    _session(inst=inst, name="user_answered", data=dead + [id(r.reply) for r in gone])
+
+
+def withdraws_waiting(ctx, inst, event) -> bool:
+    """The withdrawal is of a message waiting on this machine."""
+    return any(r.id == event.data for r in inst.inbox)
+
+
+def withdraw_and_forward(ctx, inst, event) -> None:
+    """Recorded here if this machine holds the request (while the clone call that makes the focus
+    graft is in flight it still does), and forwarded to the focus graft that holds the
+    conversation once it is made (while its machine is started, `spawning` defers the withdrawal),
+    which records it if it holds the request. A suspended original holds
+    none, so its record stays bounded however long the focus graft holds the conversation; a
+    request the graft hands back carries its reply, which a cancelled call has already cancelled."""
+    inst.withdrawn |= {event.data} if any(r.id == event.data for r in _held(inst)) else set()
+    _forward(target=inst.machines.timelines.get(inst.focus) if inst.focus else None, name="withdraw",
+             data=event.data)
+
+
+def take_handed(ctx, inst, event) -> None:
+    """Messages handed over with the conversation: they arrived before any this timeline holds,
+    so they go first, in order."""
+    inbox, withdrawn = event.data
+    inst.inbox = list(inbox) + inst.inbox
+    inst.withdrawn |= withdrawn
+    _prune(inst)
+
+
+def take_handed_and_begin(ctx, inst, event) -> None:
+    """Handed messages reach it at rest: the dead ones are dropped and the first live one is
+    taken now (one session event says both)."""
+    take_handed(ctx=ctx, inst=inst, event=event)
+    dead = _drop_dead(inst)
+    inst.request = inst.inbox.pop(HEAD)
+    _session(inst=inst, name="request_taken",
+             data=(inst.timeline_id, _waiting(inst=inst, request=inst.request), dead))
+
+
+def take_handed_and_engage(ctx, inst, event) -> None:
+    """Handed messages reach it at rest with joins queued: the joins are applied first."""
+    take_handed(ctx=ctx, inst=inst, event=event)
+    _session(inst=inst, name="engaged", data=inst.timeline_id)
 
 
 def begin_run(ctx, inst, event) -> None:
     mode, reply = event.data
     _session(inst=inst, name="engaged", data=inst.timeline_id)
-    inst.mode, inst.current, inst.clone_tries = mode, None, 0
+    inst.mode, inst.answering, inst.clone_tries = mode, None, 0
     inst.waiters.append(Waiter(reply=reply, user=False))
 
 
 def begin_driven(ctx, inst, event) -> None:
     mode, reply = event.data
     _session(inst=inst, name="engaged", data=inst.timeline_id)
-    inst.mode, inst.current, inst.clone_tries = mode, None, 0
+    inst.mode, inst.answering, inst.clone_tries = mode, None, 0
     _resolve(reply=reply, value="started")
 
 
@@ -988,22 +1219,27 @@ def _answer_all(inst: TimelineSM) -> list[int]:
             _fail(reply=w.reply, error=w.error)
         else:
             _resolve(reply=w.reply, value="ended")
-    users += [id(reply) for _text, reply in inst.inbox]
-    for _text, reply in inst.inbox:
-        _fail(reply=reply, error=TransitionRefused("the harness was closed"))
-    inst.inbox = []
+    users += [id(r.reply) for r in inst.inbox]
+    for r in inst.inbox:
+        _fail(reply=r.reply, error=TransitionRefused("the harness was closed"))
+    inst.inbox, inst.answering = [], None
+    _prune(inst)
     return users
 
 
 def come_to_rest(ctx, inst, event) -> None:
-    """At rest: every caller waiting is answered, and the session told in one event."""
+    """At rest: every caller waiting is answered, waiting messages whose callers have gone are
+    dropped, and the session told in one event."""
     waiters, inst.waiters = inst.waiters, []
     for w in waiters:
         if w.error is not None:
             _fail(reply=w.reply, error=w.error)
         else:
             _resolve(reply=w.reply, value="ended")
-    _session(inst=inst, name="rested", data=(inst.timeline_id, [id(w.reply) for w in waiters if w.user]))
+    dead = _drop_dead(inst)
+    inst.answering = None
+    _prune(inst)
+    _session(inst=inst, name="rested", data=(inst.timeline_id, [id(w.reply) for w in waiters if w.user] + dead))
 
 
 def close_root(ctx, inst, event) -> None:
@@ -1077,7 +1313,9 @@ def committed(ctx, inst, event) -> None:
     graft is made with the user's calls waiting on this run, and answers the same request."""
     inst.clone_text = event.data
     users = [w for w in inst.waiters if w.user]
-    inst.spawn_plan = [(child, f, users if f else [], inst.current if f else None) for child, f in inst.clone.pairs]
+    inst.spawn_plan = [GraftPlan(child=child, focus=f, waiters=users if f else [],
+                                 answering=inst.answering if f else None)
+                       for child, f in inst.clone.pairs]
 
 
 def row_not_written(ctx, inst, event) -> None:
@@ -1101,7 +1339,7 @@ def spawned(ctx, inst, event) -> None:
     inst.focus = next((g for g, f in clone.pairs if f), None)
     inst.spawn_plan = []
     background = [g for g, f in clone.pairs if not f]
-    _session(inst=inst, name="grafts_made", data=(background, inst.mode.name == "external", inst.focus))
+    _session(inst=inst, name="grafts_made", data=(background, inst.mode.name == "external"))
 
 
 def spawn_failed(ctx, inst, event) -> None:
@@ -1132,14 +1370,25 @@ def answer_pending(ctx, inst, event) -> None:  # exit of a run: a request it nev
         _resolve(reply=cancel.reply, value="the turn ended before the cancel ran")
 
 
+def pass_inbox(ctx, inst, event) -> None:
+    """The messages waiting on the original go to the focus graft with the conversation, in
+    order and with the withdrawals recorded, ahead of any message forwarded to it later."""
+    inbox, inst.inbox = inst.inbox, []
+    _forward(target=inst.machines.timelines.get(inst.focus), name="inbox_handed", data=(inbox, set(inst.withdrawn)))
+
+
 def hand_over(ctx, inst, event) -> None:
+    """Suspended: the user's calls now wait on the focus graft, which was made with them and
+    with the request it answers; the session no longer counts the original as engaged (the
+    focus graft counts itself while it runs)."""
     clone, inst.handing = inst.handing, None
     for w in inst.waiters:
         if not w.user:
             _resolve(reply=w.reply, value="handed_off")
-    inst.waiters = []  # a user's call now waits on the focus graft, which was made with it
+    inst.waiters, inst.answering = [], None
+    _prune(inst)
     _resolve(reply=clone.reply, value=([g for g, _ in clone.pairs], inst.focus, inst.clone_text))
-    _session(inst=inst, name="handed", data=(inst.timeline_id, inst.focus))
+    _session(inst=inst, name="suspended", data=inst.timeline_id)
 
 
 def clone_done(ctx, inst, event) -> None:
@@ -1148,20 +1397,6 @@ def clone_done(ctx, inst, event) -> None:
 
 
 # ------------------------------------------------------------------ effects: cancel
-def mark_interrupted(ctx, inst, event) -> None:
-    """The caller of the run went away: the session no longer counts it as waiting."""
-    inst.interrupted = True
-    _session(inst=inst, name="user_answered", data=[id(event.data)])
-
-
-def caller_left(ctx, inst, event) -> None:
-    _session(inst=inst, name="user_answered", data=[id(event.data)])
-
-
-def clear_interrupted(ctx, inst, event) -> None:
-    inst.interrupted = False
-
-
 def take_cancel(ctx, inst, event) -> None:
     inst.cancel = event.data
     inst.clone = None
@@ -1259,12 +1494,17 @@ def close_and_engage(ctx, inst, event) -> None:
 
 
 def focus_back(ctx, inst, event) -> None:
-    join, waiters, inbox = event.data
+    """Its focus graft joined: the conversation is back, with the calls waiting on the graft,
+    the messages it never got to (in order, ahead of any that came back since), the request
+    it was answering and the withdrawals it recorded."""
+    join, waiters, inbox, answering, withdrawn = event.data
     _session(inst=inst, name="handed", data=(inst.focus, inst.timeline_id))
     inst.focus = None
     inst.queue.append(join)
     inst.waiters.extend(waiters)
-    inst.inbox.extend(inbox)
+    inst.inbox = list(inbox) + inst.inbox
+    inst.answering = answering
+    inst.withdrawn |= withdrawn
 
 
 def start_joining(ctx, inst, event) -> None:  # entry of `joining`: a commit point
@@ -1314,18 +1554,18 @@ def abandon_head(ctx, inst, event) -> None:
 
 def answer_handback(ctx, inst, event) -> None:
     inst.clone_tries = 0
-    inst.mode, inst.current = Mode(name="turn", user=True, about=tuple(c for c, _ in inst.news)), None
+    inst.mode = Mode(name="turn", user=True, about=tuple(c for c, _ in inst.news))
 
 
 def wake_route(ctx, inst, event) -> None:
     focus_back = any(r != "done" and inst.made.get(c) for c, r in inst.news)
     inst.clone_tries = 0
-    inst.mode, inst.current = Mode(name="route", wake=not focus_back, about=tuple(c for c, _ in inst.news)), None
+    inst.mode = Mode(name="route", wake=not focus_back, about=tuple(c for c, _ in inst.news))
 
 
 def wake_report(ctx, inst, event) -> None:
     inst.clone_tries = 0
-    inst.mode, inst.current = Mode(name="report", report=True, about=tuple(c for c, _ in inst.news)), None
+    inst.mode = Mode(name="report", report=True, about=tuple(c for c, _ in inst.news))
 
 
 def note_failed(ctx, inst, event) -> None:
@@ -1341,7 +1581,9 @@ def _hand_back(inst: TimelineSM, join: QueuedJoin, also: list[Waiter]) -> None:
             _resolve(reply=w.reply, value="joined")
     inst.waiters = []
     inbox, inst.inbox = inst.inbox, []
-    _forward(target=inst.machines.timelines.get(inst.source_id), name="focus_joined", data=(join, users, inbox))
+    answering, inst.answering = inst.answering, None
+    _forward(target=inst.machines.timelines.get(inst.source_id), name="focus_joined",
+             data=(join, users, inbox, answering, set(inst.withdrawn)))
 
 
 def focus_join(ctx, inst, event) -> None:
@@ -1437,7 +1679,7 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
     """What a running timeline does: run its model loop (`run`, an activity) or wait for the
     caller that drives the turn (`driven`). Both clone and cancel, step by step. A clone call is
     gated whole first (`clone_gate`: nothing is seeded for a call that may not be tried), then
-    prepared (`preparing`, the harness's activity: an interrupt ends it), then decided and carried
+    prepared (`preparing`, the harness's activity: leaving the run ends it), then decided and carried
     out in `steps/cloning`; the cancel calls of one response are `steps/cancels`, and a clone call
     carried with them goes to the gate after them. While a step runs, shutdown and a driven end
     wait (`steps`)."""
@@ -1474,16 +1716,21 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
             hsm.Defer("shutdown", "driven_done"),
             hsm.State(
                 "cloning",  # one clone call: committed, its machines started, its result written
-                hsm.Defer("interrupt", "focus_joined"),
+                hsm.Defer("focus_joined"),
+                # a withdrawal of a waiting message drops it here; any other is recorded and reaches
+                # the focus graft once it is made; the run ends once the step is done (`resume`), and
+                # a focus graft never acts on it
+                T(On("withdraw"), G(withdraws_waiting), hsm.Effect(note_withdrawn)),
+                T(On("withdraw"), hsm.Effect(withdraw_and_forward)),
                 hsm.State(
                     "rejecting", io(done="rejected", work=_reject),  # refused before or in its preparation
-                    T(On("rejected"), S("../../../running"), hsm.Effect(clone_refused_written)),
-                    T(On(E), S("../../../running"), hsm.Effect(clone_refusal_not_written)),
+                    T(On("rejected"), S("../../../resume"), hsm.Effect(clone_refused_written)),
+                    T(On(E), S("../../../resume"), hsm.Effect(clone_refusal_not_written)),
                 ),
                 hsm.State(
                     "refusing", io(done="refused", work=_refuse),
-                    T(On("refused"), S("../../../running"), hsm.Effect(clone_refused_written)),
-                    T(On(E), S("../../../running"), hsm.Effect(clone_refusal_not_written)),
+                    T(On("refused"), S("../../../resume"), hsm.Effect(clone_refused_written)),
+                    T(On(E), S("../../../resume"), hsm.Effect(clone_refusal_not_written)),
                 ),
                 hsm.State(
                     "committing", io(done="committed", work=_commit),
@@ -1492,6 +1739,9 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
                 ),
                 hsm.State(
                     "spawning", hsm.Activity(spawn_activity),
+                    # a withdrawal waits for the grafts' machines (the activity reads no data of
+                    # this one after it starts), then is handled by `cloning` like any later one
+                    hsm.Defer("withdraw"),
                     T(On("spawned"), S("../recording"), hsm.Effect(spawned)),
                     T(On("spawn_failed"), S("../unspawning"), hsm.Effect(spawn_failed)),
                 ),
@@ -1515,7 +1765,7 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
                 "cancels",  # the cancel calls of one response, id by id; a clone call carried with them waits
                 hsm.Entry(checks_from),
                 hsm.Defer("clone_request"),
-                T(On("interrupt"), G(answers), hsm.Effect(mark_interrupted)),
+                T(On("withdraw"), hsm.Effect(note_withdrawn)),  # the run ends once the cancels are done
                 T(On("graft_queued"), G(one_of_pending), hsm.Effect(cancel_landed)),
                 hsm.Initial(S("checking")),
                 hsm.State(
@@ -1554,12 +1804,17 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
         hsm.Choice(
             "clone_choice",  # a hand-over leaves the run: its open calls and kept rows are written first
             T(S("steps/cloning/flushing"), G(hands_over), hsm.Effect(take_hand_over)),
-            T(S("running"), hsm.Effect(clone_done)),
+            T(S("resume"), hsm.Effect(clone_done)),
         ),
-        hsm.Choice("handed", T(S("../../../cloned"), hsm.Effect(hand_over))),
         hsm.Choice(
-            "cancels_done",  # an interrupt that came meanwhile ends the run: what waited is not run
-            T(S("../../closing_calls"), G(was_interrupted), hsm.Effect(clear_interrupted)),
+            "resume",  # after a clone step: a run whose request was withdrawn meanwhile ends
+            T(S("../../closing_calls"), G(run_withdrawn)),
+            T(S("running")),
+        ),
+        hsm.Choice("handed", T(S("../../../passing"), hsm.Effect(pass_inbox))),
+        hsm.Choice(
+            "cancels_done",  # a withdrawal that came meanwhile ends the run: what waited is not run
+            T(S("../../closing_calls"), G(run_withdrawn)),
             T(S("clone_gate"), G(clone_waits)),
             T(S("running"), G(clone_dropped), hsm.Effect(drop_clone)),  # the run then ends with the error
             T(S("running")),
@@ -1574,17 +1829,20 @@ def _timeline(name: str) -> hsm.Model:
         hsm.Initial(S("start")),
         hsm.Choice(
             "start",  # a focus graft starts on its request, unless a caller drives the turn that made it
-            T(S("live/engaged/busy/run"), G(starts_busy)),
+            T(S("live/engaged/busy/run"), G(starts_busy), hsm.Effect(engage)),
+            T(S("live/idle"), G(starts_withdrawn), hsm.Effect(come_to_rest)),  # it never acts on it
             T(S("live/idle")),
         ),
-        T(On(*REQUESTS, "when_queued"), hsm.Effect(refuse_request)),
+        T(On(*REQUESTS, "when_queued", "may_continue"), hsm.Effect(refuse_request)),
+        T(On("withdraw"), hsm.Effect(note_withdrawn)),  # in every state: recorded, never ignored
         T(On("result_unstored"), hsm.Effect(keep_unstored)),
+        T(On("inbox_handed"), hsm.Effect(take_handed)),
         T(On("rest_request"), G(has_joined), hsm.Effect(answer_joined)),
         T(On("rest_request"), hsm.Effect(refuse_request)),  # closed, or its join abandoned
         T(On("graft_queued"), hsm.Effect(enqueue)),
         T(On("clone_request"), hsm.Effect(refuse_clone_call)),
         T(On("cancel_request"), hsm.Effect(refuse_cancel_call)),
-        T(On("poke", "interrupt", "shutdown", "check"), hsm.Effect(ignore)),
+        T(On("poke", "shutdown", "check"), hsm.Effect(ignore)),
         T(On("closing"), hsm.Effect(set_closing)),
         hsm.State(
             "live",
@@ -1593,8 +1851,9 @@ def _timeline(name: str) -> hsm.Model:
             hsm.State(
                 "idle",
                 mirrored("active"),
-                T(On("user_message"), S("../engaged/joining"), G(has_queue), hsm.Effect(stash_and_engage)),
-                T(On("user_message"), S("../engaged/requesting"), G(no_queue), hsm.Effect(take_message)),
+                T(On("user_message"), G(arrives_withdrawn), hsm.Effect(drop_message)),
+                T(On("user_message"), S("../engaged/joining"), G(arrives_behind_joins), hsm.Effect(stash_and_engage)),
+                T(On("user_message"), S("../engaged/requesting"), G(arrives_to_answer), hsm.Effect(take_message)),
                 T(On("turn_request"), S("../engaged/busy/driven"), G(is_external), hsm.Effect(begin_driven)),
                 T(On("turn_request"), S("../engaged/busy/run"), G(not_external), hsm.Effect(begin_run)),
                 T(On("graft_queued"), S("../receiving"), hsm.Effect(engage)),
@@ -1603,16 +1862,22 @@ def _timeline(name: str) -> hsm.Model:
                 T(On("rest_request"), hsm.Effect(answer_ended)),
                 T(On("poke"), S("../engaged/joining"), G(has_queue), hsm.Effect(engage)),
                 T(On("shutdown"), S("../engaged/joining"), G(has_queue), hsm.Effect(close_and_engage)),
+                # messages handed over with the conversation (or back, past a focus graft that had
+                # already joined) reach it at rest
+                T(On("inbox_handed"), S("../engaged/joining"), G(handed_live_with_queue),
+                  hsm.Effect(take_handed_and_engage)),
+                T(On("inbox_handed"), S("../engaged/requesting"), G(handed_live_to_answer),
+                  hsm.Effect(take_handed_and_begin)),
             ),
             hsm.State(
                 "engaged",
                 hsm.Defer("shutdown"),  # taken by `busy` and `joining`; every other step finishes first
                 T(On("user_message"), hsm.Effect(stash_message)),
                 T(On("rest_request", "drain_request"), hsm.Effect(add_run_waiter)),
-                T(On("interrupt"), G(waits_in_inbox), hsm.Effect(withdraw)),
                 hsm.State(
                     "requesting", mirrored("active"), io(done="request_written", work=_write_request),
-                    T(On("request_written"), S("../busy/run"), hsm.Effect(request_written)),
+                    T(On("request_written"), S("../busy/run"), G(request_live), hsm.Effect(request_written)),
+                    T(On("request_written"), S("../rest"), hsm.Effect(request_dropped)),  # withdrawn meanwhile
                     T(On(E), S("../rest"), hsm.Effect(request_failed)),
                 ),
                 hsm.State(
@@ -1622,7 +1887,13 @@ def _timeline(name: str) -> hsm.Model:
                     T(On(E), S("../closing_calls"), G(error_to_user), hsm.Effect(error_for_user)),
                     T(On(E), S("../closing_calls"), G(error_already_shown), hsm.Effect(error_shown)),
                     T(On(E), S("../closing_calls"), hsm.Effect(error_reported)),
-                    T(On("interrupt"), S("../closing_calls"), G(answers), hsm.Effect(caller_left)),
+                    T(On("withdraw"), S("../closing_calls"), G(ends_run), hsm.Effect(note_withdrawn)),
+                    # the run asks before each step that could act: it goes on while the request it
+                    # answers, if any, is live; once it is withdrawn the run is ended the way a
+                    # withdrawal ends it (leaving `busy` ends the run that asked: nothing is left to answer)
+                    T(On("may_continue"), S("../closing_calls"), G(run_withdrawn)),
+                    T(On("may_continue"), hsm.Effect(answer_true)),
+                    T(On("inbox_handed"), S("../closing_calls"), G(handed_withdraws_run), hsm.Effect(take_handed)),
                     T(On("shutdown"), S("../closing_calls"), hsm.Effect(interrupted_closing)),
                     _work("run", hsm.Activity(busy_activity), T(On("turn_done"), S("../../ran"), hsm.Effect(end_run))),
                     _work("driven", T(On("driven_done"), S("../../rest"), hsm.Effect(end_driven))),
@@ -1670,7 +1941,8 @@ def _timeline(name: str) -> hsm.Model:
                 ),
                 hsm.State(
                     "noting", mirrored("active"), io(done="noted", work=_wake_note),
-                    T(On("noted"), S("../busy/run")),
+                    T(On("noted"), S("../busy/run"), G(answering_live)),
+                    T(On("noted"), S("../rest")),  # its caller withdrew meanwhile
                     T(On(E), S("../unnoted"), hsm.Effect(note_failed)),
                 ),
                 hsm.Choice("unnoted", T(S("../idle"), hsm.Effect(come_to_rest))),
@@ -1693,11 +1965,13 @@ def _timeline(name: str) -> hsm.Model:
                 ),
             ),
             hsm.Choice("shutting", T(S("../closed"), hsm.Effect(close_root))),
+            hsm.Choice("passing", T(S("cloned"), hsm.Effect(hand_over))),
             hsm.Choice("receiving", T(S("engaged/joining"), hsm.Effect(enqueue))),
             hsm.State(
                 "cloned",
                 mirrored("cloned"),
-                T(On("user_message", "interrupt"), hsm.Effect(forward_to_focus)),
+                T(On("user_message"), hsm.Effect(forward_to_focus)),
+                T(On("withdraw"), hsm.Effect(withdraw_and_forward)),
                 T(On("focus_joined"), S("../engaged/joining"), hsm.Effect(focus_back)),
                 T(On("rest_request"), hsm.Effect(answer_handed_off)),
                 T(On("shutdown"), S("../releasing"), hsm.Effect(close_and_release)),
@@ -1712,7 +1986,9 @@ def _timeline(name: str) -> hsm.Model:
             mirrored("queued"),
             T(On("join_commit", "join_rollback"), S("../joined"), into("joined")),
             T(On("join_abandon"), S("../abandoned"), into("abandoned")),
-            T(On("user_message", "interrupt"), hsm.Effect(forward_to_source)),
+            # a withdrawal reaches a focus graft only from its source: here it holds no request,
+            # so the withdrawal changes nothing (top level) and is not sent back
+            T(On("user_message", "inbox_handed"), hsm.Effect(forward_to_source)),
             T(On("rest_request"), hsm.Effect(answer_joined)),  # its run has ended by joining
         ),
         hsm.Final("joined"),
@@ -1732,7 +2008,7 @@ BACKGROUND = hsm.Define(
         _T(_S("live/background/held"), _G(is_held)),
         _T(_S("live/background/running")),
     ),
-    _T(_On(*REQUESTS, "rest_request"), hsm.Effect(refuse_request)),  # not a timeline that rests: see join_queued
+    _T(_On(*REQUESTS, "rest_request", "may_continue"), hsm.Effect(refuse_request)),  # not a timeline that rests
     _T(_On("when_queued"), hsm.Effect(answer_true)),
     _T(_On("result_unstored"), hsm.Effect(keep_unstored)),
     _T(_On("cancel_request"), hsm.Effect(refuse_cancel_call)),
@@ -1750,7 +2026,8 @@ BACKGROUND = hsm.Define(
             _T(_On("join"), _S("../recording"), hsm.Effect(forced)),
             _T(_On(_E), _S("../recording"), hsm.Effect(run_raised)),
             hsm.State("held"),
-            hsm.State("running", hsm.Activity(background_activity)),
+            # its run goes on until the graft leaves `background` (finish, cancel, shutdown, join)
+            hsm.State("running", hsm.Activity(background_activity), _T(_On("may_continue"), hsm.Effect(answer_true))),
         ),
         hsm.Choice(
             "ending",  # how its run ended: its join reason
@@ -1843,19 +2120,21 @@ def _apply_session(inst: SessionSM, name: str, data: Any) -> None:
     """How each event changes the session's own record of what is in flight."""
     if name == "engaged":
         inst.engaged.add(data)
-    elif name == "request_taken":
+    elif name == "request_taken":  # (timeline, the user call taken, waiting messages dropped)
         inst.engaged.add(data[0])
         inst.users.update(data[1])
+        inst.users.difference_update(data[2])
     elif name in ("rested", "root_closed"):
         inst.engaged.discard(data[0])
         inst.users.difference_update(data[1])
     elif name == "handed":
         inst.engaged.discard(data[0])
         inst.engaged.add(data[1])
+    elif name == "suspended":  # the original handed the conversation over; its focus graft counts itself
+        inst.engaged.discard(data)
     elif name == "grafts_made":
-        grafts, held, focus = data
+        grafts, held = data
         (inst.held if held else inst.grafts).update(grafts)
-        inst.engaged |= {focus} if focus is not None else set()
     elif name == "graft_received":
         inst.grafts.discard(data)
         inst.held.discard(data)
@@ -2060,7 +2339,7 @@ def is_root_event(ctx, inst, event) -> bool:
     return event.data[0] == inst.root
 
 
-RECORDS = ("engaged", "request_taken", "rested", "handed", "grafts_made", "graft_received",
+RECORDS = ("engaged", "request_taken", "rested", "handed", "suspended", "grafts_made", "graft_received",
            "user_waiting", "user_answered")
 
 SESSION = hsm.Define(
@@ -2133,6 +2412,7 @@ class Machines:
         self.session: SessionSM | None = None
         self.scribe: ScribeSM | None = None
         self.root: str | None = None
+        self.requests = 0  # user requests made so far: the next one's id
 
     # ------------------------------------------------------------------ making machines
     async def start_root(self, tl: str) -> None:
@@ -2152,13 +2432,34 @@ class Machines:
     def future(self) -> asyncio.Future:
         return asyncio.get_running_loop().create_future()
 
-    async def send(self, tl: str, name: str, data: Any = None) -> None:
+    def request(self, text: str) -> Request:
+        """A new user request: a fresh id and the future that carries its answer."""
+        self.requests += 1
+        return Request(id=self.requests, text=text, reply=self.future())
+
+    def _target(self, tl: str, name: str) -> hsm.Instance:
         sm = self.session if tl == "session" else self.timelines.get(tl)
         if sm is None:
             raise TransitionRefused(f"no machine for {tl}")
         if not sm.state():  # stopped by `close`: readiness only, nothing about the graph is read
             raise TransitionRefused(f"{tl}: '{name}' refused in state closed (the harness is closed)")
-        await hsm.Dispatch(None, sm, hsm.Event(name=name, data=data))
+        return sm
+
+    async def send(self, tl: str, name: str, data: Any = None) -> None:
+        await hsm.Dispatch(None, self._target(tl=tl, name=name), hsm.Event(name=name, data=data))
+
+    def post(self, tl: str, name: str, data: Any = None) -> None:
+        """Put an event on tl's machine now, without waiting for it to be processed (the machine
+        takes its events in order). For a caller that waits on a reply carried in the event: its
+        only await is that reply, so a cancel of the caller always lands on it.
+
+        Nothing a post sets off is lost. A stopped machine is refused here (TransitionRefused,
+        raised to the caller) before hsm is asked, so hsm's "not started" result never arises;
+        hsm's event queue is unbounded, so the push cannot fail; and posts go to the original,
+        which is stopped only once it is `closed` (a final state with no activity), so an event
+        cannot land in its queue while it is being stopped and be cleared with it. What the event
+        then sets off fails as an activity, handled by the graph's `hsm/error` transitions."""
+        hsm.Dispatch(None, self._target(tl=tl, name=name), hsm.Event(name=name, data=data))
 
     async def ask(self, tl: str, name: str, build: Callable[[asyncio.Future], Any]) -> Any:
         reply = self.future()

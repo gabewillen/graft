@@ -12,9 +12,11 @@ waits for its source, a cancel that waits for a graft to stop, `settle` and `clo
 events and states of the machines. The harness does only I/O for them: model calls, store reads
 and writes (the ones that belong to a machine step are made by that step's effect, through the
 host methods below), tool execution, emitting text, building prompts. It holds no lock, no task
-of its own, and no future except a reply carried in an event's data. It never reads a machine:
-what it needs to know about a timeline (its kind, its source's grafts still running) comes in
-the host call the machine's activity makes.
+of its own, and no future except a reply carried in an event's data, whose answer it never
+inspects. It never reads a machine: what it needs to know about a timeline (its kind, its
+source's grafts still running) comes in the host call the machine's activity makes, and whether a
+run may take its next step is the machine's answer to the run's `may_continue` request. A user's
+call is a request the original's machine owns (see `user_says`); a cancelled call withdraws it.
 
 Clone is one call, `clone(clone=[{purpose, skills, focus, seed_quotes | seed_row_ids}, ...])`, and
 one atomic batch, put to the original's machine as the model made it. The machine decides
@@ -60,7 +62,7 @@ from . import callsites, compaction
 from . import seeder as seeder_mod
 from .db import Graft, Store, render, validate
 from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, Cancel, CancelCall, Clone, Machines, Mode, Prepared,
-                      QueuedJoin, RunOutcome, Unwritten)
+                      QueuedJoin, RunOutcome, TransitionRefused, Unwritten)
 from .providers import Provider, prefix_nonce, window_tokens_for
 from .skills import (BASE_SYSTEM, BUILTIN, MAX_CANCEL_IDS, MAX_CLONE_ENTRIES, World, load_skill,
                      skill_listing)
@@ -415,19 +417,26 @@ class Harness:
 
     # ------------------------------------------------------------ entry points
     async def user_says(self, text: str) -> list[str]:
-        """One user message, put to the original's machine: it answers it, forwards it to its
-        focus graft, or keeps it until the run in progress and the joins waiting are done. Returns
-        the user-facing texts emitted since the last return, once the conversation is at rest. If
-        the call is cancelled, any run it waits on is interrupted: its turn, a focus graft's, the run
-        answering a message handed back, or the wake run that follows its turn. A wake or join-commit failure
-        after the turn is part of that output (a harness error line), not an exception."""
+        """One user message, put to the original's machine as a request (an id, the text and the
+        reply future): the machine answers it, forwards it to its focus graft, or keeps it until
+        the run in progress and the joins waiting are done. Returns the user-facing texts emitted
+        since the last return, once the conversation is at rest. A wake or join-commit failure
+        after the turn is part of that output (a harness error line), not an exception.
+
+        The request is put on the machine without waiting, so the call's only await is its reply:
+        a cancel, wherever the request is in its lifecycle, cancels that reply at once and the
+        caller withdraws the request by id. The machine then never starts a run, writes a row or
+        lets a focus graft act for it; a run already answering it is ended by its machine before
+        its next step. If writing its row or the run answering it fails, the machine answers the reply
+        with that error, raised here."""
         root = self.machines.root
-        reply = self.machines.future()  # the reply, and the request's identity
-        await self.machines.send(tl=root, name="user_message", data=(text, reply))
+        request = self.machines.request(text)
+        self.machines.post(tl=root, name="user_message", data=request)
         try:
-            await reply
-        except asyncio.CancelledError:
-            await self.machines.send(tl=root, name="interrupt", data=reply)  # this request's run, or its place in line
+            await request.reply
+        except asyncio.CancelledError:  # the reply it awaited is cancelled with it
+            with contextlib.suppress(TransitionRefused):  # closed meanwhile: nothing left to withdraw from
+                self.machines.post(tl=root, name="withdraw", data=request.id)
             raise
         return self._take()
 
@@ -645,23 +654,28 @@ class Harness:
         a fresh user message, is over the threshold, one `compact` call partitions the prefix into
         kept rows and compressed windows; the new view (items in order + the fresh message) is
         validated (partition, then turn structure like a seed or join), with one retry on
-        violations, then recorded with Store.mark_compaction. The full timeline is unchanged."""
+        violations, then recorded with Store.mark_compaction. The full timeline is unchanged. A
+        compaction is a step of tl's run: its machine is asked before each compaction call and again
+        when it comes back, before anything of it is stored."""
         rows = self.store.working_view(tl)
         if len(rows) < 2 or not compaction.needs_compaction(render(rows), self.compact_tokens):
             return
         prefix, fresh = rows[:-1], rows[-1]
         if self.compaction_mode == "summary":
+            await self.may_continue(tl)
             await self._summary_compact(tl, rows)
             return
         violations: list[str] | None = None
         calls: list[dict] = []
         for attempt in range(2):
+            await self.may_continue(tl)
             budget = int(self.compact_tokens * compaction.BUDGET_FRACTION)
             blocks, last = await self.complete(
                 f"{self.role(tl)}:compaction", self.system(tl),
                 compaction.extract_request(render(prefix), prefix, violations, budget,
                                            compaction.estimate_tokens(render(rows))),
                 [compaction.COMPACT_TOOL], max_tokens=4000)
+            await self.may_continue(tl)  # nothing of a compaction that comes back after a cancel is stored
             if last:
                 calls.append(last)
             items = compaction.parse_items(blocks)
@@ -700,6 +714,7 @@ class Harness:
         prefix, fresh = rows[:-1], rows[-1]
         blocks, last = await self.complete(f"{self.role(tl)}:compaction", self.system(tl),
                                            compaction.request(render(prefix)), [], max_tokens=2000)
+        await self.may_continue(tl)  # nothing of a summary that comes back after a cancel is stored
         sid = self.store.add_compressed_turn(tl, "user", compaction.summary_turn(blocks),
                                              prefix[0]["row_id"], prefix[-1]["row_id"])
         view_ids = [sid, fresh["row_id"]]
@@ -766,6 +781,12 @@ class Harness:
         if missing:
             self._store_results(tl=tl, results=missing)
 
+    async def may_continue(self, tl: str) -> None:
+        """Ask tl's machine whether its run may take its next step (a model call, a tool, the next
+        text). Returns when it may. A run whose request was withdrawn is not answered here:
+        the machine leaves the run's state, which ends this run where it waits."""
+        await self.machines.ask(tl=tl, name="may_continue", build=lambda reply: reply)
+
     async def _loop(self, tl: str, kind: str, wake: bool = False, report: bool = False) -> RunOutcome:
         """The model loop for tl: the activity of its machine's `busy` (or `background`) state.
         Returns how it ended, and nothing more: a reply with no tool call, an empty response, a
@@ -774,16 +795,30 @@ class Harness:
         original rests). A clone that hands the conversation to a focus graft ends the run from
         the machine (the state is left). `wake`: the run was started for joins; `report`: it may
         only report (no clone). `kind`: tl's kind, as its machine says; it decides only whether
-        tl's text reaches the user."""
+        tl's text reaches the user.
+
+        Whether the run may go on is its machine's decision, asked (`may_continue`) before every
+        step that could act: each compaction call and model call, when either comes back (a
+        response or a compaction is then not stored, said or acted on), after each text it says
+        (nothing more of that response is said or run), and before each tool call and the
+        response's cancel calls. A run whose request was withdrawn is ended by its machine
+        there (the calls it stored but did not run are closed by the machine as not run)."""
         background = kind == "background"
+        # The run starts inside a machine step, so this first question is answered in that step
+        # and the answer reaches the run only after it: a caller cancelled in that step has
+        # withdrawn its request by then, and the machine has ended the run. Every later question
+        # (before the first model call too) is answered in the step the run acts in.
+        await self.may_continue(tl)
         await self.maybe_compact(tl)
         for _ in range(self.max_steps):
+            await self.may_continue(tl)
             rows = self.store.working_view(tl)
             violations = validate(rows, tl)
             if violations:
                 raise RuntimeError(f"{tl} view invalid before model call: {violations}")
             tools = self.store.tools_for(tl)
             blocks, last = await self.complete(self.role(tl), self.system(tl), render(rows), tools)
+            await self.may_continue(tl)
             pending = self._after_compaction.pop(tl, None)
             if pending is not None and last:
                 pending["first_call_after"] = {k: last[k] for k in ("input", "cached", "cache_write", "uncached")}
@@ -794,6 +829,7 @@ class Harness:
             for b in blocks:
                 if b["type"] == "text":
                     self.say(tl=tl, text=b["text"], background=background)
+                    await self.may_continue(tl)
             uses = [b for b in blocks if b["type"] == "tool_use"]
             if not uses:
                 return RunOutcome(kind="replied")  # a background graft's reply is its result
@@ -833,6 +869,7 @@ class Harness:
             # Each result is stored as soon as its call returns, so a later call of the same
             # response that raises never leaves a call that ran recorded as not run.
             for u in uses:
+                await self.may_continue(tl)
                 if u is refused_join:
                     if background:
                         msg = ("join(reason='done') refused: you have not written your result yet. First "
@@ -858,6 +895,7 @@ class Harness:
             # The cancel calls run after every other call's result is stored: one request to the
             # machine, which stores each call's real result once the grafts have stopped.
             if cancels:
+                await self.may_continue(tl)
                 await self._cancels(tl=tl, uses=cancels)
         self.trace(f"[{tl}] step budget exhausted")
         return RunOutcome(kind="exhausted")

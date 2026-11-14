@@ -8,6 +8,7 @@ fixes the order."""
 import asyncio
 import contextlib
 import json
+import re
 import threading
 
 import pytest
@@ -1967,12 +1968,13 @@ def test_a_cancelled_turn_leaves_a_valid_view_and_no_open_transaction(tmp_path):
         turn.cancel()
         with pytest.raises(asyncio.CancelledError):
             await turn
+        assert await h.until_rest("o") == "ended"  # the withdrawal is the machine's to carry out
         assert validate(store.view("o"), "o", require_user_end=False) == []  # no dangling tool_use
         result = [r["content"] for r in store.view("o") if r["kind"] == "tool_result"]
         assert len(result) == 1 and '"is_error": true' in result[0]
         statuses = [r[0] for r in store.con.execute("SELECT status FROM transactions")]
         assert statuses and set(statuses) == {"rolled_back"}
-        assert clones(store) == [] and await h.until_rest("o") == "ended"
+        assert clones(store) == []
         assert await h.user_says("Hi.") == ["Hello."]  # and the next turn runs
         await h.close()
 
@@ -2084,8 +2086,6 @@ NESTING = 100_000  # depth of a nested list no repr can be built of
 
 def cancel_use(ids, id="x"):
     return {"type": "tool_use", "id": id, "name": "cancel", "input": {"cancel": ids}}
-
-
 
 
 def violations(store, tl):
@@ -3919,6 +3919,539 @@ def test_a_cancelled_call_ends_the_wake_run_that_follows_its_turn(tmp_path):
     assert violations(store=store, tl="o") == []
 
 
+# ------------------------------------------------------------------ a withdrawn request, wherever it is
+LIFECYCLE = ["waiting", "sending", "sending, a step later", "sending mid-step", "requesting", "requesting behind a run",
+             "running",
+             "returning", "saying", "joining", "noting", "wake", "hand-back", "withdrawn before the hand-over",
+             "handed over, then withdrawn", "forwarded to a focus graft", "focus graft starting"]
+HOLD_CLONE = ("withdrawn before the hand-over", "handed over, then withdrawn")
+
+
+@pytest.mark.parametrize("point", LIFECYCLE)
+def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is(tmp_path, point):
+    """The user's call is cancelled at each point of its request's lifecycle. A model call is
+    for the last user message in its view; the scripted provider records (and the test fails on)
+    any model call started for a request whose caller had already gone, and no tool runs and no
+    text is said for it after the cancel. The conversation stays valid."""
+    gates = {name: threading.Event() for name in ("A", "B", "root", "c1", "wake", "clone")}
+    entered = {name: threading.Event() for name in gates}
+    cancelled: set[str] = set()
+    started_after_cancel: list[tuple[str, str]] = []
+    said_at_cancel: dict[str, int] = {}
+    tasks: dict[str, asyncio.Task] = {}
+
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        request = user_texts(messages)[-1]
+        if "clone" in names:
+            if is_wake(last):
+                entered["wake"].set()
+                assert gates["wake"].wait(GATE_TIMEOUT)
+                return [{"type": "tool_use", "id": "w", "name": "load_skill", "input": {"name": "clone"}}]
+            if last["type"] == "tool_result":
+                entered["root"].set()
+                assert gates["root"].wait(GATE_TIMEOUT)
+                return text("Started.")
+            if request.startswith(("BG", "FOCUS")):
+                focus = request.startswith("FOCUS")
+                if point in HOLD_CLONE:  # the original's turn is held while B arrives
+                    entered["clone"].set()
+                    assert gates["clone"].wait(GATE_TIMEOUT)
+                return [clone_use(clone_entry(skills=["website"], focus=focus, quotes=[request]), id="t1")
+                        | {"type": "tool_use"}]
+            if request in gates:
+                entered[request].set()
+                assert gates[request].wait(GATE_TIMEOUT)
+            write = {"type": "tool_use", "id": f"s{len(messages)}", "name": "site_write",
+                     "input": {"page": request, "content": "x"}}
+            if request == "B" and point == "running":
+                return [write]
+            load = {"type": "tool_use", "id": "l1", "name": "load_skill", "input": {"name": "clone"}}
+            if request == "B" and point == "saying":  # the caller goes away as the first text is said
+                return text(f"answer to {request}") + text(f"more for {request}") + [load]
+            if request == "B" and point == "returning":  # the caller goes away as the response comes back
+                return [load]
+            return text(f"answer to {request}")
+        if request.startswith("FOCUS-OOS"):  # a focus graft that hands the request back at once
+            return [{"type": "tool_use", "id": "j", "name": "join", "input": {"reason": "out_of_scope"}}]
+        if request.startswith("FOCUS"):
+            entered["c1"].set()
+            assert gates["c1"].wait(GATE_TIMEOUT)
+            return text(f"c1 answers {request}")
+        return text("website finished")  # a background graft
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+    real_complete = h.complete
+
+    async def complete(tag, system, messages, tools, **kw):
+        request = user_texts(messages)[-1]
+        if request in cancelled:  # a model call started after its caller had gone
+            started_after_cancel.append((tag, request))
+        result = await real_complete(tag, system, messages, tools, **kw)
+        if point == "returning" and request == "B":  # cancelled in the step the response is handed back in
+            cancel("B")
+        return result
+
+    h.complete = complete
+    real_load, loaded = h.load, []
+
+    def load(tl, name):  # the only tool the original holds
+        loaded.append((tl, name))
+        return real_load(tl, name)
+
+    h.load = load
+
+    def cancel(name):
+        cancelled.add(name)
+        said_at_cancel[name] = len(said)
+        tasks[name].cancel()
+
+    def emit(line):
+        said.append(line)
+        if point == "saying" and line == "answer to B":
+            cancel("B")
+
+    h.emit = emit
+
+    def cancel_inside(method, name, when=lambda **kw: True):
+        real = getattr(h, method)
+
+        def call(**kw):
+            result = real(**kw)
+            if when(**kw) and name not in cancelled:
+                cancel(name)
+            return result
+        setattr(h, method, call)
+
+    async def caller_gone(name):
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[name]
+
+    async def go():
+        await h.start()
+        if point == "waiting":  # B waits behind A's run
+            tasks["A"] = asyncio.create_task(h.user_says("A"))
+            await until(event=entered["A"], what="A's model call")
+            tasks["B"] = now(h.user_says("B"))
+            cancel("B")
+            gates["A"].set()
+            assert await asyncio.wait_for(tasks["A"], WAIT_TIMEOUT) == ["answer to A"]
+            await caller_gone("B")
+        elif point == "sending":  # cancelled as soon as the call has put its request on the machine
+            tasks["B"] = now(h.user_says("B"))
+            cancel("B")
+            await caller_gone("B")
+        elif point == "sending, a step later":  # cancelled one loop step after its run started
+            tasks["B"] = now(h.user_says("B"))
+            await asyncio.sleep(0)
+            cancel("B")
+            await caller_gone("B")
+        elif point == "sending mid-step":  # B starts and is cancelled while A's withdrawal is processed
+            real_post = h.machines.post
+
+            def post(tl, name, data=None):
+                real_post(tl=tl, name=name, data=data)
+                if name == "withdraw" and "B" not in tasks:
+                    tasks["B"] = asyncio.Task(h.user_says("B"), loop=asyncio.get_running_loop(), eager_start=True)
+                    cancel("B")
+
+            h.machines.post = post
+            tasks["A"] = asyncio.create_task(h.user_says("A"))
+            await until(event=entered["A"], what="A's model call")
+            cancel("A")
+            gates["A"].set()
+            await caller_gone("A")
+            await caller_gone("B")
+        elif point == "requesting behind a run":  # B waits behind A and is cancelled as its row is written
+            cancel_inside(method="begin_request", name="B", when=lambda tl, text: text == "B")
+            tasks["A"] = asyncio.create_task(h.user_says("A"))
+            await until(event=entered["A"], what="A's model call")
+            tasks["B"] = now(h.user_says("B"))
+            gates["A"].set()
+            assert await asyncio.wait_for(tasks["A"], WAIT_TIMEOUT) == ["answer to A"]
+            await caller_gone("B")
+        elif point in ("saying", "returning"):
+            gates["B"].set()
+            tasks["B"] = asyncio.create_task(h.user_says("B"))
+            await caller_gone("B")
+        elif point == "requesting":  # cancelled while its row is written
+            cancel_inside(method="begin_request", name="B", when=lambda tl, text: text == "B")
+            tasks["B"] = asyncio.create_task(h.user_says("B"))
+            await caller_gone("B")
+        elif point == "running":  # cancelled in its model call: the response is never acted on
+            tasks["B"] = asyncio.create_task(h.user_says("B"))
+            await until(event=entered["B"], what="B's model call")
+            cancel("B")
+            gates["B"].set()
+            await caller_gone("B")
+        elif point in ("joining", "noting", "wake"):  # a background join lands during the turn
+            if point == "joining":
+                cancel_inside(method="apply_join", name="BG go")
+            elif point == "noting":
+                cancel_inside(method="wake_note", name="BG go")
+            tasks["BG go"] = asyncio.create_task(h.user_says("BG go"))
+            await until(event=entered["root"], what="the turn's reply")
+            await h.join_queued("c1")
+            gates["root"].set()
+            if point == "wake":
+                await until(event=entered["wake"], what="the wake run's model call")
+                cancel("BG go")
+                gates["wake"].set()
+            await caller_gone("BG go")
+        elif point == "hand-back":  # the focus graft hands the request back: no run answers it
+            cancel_inside(method="apply_join", name="FOCUS-OOS go")
+            tasks["FOCUS-OOS go"] = asyncio.create_task(h.user_says("FOCUS-OOS go"))
+            await caller_gone("FOCUS-OOS go")
+        elif point in HOLD_CLONE:  # B waits on the original while its turn clones a focus graft
+            tasks["FOCUS go"] = asyncio.create_task(h.user_says("FOCUS go"))
+            await until(event=entered["clone"], what="the original's clone call")
+            tasks["B"] = now(h.user_says("B"))  # kept on the original, then handed to c1 with the conversation
+            if point == "withdrawn before the hand-over":
+                cancel("B")
+            gates["clone"].set()
+            await until(event=entered["c1"], what="the focus graft's model call")
+            if point == "handed over, then withdrawn":
+                cancel("B")
+            gates["c1"].set()
+            assert await asyncio.wait_for(tasks["FOCUS go"], WAIT_TIMEOUT)
+            await caller_gone("B")
+        elif point == "forwarded to a focus graft":  # B reaches c1 after the hand-over
+            gates["root"].set()
+            tasks["FOCUS go"] = asyncio.create_task(h.user_says("FOCUS go"))
+            await until(event=entered["c1"], what="the focus graft's model call")
+            tasks["B"] = now(h.user_says("B"))  # forwarded to c1 and kept there
+            cancel("B")
+            gates["c1"].set()
+            assert await asyncio.wait_for(tasks["FOCUS go"], WAIT_TIMEOUT)
+            await caller_gone("B")
+        elif point == "focus graft starting":  # cancelled while the clone call that makes c1 commits
+            cancel_inside(method="commit_clone", name="FOCUS go")
+            tasks["FOCUS go"] = asyncio.create_task(h.user_says("FOCUS go"))
+            await caller_gone("FOCUS go")
+        for gate in gates.values():
+            gate.set()
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert started_after_cancel == [], point
+    assert h.world.log == [], point
+    for name, mark in said_at_cancel.items():  # nothing is said for a request after its cancel
+        assert not any(line in (f"answer to {name}", f"more for {name}", f"c1 answers {name}")
+                       for line in said[mark:]), point
+    if point in ("waiting", "sending mid-step"):  # B was withdrawn before it was taken: no row is written
+        assert "B" not in [r["content"] for r in store.view("o") if r["kind"] == "text"], point
+    assert loaded == [], point  # no tool ran for a withdrawn request
+    for tl in ("o", "c1"):
+        if store.timeline(tl) is not None:
+            assert violations(store=store, tl=tl) == [], (point, tl)
+    if point == "focus graft starting":
+        assert [r for r in store.view("c1") if r["role"] == "assistant"] == []  # c1 never acted
+
+
+WITHIN_A_RUN = ["a tool runs", "a tool result is stored", "the second model call", "a later model call",
+               "a later response comes back", "compaction", "a compaction call comes back", "summary compaction"]
+TOOL_CALLS_RUN = {"a tool runs": 1, "a tool result is stored": 1, "the second model call": 1,
+                  "a later model call": 2, "a later response comes back": 1, "compaction": 0,
+                  "a compaction call comes back": 0, "summary compaction": 0}
+COMPACTING = ("compaction", "a compaction call comes back", "summary compaction")
+
+
+def load_use(*, n):
+    return {"type": "tool_use", "id": f"l{n}", "name": "load_skill", "input": {"name": "clone"}}
+
+
+@pytest.mark.parametrize("point", WITHIN_A_RUN)
+def test_a_withdrawn_request_starts_nothing_more_wherever_its_run_is(tmp_path, point):
+    """The user's call is cancelled at each step inside the run that answers it: while a tool
+    runs, as a tool's result is stored, in the run's second and a later model call and as a later
+    response comes back, during its compaction and as a compaction call comes back, and (summary
+    compaction) one loop step after its run started. From the cancel on, no model call (compaction included) and no tool call is
+    started and nothing is said; the run's view stays valid."""
+    gate, entered = threading.Event(), threading.Event()
+    calls_after, loaded, task = [], [], {}
+
+    def policy(system, messages, tools):
+        if not tools:  # a summary compaction call
+            return text("summary")
+        if "compact" in {t["name"] for t in tools}:  # the compaction call: refused, so it would retry
+            if point == "compaction":
+                entered.set()
+                assert gate.wait(GATE_TIMEOUT)
+            return text("no compact call")
+        if user_texts(messages)[-1] == "A":
+            return text("answer to A")
+        done = sum(1 for m in messages for b in m["content"] if b["type"] == "tool_result")
+        if point == "a tool runs" and done == 0:
+            return [load_use(n=1), load_use(n=2)]
+        if point in ("a tool runs", "a tool result is stored", *COMPACTING) and done:
+            return text("answer to B")
+        if point == "a later response comes back" and done == 1:
+            return text("answer to B")
+        if (point, done) in (("the second model call", 1), ("a later model call", 2)):
+            entered.set()
+            assert gate.wait(GATE_TIMEOUT)
+            return text("answer to B") if point == "a later model call" else [load_use(n=done + 1)]
+        return [load_use(n=done + 1)]
+
+    compacts = point in COMPACTING
+    store, h, said = make(tmp_path=tmp_path, policy=policy, compact_tokens=1 if compacts else None,
+                          compaction_mode="summary" if point == "summary compaction" else "turns")
+    real_complete, real_load, real_store = h.complete, h.load, h._store_results
+
+    def cancel():
+        task["cancelled"] = len(said)
+        task["B"].cancel()
+
+    async def complete(tag, system, messages, tools, **kw):
+        if "cancelled" in task:  # a model call started after the caller had gone
+            calls_after.append(tag)
+        result = await real_complete(tag, system, messages, tools, **kw)
+        done = sum(1 for m in messages for b in m["content"] if b["type"] == "tool_result")
+        if "cancelled" not in task and (
+                (point == "a later response comes back" and done == 1 and user_texts(messages)[-1] == "B")
+                or (point == "a compaction call comes back" and tag.endswith(":compaction"))):
+            cancel()  # the caller goes away in the step the response is handed back in
+        return result
+
+    def load(tl, name):
+        loaded.append(name)
+        result = real_load(tl, name)
+        if point == "a tool runs" and "cancelled" not in task:
+            cancel()  # the caller goes away while the tool runs
+        return result
+
+    def store_results(tl, results):
+        real_store(tl=tl, results=results)
+        if point == "a tool result is stored" and results[0][0]["id"] == "l1":
+            cancel()
+
+    h.complete, h.load, h._store_results = complete, load, store_results
+
+    async def go():
+        await h.start()
+        if compacts:
+            assert await h.user_says("A") == ["answer to A"]
+        if point == "summary compaction":  # the run starts at once; the caller goes away one step later
+            task["B"] = now(h.user_says("B"))
+            await asyncio.sleep(0)
+            cancel()
+        else:
+            task["B"] = asyncio.create_task(h.user_says("B"))
+        if point in ("the second model call", "a later model call", "compaction"):
+            await until(event=entered, what="the gated model call")
+            cancel()
+            gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task["B"]
+        gate.set()
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert calls_after == [], point
+    assert len(loaded) == TOOL_CALLS_RUN[point], point
+    assert "answer to B" not in said[task["cancelled"]:], point
+    assert violations(store=store, tl="o") == [], point
+
+
+@pytest.mark.parametrize("mode", ["turns", "summary"])
+def test_a_compaction_that_comes_back_after_the_cancel_stores_nothing(tmp_path, mode):
+    """B's call is cancelled as its run's compaction call comes back with a compaction that would
+    be accepted: nothing of it is stored (no compressed row, no compaction mark), no model call
+    follows, and nothing is said for B."""
+    long_a = "A " + "detail " * 300
+    task, at_cancel, calls_after = {}, {}, []
+
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        if not tools:  # the summary compaction call
+            return text("summary of A")
+        if names == {"compact"}:  # compress A into one short row, keep its answer
+            first, second = re.findall(r"row_id=(\d+) ", messages[-1]["content"][-1]["text"])[:2]
+            return [{"type": "tool_use", "id": "k", "name": "compact", "input": {"items": [
+                {"op": "compress", "role": "user", "text": "A, in short", "begin_row_id": int(first),
+                 "end_row_id": int(first)},
+                {"op": "keep", "row_id": int(second)}]}}]
+        return text("answer to " + user_texts(messages)[-1][:1])
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy, compact_tokens=200, compaction_mode=mode)
+    real_complete = h.complete
+
+    def counts():
+        return (store.con.execute("SELECT COUNT(*) FROM turns").fetchone()[0],
+                store.con.execute("SELECT COUNT(*) FROM compactions").fetchone()[0])
+
+    async def complete(tag, system, messages, tools, **kw):
+        if "cancelled" in task:
+            calls_after.append(tag)
+        result = await real_complete(tag, system, messages, tools, **kw)
+        if tag.endswith(":compaction") and "B" in task and "cancelled" not in task:
+            task["cancelled"], at_cancel["counts"] = len(said), counts()
+            task["B"].cancel()  # the caller goes away as the compaction call comes back
+        return result
+
+    h.complete = complete
+
+    async def go():
+        await h.start()
+        assert await h.user_says(long_a) == ["answer to A"]
+        task["B"] = asyncio.create_task(h.user_says("B"))
+        with pytest.raises(asyncio.CancelledError):
+            await task["B"]
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert "cancelled" in task, "no compaction call was made"
+    assert counts()[1] == at_cancel["counts"][1] and counts()[0] == at_cancel["counts"][0], (at_cancel, counts())
+    assert calls_after == [] and said[task["cancelled"]:] == [] and h.compactions == []
+    assert violations(store=store, tl="o") == []
+
+
+def test_a_compaction_that_comes_back_before_any_cancel_is_stored(tmp_path):
+    """The same compaction with no cancel is accepted and stored: the cancel test above is not
+    passing because the compaction was refused."""
+    long_a = "A " + "detail " * 300
+
+    def policy(system, messages, tools):
+        if {t["name"] for t in tools} == {"compact"}:
+            first, second = re.findall(r"row_id=(\d+) ", messages[-1]["content"][-1]["text"])[:2]
+            return [{"type": "tool_use", "id": "k", "name": "compact", "input": {"items": [
+                {"op": "compress", "role": "user", "text": "A, in short", "begin_row_id": int(first),
+                 "end_row_id": int(first)},
+                {"op": "keep", "row_id": int(second)}]}}]
+        return text("answer to " + user_texts(messages)[-1][:1])
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy, compact_tokens=200)
+
+    async def go():
+        await h.start()
+        await h.user_says(long_a)
+        assert await h.user_says("B") == ["answer to B"]
+        await h.close()
+
+    asyncio.run(go())
+    assert h.compactions == ["o"] and violations(store=store, tl="o") == []
+
+
+def test_a_withdrawn_request_runs_no_cancel_call_after_the_cancel(tmp_path):
+    """The caller of B goes away while a tool of B's response runs; the response's cancel call,
+    which runs after the other calls, is never run: the background graft it names is not stopped."""
+    finish, task = threading.Event(), {}
+
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" not in names:  # the background graft finishes once released
+            assert finish.wait(GATE_TIMEOUT)
+            return text("website finished")
+        if is_wake(last):  # the graft's join is reported
+            return text("reported")
+        if user_texts(messages)[-1] == "BG go":
+            if last["type"] == "tool_result":
+                return text("Started.")
+            return [clone_use(clone_entry(skills=["website"], focus=False, quotes=["BG go"]), id="t1")
+                    | {"type": "tool_use"}]
+        return [cancel_use(ids=["c1"], id="x1"), load_use(n=1)]  # the cancel calls run after the others
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+    real_load = h.load
+
+    def load(tl, name):
+        result = real_load(tl, name)
+        task["B"].cancel()  # the caller goes away while the tool runs
+        return result
+
+    h.load = load
+
+    async def go():
+        await h.start()
+        assert await h.user_says("BG go") == ["Started."]
+        task["B"] = asyncio.create_task(h.user_says("B"))
+        with pytest.raises(asyncio.CancelledError):
+            await task["B"]
+        finish.set()
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert store.timeline("c1")["join_reason"] == "done"  # never cancelled
+    assert results_by_name(store=store, tl="o")["cancel"] == (NOT_RUN_INTERRUPTED, True)
+    assert violations(store=store, tl="o") == []
+
+
+@pytest.mark.parametrize("where", ["sending", "running"])
+def test_a_cancelled_call_followed_at_once_by_another_loses_nothing(tmp_path, where):
+    """A user's call is cancelled and another is made at once (its request is put on the machine
+    while the first one's withdrawal is): nothing it posted is lost. The second is answered,
+    `settle` raises nothing, nothing is reported, and `close` stops every machine."""
+    gate, entered = threading.Event(), threading.Event()
+
+    def policy(system, messages, tools):
+        request = user_texts(messages)[-1]
+        if request == "A":
+            entered.set()
+            assert gate.wait(GATE_TIMEOUT)
+        return text(f"answer to {request}")
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+
+    async def go():
+        await h.start()
+        first = now(h.user_says("A"))
+        if where == "running":
+            await until(event=entered, what="A's model call")
+        first.cancel()
+        second = now(h.user_says("B"))
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert await asyncio.wait_for(second, WAIT_TIMEOUT) == ["answer to B"]
+        assert await asyncio.wait_for(h.settle(), WAIT_TIMEOUT) == []
+        await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+        with pytest.raises(TransitionRefused, match="refused in state closed"):
+            await h.user_says("again")  # every machine was stopped
+
+    asyncio.run(go())
+    assert said == ["answer to B"] and h.task_errors == [] and h.wake_errors == []
+    assert violations(store=store, tl="o") == []
+
+
+def test_a_message_waiting_when_the_original_hands_over_is_answered_before_a_later_one(tmp_path):
+    """B arrives while the original's turn is cloning a focus graft; C after the hand-over. The
+    focus graft holds the conversation and answers B, then C: never C before B."""
+    gate, calls = threading.Event(), []
+
+    def policy(system, messages, tools):
+        request = user_texts(messages)[-1]
+        if "clone" in {t["name"] for t in tools}:
+            if messages[-1]["content"][-1]["type"] == "tool_result":
+                return text("Handing over.")
+            assert gate.wait(GATE_TIMEOUT)
+            return [clone_use(clone_entry(skills=["website"], focus=True, quotes=[request]), id="t1") | {"type": "tool_use"}]
+        calls.append(request)
+        return text(f"c1 answers {request}")
+
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
+
+    async def go():
+        await h.start()
+        first = now(h.user_says("Build a website."))
+        second = now(h.user_says("B"))  # waits on the original while it runs
+        gate.set()
+        await asyncio.wait_for(first, WAIT_TIMEOUT)
+        await asyncio.wait_for(second, WAIT_TIMEOUT)  # answered by the focus graft, not left waiting
+        await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert calls == ["Build a website.", "B", "C"]
+    assert [r["content"] for r in store.view("c1") if r["role"] == "user" and r["kind"] == "text"] == [
+        "Build a website.", "B", "C"]
+
+
 def test_a_tool_that_ran_keeps_its_result_when_a_later_call_of_the_response_raises(tmp_path):
     class Raising(World):
         def execute(self, name, args):
@@ -4186,3 +4719,19 @@ def test_a_focus_graft_whose_join_can_never_be_applied_ends_abandoned(tmp_path, 
     asyncio.run(go())
     told = said_errors(said)
     assert len(told) == 2 and "will be retried" in told[0] and "is abandoned" in told[1]
+
+
+# ------------------------------------------------------------------ a step that fails is never lost
+def _send_fails_once(sm, name):
+    """Fault injection: the next `name` event sent to sm's machine raises in the step that sends
+    it (an effect of another machine). Returns the error it raises."""
+    real, error = sm.dispatch, RuntimeError(f"cannot send {name}")
+    fired: list[str] = []
+
+    def dispatch(ctx, event):
+        if event.name == name and not fired:
+            fired.append(name)
+            raise error
+        return real(ctx, event)
+    sm.dispatch = dispatch
+    return error
