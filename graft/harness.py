@@ -1287,17 +1287,16 @@ class Harness:
         may make one more clone call after this one (the machine counts them).
 
         The input is model-written and anything can fail on it. Whatever is raised in here (the
-        seeder, a store write) ends as a refusal with every transaction `rolled_back`; if the run
-        is ended meanwhile, the transactions are closed and the end goes on."""
+        seeder, a store write) ends as a refusal with every transaction `rolled_back`. If the run
+        is ended meanwhile (this activity is cancelled), nothing more is done here: the machine
+        rolls the call back in a state of its own (`roll_back_clone`)."""
         txs: list[int] = []
         try:
             prepared = await self._prepare_clone(src=src, use=clone.use, retry_left=retry_left, txs=txs)
-        except BaseException as e:  # an error, or the run was ended while the call was being prepared
+        except Exception as e:  # noqa: BLE001 - an error is a refusal of the call
             err = f"{type(e).__name__}: {e}"
             self._roll_back(src=src, txs=txs, scratch={"args": clone.use.get("input"), "error": err})
             self.trace(f"[{src}] clone refused: internal error: {err}")
-            if not isinstance(e, Exception):
-                raise  # ended: the transactions are closed; the machine closes the tool call
             tail = "Call clone once more." if retry_left \
                 else "No retries left for this message; answer the user instead."
             return f"clone refused; no clone was created: internal error ({err}).\n{tail}"
@@ -1305,6 +1304,14 @@ class Harness:
             return prepared
         batch, pairs, parts = prepared
         return Prepared(pairs=pairs, parts=parts, data=batch)
+
+    def roll_back_clone(self, src: str) -> None:
+        """A clone call whose preparation was cut short (the run was ended while it was being
+        seeded): its open audit transactions are closed as `rolled_back` (the activity of the
+        machine's `unpreparing` state; if this raises, the machine reports it)."""
+        self._roll_back(src=src, txs=self.store.open_txs(tl=src, kind="clone"),
+                        scratch={"error": "the turn ended while the call was prepared"})
+        self.trace(f"[{src}] clone not executed: the turn ended while it was prepared")
 
     def _roll_back(self, src: str, txs: list[int], scratch: dict) -> None:
         if not txs:

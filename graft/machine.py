@@ -11,7 +11,10 @@ Three rules hold everywhere in this module.
 * Anything that can fail is a state's activity: a run of the model loop, every store write, the
   report lines and trace the user's callbacks receive, starting a graft's machine. The activity
   ends by dispatching its outcome as an event; if it raises, the library dispatches `hsm/error`,
-  and a transition of that state handles it. So a failed write can never leave a machine stuck:
+  and a transition of that state handles it. A run of the model loop types its own failure
+  (`run_failed`), since states inside it (`preparing`, a step's writes) have activities and
+  `hsm/error` transitions of their own: a clone call being prepared when the run fails is cut
+  short and rolled back, and a step finishes first. So a failed write can never leave a machine stuck:
   the state that does the write is left by its outcome event or by its error event, and both are
   transitions. Fire-and-forget writes (the store copy of each state, report
   lines, trace) go to the scribe machine, which does them one at a time in its `writing` state.
@@ -65,6 +68,8 @@ unless the request it answers was withdrawn before it could act: then at rest):
                         their result rows, and each row that could not be written told
         ran           (choice) how the run ended (a RunOutcome): a focus graft that joined or spent
                       its step budget hands back (`handing_back`, activity: its join event)
+        unpreparing   the run was left while a clone call was prepared: the call is rolled back
+                      (activity; then `unwound`, a choice: a driven turn rests, others close calls)
         closing_calls the run ended early: its open tool calls get results (activity)
         failing       (a focus graft) its run raised: it joins `failed` (activity; `unrecorded`,
                       a choice, if that failed)
@@ -257,6 +262,7 @@ class Host(Protocol):
     def graft_failed(self, tl: str, error: BaseException) -> None: ...
     def begin_request(self, tl: str, text: str) -> int: ...
     async def prepare_clone(self, src: str, clone: Clone, retry_left: bool) -> "Prepared | str": ...
+    def roll_back_clone(self, src: str) -> None: ...
     def commit_clone(self, src: str, clone: Clone) -> str: ...
     def refuse_clone(self, src: str, clone: Clone, why: str, error: BaseException | None) -> str: ...
     def store_result(self, tl: str, use: dict, content: str, is_error: bool) -> None: ...
@@ -792,6 +798,11 @@ def wakes_to_route(ctx, inst, event) -> bool:
     return _wakes(inst) and not inst.ends_on_request and _routing(inst)
 
 
+def is_driven(ctx, inst, event) -> bool:
+    """A turn its caller drives: the caller writes its own rows, so its open calls are its own."""
+    return inst.mode.name == "external"
+
+
 # ------------------------------------------------------------------ activities
 def _still_running(inst: TimelineSM) -> list[str]:
     """Its background grafts still running: live, and whose join is not on its queue."""
@@ -804,8 +815,17 @@ async def busy_activity(ctx, inst: TimelineSM, event) -> None:
     ended (a RunOutcome); the graph decides what follows (leaving the state ends this activity).
     Before each step that could act (a model call, a tool, the next text) the run asks its
     machine (`may_continue`); a run whose request was withdrawn is answered by leaving
-    this state, so it is ended there and then."""
-    outcome = await inst.host.run_busy(tl=inst.timeline_id, mode=inst.mode, kind=inst.kind)
+    this state, so it is ended there and then. A run that raises ends with its own outcome,
+    `run_failed`, never `hsm/error`: a state inside the run that does I/O of its own (a clone
+    call being prepared, a step) handles `hsm/error` as its own failure, so the run's failure is
+    typed to be told apart from it. Like the library's own `hsm/error`, it is sent only while the
+    run's state is still active: a run that raises as it is ended (its state left) is stale."""
+    try:
+        outcome = await inst.host.run_busy(tl=inst.timeline_id, mode=inst.mode, kind=inst.kind)
+    except Exception as error:  # noqa: BLE001 - the outcome event carries it
+        if not ctx.is_done():
+            inst.dispatch(inst.context(), hsm.Event(name="run_failed", data=error))
+        return
     await inst.dispatch(inst.context(), hsm.Event(name="turn_done", data=outcome))
 
 
@@ -816,7 +836,7 @@ async def background_activity(ctx, inst: TimelineSM, event) -> None:
 
 async def prepare_activity(ctx, inst: TimelineSM, event) -> None:
     """The harness seeds and validates the clone call (its seeder may take a while: a withdrawal
-    or shutdown ends this activity, and the harness rolls the call's audit back). The outcome is
+    or shutdown ends this activity, and `unpreparing` rolls the call's audit back). The outcome is
     `prepared`: a Prepared call, or the text of a refusal the harness already audited."""
     prepared = await inst.host.prepare_clone(src=inst.timeline_id, clone=inst.clone,
                                              retry_left=inst.clone_tries < CLONE_TRIES)
@@ -862,6 +882,12 @@ async def unspawn_activity(ctx, inst: TimelineSM, event) -> None:
 
 def _write_request(inst, event):
     return inst.host.begin_request(tl=inst.timeline_id, text=inst.request.text)
+
+
+def _unprepare(inst, event):
+    """A clone call whose preparation was cut short: its open audit transactions are closed as
+    rolled back (the activity of `unpreparing`)."""
+    inst.host.roll_back_clone(src=inst.timeline_id)
 
 
 def _commit(inst, event):
@@ -1174,6 +1200,11 @@ def end_driven(ctx, inst, event) -> None:
     _resolve(reply=event.data, value="ended")
 
 
+def unprepare_failed(ctx, inst, event) -> None:
+    """Rolling the cut-short call back failed: the user is told, and settle raises it."""
+    _report(inst=inst, kind="task", clones=[], error=event.data)
+
+
 def error_shown(ctx, inst, event) -> None:
     inst.reported = None
 
@@ -1189,6 +1220,11 @@ def set_closing(ctx, inst, event) -> None:
 
 def set_final(ctx, inst, event) -> None:
     inst.closing = inst.final = True
+
+
+def run_failed_after_it_ended(ctx, inst, event) -> None:
+    """The run raised while a step waited, and the step ended the run: its failure is reported."""
+    _report(inst=inst, kind="task", clones=[], error=event.data)
 
 
 def interrupted_closing(ctx, inst, event) -> None:
@@ -1704,6 +1740,16 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
             "preparing", hsm.Activity(prepare_activity),
             T(On("prepared"), S("../prepared_gate"), hsm.Effect(take_prepared)),
             T(On(E), S("../steps/cloning/rejecting"), hsm.Effect(preparation_crashed)),
+            # left early (the run's request withdrawn, the run raised, shutdown, a driven turn
+            # ended): the call it was preparing is rolled back in a state of its own before the
+            # run's closing. A run that raised is told the way `busy` tells it (only the original
+            # prepares a clone call, so the focus graft's branch does not arise here)
+            T(On("withdraw"), S("../../../unpreparing"), G(ends_run), hsm.Effect(note_withdrawn)),
+            T(On("run_failed"), S("../../../unpreparing"), G(error_to_user), hsm.Effect(error_for_user)),
+            T(On("run_failed"), S("../../../unpreparing"), G(error_already_shown), hsm.Effect(error_shown)),
+            T(On("run_failed"), S("../../../unpreparing"), hsm.Effect(error_reported)),
+            T(On("shutdown"), S("../../../unpreparing"), hsm.Effect(interrupted_closing)),
+            T(On("driven_done"), S("../../../unpreparing"), hsm.Effect(end_driven)),
         ),
         hsm.Choice(
             "prepared_gate",
@@ -1712,8 +1758,9 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
             T(S("steps/cloning/committing")),
         ),
         hsm.State(
-            "steps",  # one clone or cancel request, step by step: shutdown and a driven end wait
-            hsm.Defer("shutdown", "driven_done"),
+            "steps",  # one clone or cancel request, step by step: shutdown, a driven end and the
+            # failure of the run (a clone or cancel request from outside it) wait
+            hsm.Defer("shutdown", "driven_done", "run_failed"),
             hsm.State(
                 "cloning",  # one clone call: committed, its machines started, its result written
                 hsm.Defer("focus_joined"),
@@ -1843,6 +1890,8 @@ def _timeline(name: str) -> hsm.Model:
         T(On("clone_request"), hsm.Effect(refuse_clone_call)),
         T(On("cancel_request"), hsm.Effect(refuse_cancel_call)),
         T(On("poke", "shutdown", "check"), hsm.Effect(ignore)),
+        # a run that raised during a step that then ended it (a hand-over, its request withdrawn)
+        T(On("run_failed"), hsm.Effect(run_failed_after_it_ended)),
         T(On("closing"), hsm.Effect(set_closing)),
         hsm.State(
             "live",
@@ -1883,10 +1932,10 @@ def _timeline(name: str) -> hsm.Model:
                 hsm.State(
                     "busy",
                     mirrored("active"),
-                    T(On(E), S("../failing"), G(is_focus)),
-                    T(On(E), S("../closing_calls"), G(error_to_user), hsm.Effect(error_for_user)),
-                    T(On(E), S("../closing_calls"), G(error_already_shown), hsm.Effect(error_shown)),
-                    T(On(E), S("../closing_calls"), hsm.Effect(error_reported)),
+                    T(On("run_failed", E), S("../failing"), G(is_focus)),
+                    T(On("run_failed", E), S("../closing_calls"), G(error_to_user), hsm.Effect(error_for_user)),
+                    T(On("run_failed", E), S("../closing_calls"), G(error_already_shown), hsm.Effect(error_shown)),
+                    T(On("run_failed", E), S("../closing_calls"), hsm.Effect(error_reported)),
                     T(On("withdraw"), S("../closing_calls"), G(ends_run), hsm.Effect(note_withdrawn)),
                     # the run asks before each step that could act: it goes on while the request it
                     # answers, if any, is live; once it is withdrawn the run is ended the way a
@@ -1897,6 +1946,16 @@ def _timeline(name: str) -> hsm.Model:
                     T(On("shutdown"), S("../closing_calls"), hsm.Effect(interrupted_closing)),
                     _work("run", hsm.Activity(busy_activity), T(On("turn_done"), S("../../ran"), hsm.Effect(end_run))),
                     _work("driven", T(On("driven_done"), S("../../rest"), hsm.Effect(end_driven))),
+                ),
+                hsm.State(
+                    "unpreparing", io(done="unprepared", work=_unprepare),  # a clone call cut short is rolled back
+                    T(On("unprepared"), S("../unwound")),
+                    T(On(E), S("../unwound"), hsm.Effect(unprepare_failed)),
+                ),
+                hsm.Choice(
+                    "unwound",
+                    T(S("rest"), G(is_driven)),  # a driven turn: its caller closes its own calls
+                    T(S("closing_calls")),
                 ),
                 hsm.Choice(
                     "ran",  # how the run ended: a focus graft that joins hands back; anything else rests

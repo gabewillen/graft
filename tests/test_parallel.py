@@ -1973,7 +1973,7 @@ def test_a_cancelled_turn_leaves_a_valid_view_and_no_open_transaction(tmp_path):
         result = [r["content"] for r in store.view("o") if r["kind"] == "tool_result"]
         assert len(result) == 1 and '"is_error": true' in result[0]
         statuses = [r[0] for r in store.con.execute("SELECT status FROM transactions")]
-        assert statuses and set(statuses) == {"rolled_back"}
+        assert statuses and set(statuses) == {"rolled_back"}  # rolled back by `unpreparing`
         assert clones(store) == []
         assert await h.user_says("Hi.") == ["Hello."]  # and the next turn runs
         await h.close()
@@ -4334,6 +4334,53 @@ def test_a_compaction_that_comes_back_before_any_cancel_is_stored(tmp_path):
 
     asyncio.run(go())
     assert h.compactions == ["o"] and violations(store=store, tl="o") == []
+
+
+def test_a_run_that_fails_while_a_clone_call_is_prepared_is_the_runs_failure(tmp_path):
+    """A clone call made from outside the original's model-loop run (the harness's `clone_call`)
+    is being prepared when the run's model call raises. The failure is the run's: its caller
+    raises it, the call being prepared is cut short and rolled back, and the original comes to
+    rest, instead of the call being refused with the run's error and the run's caller waiting
+    for ever."""
+    from graft import seeder as sd
+    gate, entered = threading.Event(), threading.Event()
+
+    def policy(system, messages, tools):
+        entered.set()
+        assert gate.wait(GATE_TIMEOUT)
+        raise RuntimeError("model call failed")
+
+    class Slow:
+        name = "slow"
+        entered: asyncio.Future | None = None
+
+        async def score(self, purpose, cands, trigger):
+            self.entered.set_result(None)
+            await asyncio.get_running_loop().create_future()  # never answered: it is cut short
+            return sd.SeedDecision()
+
+    slow = Slow()
+    store = Store(str(tmp_path / "f.db"))
+    install(store)
+    h = Harness(store=store, provider=FakeProvider(policy), seeder=slow)
+
+    async def go():
+        await h.start()
+        slow.entered = asyncio.get_running_loop().create_future()
+        said = asyncio.create_task(h.user_says(REQUEST))
+        await until(event=entered, what="the run's model call")
+        call = asyncio.create_task(h.clone_call(src="o", use=clone_use(clone_entry(skills=["website"], focus=False))))
+        await asyncio.wait_for(slow.entered, timeout=WAIT_TIMEOUT)  # the call is being prepared
+        gate.set()
+        with pytest.raises(RuntimeError, match="model call failed"):
+            await asyncio.wait_for(said, WAIT_TIMEOUT)
+        children, _, result = await asyncio.wait_for(call, WAIT_TIMEOUT)
+        assert children is None and result == "clone not executed: the turn ended before it ran"
+        await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+
+    asyncio.run(go())
+    assert clones(store) == []
+    assert {r[0] for r in store.con.execute("SELECT status FROM transactions")} == {"rolled_back"}
 
 
 def test_a_withdrawn_request_runs_no_cancel_call_after_the_cancel(tmp_path):

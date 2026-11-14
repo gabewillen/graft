@@ -89,6 +89,9 @@ class Host:
         self.record("commit", src, [g for g, _ in clone.pairs])
         return "cloned"
 
+    def roll_back_clone(self, src):
+        self.record("roll_back", src)
+
     def refuse_clone(self, src, clone, why, error):
         return f"refused: {why}"
 
@@ -551,6 +554,41 @@ def test_an_interrupt_waits_while_the_original_waits_for_a_graft_it_cancelled():
         assert host.log.index(result) < host.log.index(host.logged("close", "o")[0])
         assert await reply == "ended" and host.status["c1"] == "joined"  # c1's join is applied at rest
         assert not host.logged("run", "o", "report")  # and no wake runs for a withdrawn call
+        await m.stop()
+    run(go)
+
+
+@pytest.mark.parametrize("withdrawn", [False, True])
+def test_a_run_that_fails_during_a_cancel_step_waits_for_the_step(withdrawn):
+    """A cancel request from outside the original's run is waiting for the graft it cancelled when
+    the run raises. The failure is the run's and waits for the step: the cancel finishes with its
+    real result, then the run's caller raises the failure. If the caller withdrew meanwhile, the
+    step ends the run, and the failure, which no caller waits on, is reported once."""
+    async def go():
+        host, m = await started()
+        reply = await say(m=m, text="go")
+        await clone(m=m, pairs=[("c1", False)])
+        host.hold = m.future()
+        stopping = host.next("run_cancelled", "c1")
+        asking = asyncio.ensure_future(cancel(m=m, tl="o", ids=["c1"]))
+        await stopping  # o waits for c1's join in its cancel step
+        host.fail(tl="o", error=RuntimeError("run failed"))
+        if withdrawn:
+            await withdraw(m=m, reply=reply)
+        reporting = host.next("run", "o", "report")  # c1's join is applied and reported at rest
+        host.hold.set_result(None)
+        assert await asyncio.wait_for(asking, GUARD) == [(repr([("c1", CANCELLED)]), False)]
+        if withdrawn:
+            assert await asyncio.wait_for(reply, GUARD) == "ended"
+            await at_rest(m)
+            assert [r for r in host.reports if r[2] == "run failed"] == [("task", [], "run failed")]
+        else:
+            await asyncio.wait_for(reporting, GUARD)
+            host.end("o")
+            with pytest.raises(RuntimeError, match="run failed"):
+                await asyncio.wait_for(reply, GUARD)
+            assert [r for r in host.reports if r[2] == "run failed"] == []  # its caller has it
+        assert host.status["c1"] == "joined"
         await m.stop()
     run(go)
 
@@ -1279,6 +1317,53 @@ def test_a_suspended_original_records_no_withdrawal_while_its_focus_graft_holds_
         back = await say_as(m=m, text="back", id=ids[0])
         assert ("request", "o", "back") in host.log  # the original never recorded it either
         await answered(host=host, m=m, reply=back)
+        await m.stop()
+    run(go)
+
+
+# ------------------------------------------------------------------ a clone call cut short in its preparation
+class Preparing(Host):
+    """A host whose preparation never ends on its own; its rollback may fail."""
+    rollback_error: BaseException | None = None
+
+    async def prepare_clone(self, src, clone, retry_left):
+        self.record("prepare", src, retry_left)
+        await asyncio.get_running_loop().create_future()
+
+    def roll_back_clone(self, src):
+        self.record("roll_back", src)
+        if self.rollback_error is not None:
+            raise self.rollback_error
+
+
+@pytest.mark.parametrize("fails", [False, True])
+@pytest.mark.parametrize("how", ["driven turn ended", "request withdrawn"])
+def test_a_clone_call_cut_short_in_its_preparation_is_rolled_back_in_its_own_state(how, fails):
+    async def go():
+        host = Preparing()
+        host.rollback_error = OSError("rollback failed") if fails else None
+        m = Machines(host)
+        await m.start_root("o")
+        if how == "driven turn ended":
+            await driven_turn(m)
+        else:
+            reply = await say(m=m, text="go")
+        asking = asyncio.ensure_future(clone(m=m, pairs=[("c1", False)]))
+        await asyncio.wait_for(host.next("prepare", "o"), GUARD)
+        if how == "driven turn ended":
+            await end_driven_turn(m)
+        else:
+            await withdraw(m=m, reply=reply)
+        assert (await asyncio.wait_for(asking, GUARD))[0] is None  # the call is answered: not executed
+        assert await at_rest(m) == "ended" and ("roll_back", "o") in host.log
+        assert bool(host.logged("close", "o")) == (how == "request withdrawn")  # a driven turn's caller closes its own
+        settling = m.ask(tl="session", name="settle_request", build=lambda r: r)
+        if fails:
+            assert ("task", [], "rollback failed") in host.reports
+            with pytest.raises(OSError, match="rollback failed"):
+                await asyncio.wait_for(settling, GUARD)
+        else:
+            assert await asyncio.wait_for(settling, GUARD) is None
         await m.stop()
     run(go)
 

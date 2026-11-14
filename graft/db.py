@@ -279,6 +279,12 @@ class Store:
             "INSERT INTO transactions(timeline_id, kind, status, target) VALUES (?,?,?,?)",
             (tl, kind, "open", target)).lastrowid
 
+    def open_txs(self, tl: str, kind: str) -> list[int]:
+        """The transactions of tl of this kind that are still open, oldest first."""
+        return [r[0] for r in self.con.execute(
+            "SELECT tx_id FROM transactions WHERE timeline_id=? AND kind=? AND status='open' ORDER BY tx_id",
+            (tl, kind))]
+
     def tx_status(self, tx_id: int) -> str:
         return self.con.execute("SELECT status FROM transactions WHERE tx_id=?", (tx_id,)).fetchone()[0]
 
