@@ -993,13 +993,16 @@ async def spawn_activity(ctx, inst: TimelineSM, event) -> None:
 
 async def unspawn_activity(ctx, inst: TimelineSM, event) -> None:
     """Undo a clone call whose machines could not all start: the machines made are stopped and
-    forgotten, and the committed grafts are marked abandoned in the store. The refusal follows."""
-    for child in inst.spawned_ids:
-        sm = inst.machines.timelines.pop(child, None)
+    forgotten, and the committed grafts are marked abandoned in the store. The refusal follows.
+    Its inputs are taken before its first await (it reads nothing of its machine after that)."""
+    made, grafts, error = list(inst.spawned_ids), [g for g, _ in inst.clone.pairs], inst.spawn_error
+    machines, host, source = inst.machines, inst.host, inst.timeline_id
+    for child in made:
+        sm = machines.timelines.pop(child, None)
         if sm is not None and sm.state():
             await hsm.Stop(sm)
-    inst.host.abandon_clone(src=inst.timeline_id, grafts=[g for g, _ in inst.clone.pairs])
-    inst.dispatch(inst.context(), hsm.Event(name="unspawned", data=inst.spawn_error))
+    host.abandon_clone(src=source, grafts=grafts)
+    inst.dispatch(inst.context(), hsm.Event(name="unspawned", data=error))
 
 
 def _write_request(inst, event):

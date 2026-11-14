@@ -1871,3 +1871,38 @@ def test_a_row_a_focus_graft_could_not_mark_is_marked_before_its_join_is_copied(
         assert host.log.index(("withdrawn", ("o",), [row])) < host.log.index(("apply", "c1", "done"))
         await m.stop()
     run(go)
+
+
+# ---------------------------------------------------------------- the activities
+def _reads(function_name):
+    import ast
+    import inspect
+    import graft.machine as machine_module
+    tree = ast.parse(inspect.getsource(getattr(machine_module, function_name)).lstrip())
+    return tree.body[0]
+
+
+def test_no_activity_reads_its_machine_s_data_after_it_first_awaits():
+    """An activity takes its inputs before its first await (inside the step that enters its state):
+    after it, it only dispatches its outcome (AC-06)."""
+    import ast
+    import inspect
+    import graft.machine as machine_module
+    late = []
+    for name, function in vars(machine_module).items():
+        if not inspect.iscoroutinefunction(function) or function.__module__ != machine_module.__name__:
+            continue
+        body = _reads(name)
+        awaits = [n for n in ast.walk(body) if isinstance(n, ast.Await)]
+        loops = [loop for loop in ast.walk(body) if isinstance(loop, (ast.For, ast.While))
+                 and any(isinstance(a, ast.Await) for a in ast.walk(loop))]  # a body that awaits runs again
+        looped = {id(n) for loop in loops for statement in loop.body for n in ast.walk(statement)}
+        for node in ast.walk(body):
+            if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "inst"):
+                continue
+            if node.attr in ("dispatch", "context"):
+                continue
+            after = any((node.lineno, node.col_offset) > (a.end_lineno, a.end_col_offset) for a in awaits)
+            if after or id(node) in looped:
+                late.append(f"{name}: inst.{node.attr} (line {node.lineno})")
+    assert late == []
