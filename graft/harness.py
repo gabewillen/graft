@@ -428,7 +428,7 @@ class Harness:
         The request is put on the machine without waiting, so the call's only await is its reply:
         a cancel, wherever the request is in its lifecycle, cancels that reply at once and the
         caller withdraws the request by id. The machine then never starts a run, writes a row or
-        lets a focus graft act for it; a run already answering it is ended by its machine before
+        lets a graft act for it; a run already answering it is ended by its machine before
         its next step, and a row already written for it is marked withdrawn. If writing its
         row or the run answering it fails, the machine answers the reply with that error, raised
         here."""
@@ -1083,7 +1083,7 @@ class Harness:
                  if reason == "failed" else None)
         if reason == CANCELLED:
             ran = self.tools_run(child)
-            error = (f"(harness note: clone {child} was cancelled by you before it finished; its timeline is frozen. "
+            error = (f"(harness note: clone {child} was cancelled before it finished; its timeline is frozen. "
                      f"Before it was stopped it had run: {', '.join(ran) if ran else 'no tools'}. "
                      "Nothing it did outside this conversation was undone; a tool that returned an error "
                      "may still have acted before it failed.)")

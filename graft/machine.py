@@ -31,7 +31,9 @@ Three rules hold everywhere in this module.
   start a run or let a graft act is guarded on its request being live (not withdrawn, reply not
   done): `requesting` -> busy, the next inbox message, the wake / hand-back / routing runs,
   `noting` -> busy, the clone gate, a focus graft's start (one whose request was withdrawn before
-  it could act marks its row in `withdrawing` and rests). Whether a run
+  it could act marks its row in `withdrawing` and rests), and a background graft's start and
+  each of its steps (a background graft made for a request withdrawn before it is answered never
+  runs, or stops at its next step, and joins `cancelled`; that join wakes nothing). Whether a run
   may go on is decided here too: the run asks (`may_continue`, a reply in the event) before every
   step that could act, and is answered while the request it answers, if any, is live; once it is
   withdrawn, `busy` is left the way a withdrawal leaves it, which ends the run where it waits. A
@@ -68,7 +70,8 @@ marks that request's row, and then at rest):
                         first if a machine could not start)   a clone call, step by step (a
                         withdrawal waits while `spawning` starts the grafts' machines); a call
                         that hands over writes the run's open calls and kept rows (`flushing`,
-                        then the choice `handed`) before the original is suspended
+                        then the choice `handed`) before the original is suspended; a graft's join
+                        that comes meanwhile waits for the step
               cancels: checking / waiting / writing / reporting   cancel calls, id by id; then
                         their result rows, and each row that could not be written told
         ran           (choice) how the run ended (a RunOutcome): a focus graft that joined or spent
@@ -98,8 +101,10 @@ marks that request's row, and then at rest):
       releasing       closed while suspended: its focus graft is shut down first
     queued, joined, abandoned, closed
 
-A background graft: `background` (its run, or `held` when a caller drives the turn that made it)
---finish (`ending`, a choice on how the run ended) | cancel | shutdown | join (forced) | error-->
+A background graft: `background` (its run, or `held` when a caller drives the turn that made it;
+never entered if the request it was made for was withdrawn before it was made)
+--finish (`ending`, a choice on how the run ended) | cancel | shutdown | join (forced) | error
+| `may_continue` once the request it was made for is withdrawn (reason cancelled)-->
 `recording` (`writing`, an activity: its open
 calls and its join reason; then each failure told, one per step, in `reporting`) --> `queued`
 --join commit | rollback--> `joined`, --join abandon--> `abandoned`.
@@ -213,11 +218,14 @@ class Request:
 
 class GraftPlan(NamedTuple):
     """A graft of a committed clone call, to be made in `spawning`: a focus graft is made with
-    the user's calls waiting on the run and the request it answers (`answering`)."""
+    the user's calls waiting on the run and the request it answers (`answering`); a background
+    graft with the request the run that made it answers (`made_for`), which it stops for if that
+    request is withdrawn."""
     child: str
     focus: bool
     waiters: list["Waiter"]
     answering: "Request | None"
+    made_for: "Request | None"
 
 
 @dataclass
@@ -296,7 +304,7 @@ class Host(Protocol):
 class TimelineSM(hsm.Instance):
     def __init__(self, machines: "Machines", timeline_id: str, source_id: str | None, kind: str,
                  held: bool = False, waiters: list[Waiter] | None = None,
-                 answering: Request | None = None,
+                 answering: Request | None = None, made_for: Request | None = None,
                  withdrawn: set[int] | None = None):
         super().__init__()
         self.machines = machines
@@ -320,8 +328,16 @@ class TimelineSM(hsm.Instance):
         # most one: its turn's message, the one its source answered when it was made, or the one
         # a focus graft handed back.
         self.answering: Request | None = answering
-        # Ids of withdrawn requests it holds: pruned as requests leave it.
+        # Ids of withdrawn requests it holds (and, for the original, of requests its background
+        # grafts were made for, until their joins are applied): pruned as requests leave it.
         self.withdrawn: set[int] = set(withdrawn or ())
+        # A background graft: the request the run that made it answers. If that request is
+        # withdrawn (by its caller: not answered), the graft stops at its next step and joins
+        # `cancelled`; it never starts if it was withdrawn before the graft was made.
+        self.made_for: Request | None = made_for
+        # The original: each background graft made for a request -> that request, until the
+        # graft's join is applied. A join of a graft made for a withdrawn request wakes nothing.
+        self.graft_requests: dict[str, Request] = {}
         self.focus: str | None = None
         self.closing = False  # nothing is woken from now on
         self.final = False  # shut down: once nothing is left to apply, close
@@ -536,6 +552,13 @@ def _live(inst: TimelineSM, request: Request) -> bool:
     return request.id not in inst.withdrawn and not request.reply.done()
 
 
+def _withdrawn(inst: TimelineSM, request: Request) -> bool:
+    """Withdrawn by its caller: by this machine's record, or its reply cancelled (a caller that
+    goes away cancels it at once). Unlike `not _live`, a request that was answered is not
+    withdrawn."""
+    return request.id in inst.withdrawn or request.reply.cancelled()
+
+
 def _run_withdrawn(inst: TimelineSM, withdrawing: int | None = None) -> bool:
     """The one rule for ending a run on a withdrawal: the run answers a user request, and that
     request is not live (or is the one being withdrawn now, `withdrawing`)."""
@@ -550,9 +573,21 @@ def _held(inst: TimelineSM) -> list[Request]:
 
 
 def _prune(inst: TimelineSM) -> None:
-    """The withdrawal record keeps only ids of requests it still holds: it is bounded by them."""
-    kept = {r.id for r in _held(inst)}
+    """The withdrawal record keeps only ids of requests it still holds, and of requests its
+    background grafts were made for whose joins are not applied yet: it is bounded by them."""
+    kept = {r.id for r in _held(inst)} | {r.id for r in inst.graft_requests.values()}
     inst.withdrawn &= kept
+
+
+def _unwanted(inst: TimelineSM, child: str) -> bool:
+    """A background graft made for a request that was withdrawn: its join wakes nothing."""
+    request = inst.graft_requests.get(child)
+    return request is not None and _withdrawn(inst=inst, request=request)
+
+
+def _made_for_withdrawn(inst: TimelineSM) -> bool:
+    """A background graft whose request was withdrawn: it stops (or never starts)."""
+    return inst.made_for is not None and _withdrawn(inst=inst, request=inst.made_for)
 
 
 # ------------------------------------------------------------------ guards
@@ -679,6 +714,21 @@ def starts_withdrawn(ctx, inst, event) -> bool:
 
 def is_held(ctx, inst, event) -> bool:
     return inst.held
+
+
+def made_for_withdrawn(ctx, inst, event) -> bool:
+    return _made_for_withdrawn(inst)
+
+
+def starts_cancelled(ctx, inst, event) -> bool:
+    """A background graft that runs on its own, made for a request withdrawn before it was made."""
+    return not inst.held and _made_for_withdrawn(inst)
+
+
+def own_graft(ctx, inst, event) -> bool:
+    """A join from a graft it holds: one of a clone call undone because a machine could not start
+    (its join held for the step) is never applied."""
+    return event.data.child in inst.grafts
 
 
 def is_focus(ctx, inst, event) -> bool:
@@ -907,8 +957,9 @@ async def spawn_activity(ctx, inst: TimelineSM, event) -> None:
     (one whose request was withdrawn before it could act never acts on it). It reads nothing of
     its machine after that: a withdrawal that comes while it runs waits for its outcome
     (`spawning` defers it) and is then handled like any later one (forwarded to the focus graft by
-    event). The outcome is an event: `spawned`, or `spawn_failed` with the machines made so far
-    (they are undone in `unspawning`)."""
+    event; a background graft reads it from its request's reply, which a cancelled call cancels
+    before it withdraws). The outcome is an event: `spawned`, or `spawn_failed` with the machines
+    made so far (they are undone in `unspawning`)."""
     machines, source, plans = inst.machines, inst.timeline_id, list(inst.spawn_plan)
     held, withdrawn = inst.mode.name == "external", set(inst.withdrawn)
     made: list[str] = []
@@ -916,7 +967,8 @@ async def spawn_activity(ctx, inst: TimelineSM, event) -> None:
         for plan in plans:
             sm = TimelineSM(machines=machines, timeline_id=plan.child, source_id=source,
                             kind="focus" if plan.focus else "background", held=held,
-                            waiters=plan.waiters, answering=plan.answering, withdrawn=withdrawn)
+                            waiters=plan.waiters, answering=plan.answering, made_for=plan.made_for,
+                            withdrawn=withdrawn)
             machines.timelines[plan.child] = sm
             made.append(plan.child)
             await hsm.Started(None, sm, TIMELINE if plan.focus else BACKGROUND, hsm.Config(ID=plan.child))
@@ -1431,7 +1483,8 @@ def committed(ctx, inst, event) -> None:
     inst.clone_text = event.data
     users = [w for w in inst.waiters if w.user]
     inst.spawn_plan = [GraftPlan(child=child, focus=f, waiters=users if f else [],
-                                 answering=inst.answering if f else None)
+                                 answering=inst.answering if f else None,
+                                 made_for=None if f else inst.answering)
                        for child, f in inst.clone.pairs]
 
 
@@ -1450,6 +1503,8 @@ def spawned(ctx, inst, event) -> None:
         inst.parts[child] = part
         inst.cloned_for[child] = clone.request
         inst.made[child] = focus
+        if not focus and inst.answering is not None:
+            inst.graft_requests[child] = inst.answering
     inst.clone_calls += 1
     inst.clone_tries = CLONE_TRIES  # one committed clone call per run
     inst.wake_clones += int(inst.mode.wake)
@@ -1635,8 +1690,9 @@ def applied(ctx, inst, event) -> None:
     join = inst.queue.pop(HEAD)
     inst.grafts.pop(join.child, None)
     _forward(target=inst.machines.timelines.get(join.child), name="join_commit" if committed_ else "join_rollback")
-    if not inst.made.get(join.child) or join.reason != "done":
+    if (not inst.made.get(join.child) or join.reason != "done") and not _unwanted(inst=inst, child=join.child):
         inst.news.append((join.child, join.reason))
+    inst.graft_requests.pop(join.child, None)
     inst.ends_on_request = ends
     if join.reason not in ("done", CANCELLED):
         part = inst.parts.get(join.child, frozenset())
@@ -1666,6 +1722,7 @@ def abandon_head(ctx, inst, event) -> None:
     """The given-up join leaves the queue, and the graft is told; the queue moves on."""
     join = inst.queue.pop(HEAD)
     inst.grafts.pop(join.child, None)
+    inst.graft_requests.pop(join.child, None)
     _forward(target=inst.machines.timelines.get(join.child), name="join_abandon")
 
 
@@ -1844,10 +1901,12 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
             hsm.Defer("shutdown", "driven_done", "run_failed"),
             hsm.State(
                 "cloning",  # one clone call: committed, its machines started, its result written
-                hsm.Defer("focus_joined"),
+                # a graft made here that joins at once (its request withdrawn) is queued after
+                # the step, once the original knows it made it
+                hsm.Defer("focus_joined", "graft_queued"),
                 # a withdrawal of a waiting message drops it here; any other is recorded and reaches
                 # the focus graft once it is made; the run ends once the step is done (`resume`), and
-                # a focus graft never acts on it
+                # no graft made for it acts on it
                 T(On("withdraw"), G(withdraws_waiting), hsm.Effect(note_withdrawn)),
                 T(On("withdraw"), hsm.Effect(withdraw_and_forward)),
                 hsm.State(
@@ -1969,7 +2028,8 @@ def _timeline(name: str) -> hsm.Model:
         T(On("inbox_handed"), hsm.Effect(take_handed)),
         T(On("rest_request"), G(has_joined), hsm.Effect(answer_joined)),
         T(On("rest_request"), hsm.Effect(refuse_request)),  # closed, or its join abandoned
-        T(On("graft_queued"), hsm.Effect(enqueue)),
+        T(On("graft_queued"), G(own_graft), hsm.Effect(enqueue)),
+        T(On("graft_queued"), hsm.Effect(ignore)),  # a graft of a clone call that was undone at its start
         T(On("clone_request"), hsm.Effect(refuse_clone_call)),
         T(On("cancel_request"), hsm.Effect(refuse_cancel_call)),
         T(On("poke", "shutdown", "check"), hsm.Effect(ignore)),
@@ -1988,7 +2048,7 @@ def _timeline(name: str) -> hsm.Model:
                 T(On("user_message"), S("../engaged/requesting"), G(arrives_to_answer), hsm.Effect(take_message)),
                 T(On("turn_request"), S("../engaged/busy/driven"), G(is_external), hsm.Effect(begin_driven)),
                 T(On("turn_request"), S("../engaged/busy/run"), G(not_external), hsm.Effect(begin_run)),
-                T(On("graft_queued"), S("../receiving"), hsm.Effect(engage)),
+                T(On("graft_queued"), S("../receiving"), G(own_graft), hsm.Effect(engage)),
                 T(On("drain_request"), S("../engaged/joining"), G(has_queue), hsm.Effect(engage_with_waiter)),
                 T(On("drain_request"), G(no_queue), hsm.Effect(answer_ended)),
                 T(On("rest_request"), hsm.Effect(answer_ended)),
@@ -2166,6 +2226,8 @@ BACKGROUND = hsm.Define(
     hsm.Choice(
         "start",  # made in a turn its caller drives: it does not run; the caller joins it
         _T(_S("live/background/held"), _G(is_held)),
+        # made for a request withdrawn before it was made: it never runs, and joins cancelled
+        _T(_S("live/recording"), _G(starts_cancelled), hsm.Effect(ended_as(reason=CANCELLED, close_first=False))),
         _T(_S("live/background/running")),
     ),
     _T(_On(*REQUESTS, "rest_request", "may_continue"), hsm.Effect(refuse_request)),  # not a timeline that rests
@@ -2186,8 +2248,14 @@ BACKGROUND = hsm.Define(
             _T(_On("join"), _S("../recording"), hsm.Effect(forced)),
             _T(_On(_E), _S("../recording"), hsm.Effect(run_raised)),
             hsm.State("held"),
-            # its run goes on until the graft leaves `background` (finish, cancel, shutdown, join)
-            hsm.State("running", hsm.Activity(background_activity), _T(_On("may_continue"), hsm.Effect(answer_true))),
+            # its run goes on until the graft leaves `background` (finish, cancel, shutdown, join);
+            # it asks before each step, and stops (joins cancelled) once its request is withdrawn
+            hsm.State(
+                "running", hsm.Activity(background_activity),
+                _T(_On("may_continue"), _S("../../recording"), _G(made_for_withdrawn),
+                   hsm.Effect(ended_as(reason=CANCELLED, close_first=True))),
+                _T(_On("may_continue"), hsm.Effect(answer_true)),
+            ),
         ),
         hsm.Choice(
             "ending",  # how its run ended: its join reason

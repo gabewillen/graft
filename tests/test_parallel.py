@@ -2258,7 +2258,7 @@ def test_the_original_cancels_a_graft_during_its_model_call_and_its_work_so_far_
     assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
     records = join_records(store)
     assert "clone c1 joined, reason=cancelled" in records[0]
-    assert "clone c1 was cancelled by you before it finished" in records[1] and "it had run: no tools" in records[1]
+    assert "clone c1 was cancelled before it finished" in records[1] and "it had run: no tools" in records[1]
     assert not any("website finished" in r["content"] for r in store.view("o"))  # the late reply never landed
     assert store.con.execute("SELECT status FROM transactions WHERE kind='join' AND target='c1'").fetchone()[0] == "committed"
     assert said_errors(said) == []
@@ -2293,7 +2293,7 @@ def test_a_graft_cancelled_after_it_acted_joins_what_it_wrote_and_the_tools_it_r
     view = store.view("o")
     assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
     assert [r["owner_timeline"] for r in view if r["content"] == "Writing the home page."] == ["c1"]  # by pointer
-    note = [r for r in join_records(store) if "clone c1 was cancelled by you" in r]
+    note = [r for r in join_records(store) if "clone c1 was cancelled before it finished" in r]
     assert len(note) == 1 and "it had run: site_write." in note[0] and "was undone" in note[0]
     assert not any(r["kind"] in ("tool_use", "tool_result") and r["owner_timeline"] == "c1" for r in view)
 
@@ -2504,7 +2504,7 @@ def test_a_graft_stopped_right_after_a_response_with_a_tool_and_a_cancel_keeps_i
     assert results[0][0] == "site_write" and not results[0][2] and "not executed" not in results[0][1]
     assert results[1][0] == "cancel" and results[1][2] and results[1][1].count("only the original cancels") == 2
     assert h.world.site == {"home": "hi"}
-    note = [r for r in join_records(store) if "clone c1 was cancelled by you" in r]
+    note = [r for r in join_records(store) if "clone c1 was cancelled before it finished" in r]
     assert len(note) == 1 and "it had run: site_write." in note[0]
     assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
 
@@ -2685,7 +2685,7 @@ def test_a_turn_cancelled_while_it_cancels_a_graft_keeps_every_real_tool_result(
 
     asyncio.run(go())
     assert violations(store=store, tl="o") == [] and said_errors(said) == []
-    assert any("clone c1 was cancelled by you" in r for r in join_records(store))
+    assert any("clone c1 was cancelled before it finished" in r for r in join_records(store))
 
 
 @pytest.mark.parametrize("turn_cancelled", [False, True])
@@ -2982,7 +2982,7 @@ def test_the_cancel_record_pairs_each_tool_call_with_the_result_of_its_own_turn(
 
     asyncio.run(go())
     assert h.world.site == {"home": "hi"}
-    note = [r for r in join_records(store) if "clone c1 was cancelled by you" in r]
+    note = [r for r in join_records(store) if "clone c1 was cancelled before it finished" in r]
     assert len(note) == 1 and "it had run: site_write, site_read." in note[0]
 
 
@@ -3074,7 +3074,7 @@ def test_the_cancel_record_lists_a_tool_that_acted_and_then_returned_an_error(tm
         await h.close()
 
     asyncio.run(go())
-    note = [r for r in join_records(store) if "clone c1 was cancelled by you" in r]
+    note = [r for r in join_records(store) if "clone c1 was cancelled before it finished" in r]
     assert len(note) == 1 and "it had run: site_write (returned an error)." in note[0]
     assert "may still have acted before it failed" in note[0]
 
@@ -3338,7 +3338,7 @@ def test_a_tool_whose_output_reads_like_a_harness_refusal_is_still_in_the_cancel
 
     asyncio.run(go())
     expected = "site_read" if mode == "tool_output" else "site_write (returned an error)"
-    note = [r for r in join_records(store) if "clone c1 was cancelled by you" in r]
+    note = [r for r in join_records(store) if "clone c1 was cancelled before it finished" in r]
     assert len(note) == 1 and f"it had run: {expected}." in note[0]
 
 
@@ -3923,7 +3923,9 @@ def test_a_cancelled_call_ends_the_wake_run_that_follows_its_turn(tmp_path):
 LIFECYCLE = ["waiting", "sending", "sending, a step later", "sending mid-step", "requesting", "requesting behind a run",
              "running",
              "returning", "saying", "joining", "noting", "wake", "hand-back", "withdrawn before the hand-over",
-             "handed over, then withdrawn", "forwarded to a focus graft", "focus graft starting"]
+             "handed over, then withdrawn", "forwarded to a focus graft", "focus graft starting",
+             "background graft starting", "background graft running"]
+BACKGROUND_POINTS = ("background graft starting", "background graft running")
 HOLD_CLONE = ("withdrawn before the hand-over", "handed over, then withdrawn")
 
 
@@ -3983,6 +3985,11 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
             entered["c1"].set()
             assert gates["c1"].wait(GATE_TIMEOUT)
             return text(f"c1 answers {request}")
+        if point in BACKGROUND_POINTS:  # a background graft that would act on the outside world
+            if point == "background graft running":
+                entered["c1"].set()
+                assert gates["c1"].wait(GATE_TIMEOUT)
+            return [{"type": "tool_use", "id": "g1", "name": "site_write", "input": {"page": "p", "content": "x"}}]
         return text("website finished")  # a background graft
 
     store, h, said = make(tmp_path=tmp_path, policy=policy)
@@ -4135,6 +4142,16 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
             await caller_gone("FOCUS go")
             await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
             assert await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT) == ["c1 answers C"]  # a later turn
+        elif point == "background graft starting":  # cancelled while the clone call that makes c1 commits
+            cancel_inside(method="commit_clone", name="BG go")
+            tasks["BG go"] = asyncio.create_task(h.user_says("BG go"))
+            await caller_gone("BG go")
+        elif point == "background graft running":  # cancelled in the model call of the graft made for it
+            tasks["BG go"] = asyncio.create_task(h.user_says("BG go"))
+            await until(event=entered["c1"], what="the background graft's model call")
+            cancel("BG go")
+            gates["c1"].set()
+            await caller_gone("BG go")
         for gate in gates.values():
             gate.set()
         await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
@@ -4158,11 +4175,15 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
         for tl in ("o", "c1"):  # its row is marked in the conversation it was asked in
             assert [r["withdrawn"] for r in store.view(tl) if r["content"] == "FOCUS go"] == [1], tl
         assert later == [["C"]]  # the next turn reads it as withdrawn, not as a request
+    if point in BACKGROUND_POINTS:  # the graft made for it stopped before acting, and woke nothing
+        assert [r for r in store.view("c1") if r["role"] == "assistant"] == [], point
+        assert store.timeline("c1")["join_reason"] == "cancelled" and h.wakes == [], point
     # a withdrawn request is marked in the view whose run never answered it; one its turn answered
     # before the cancel (the joins, wake note and wake that follow the turn) is not
     marks = {r["content"]: r["withdrawn"] for r in store.view("o") if r["kind"] == "text" and not r["harness"]}
-    if point in ("requesting", "requesting behind a run", "running", "returning", "saying", "hand-back"):
-        assert marks[{"hand-back": "FOCUS-OOS go"}.get(point, "B")] == 1, point
+    if point in ("requesting", "requesting behind a run", "running", "returning", "saying", "hand-back",
+                 *BACKGROUND_POINTS):
+        assert marks[{"hand-back": "FOCUS-OOS go"}.get(point, "BG go" if point in BACKGROUND_POINTS else "B")] == 1, point
     if point in ("joining", "noting", "wake"):
         assert marks["BG go"] == 0, point
 
@@ -4481,7 +4502,9 @@ def test_a_focus_graft_never_hands_back_a_message_that_was_withdrawn(tmp_path):
 def test_a_withdrawal_mark_binds_only_the_conversation_not_a_background_graft_seeded_with_it(tmp_path):
     """The original's turn on "BG go" starts a background graft seeded with that message and is
     then cut short by the caller's cancel: the message is marked withdrawn in the original's
-    view, while the background graft, still running, keeps it as the request it works on."""
+    view, not in the background graft's, which is not that conversation. The graft, made for
+    the withdrawn request, stops at its next step: its response that comes back is never stored,
+    and it joins cancelled."""
     gates = {name: threading.Event() for name in ("root", "c1")}
     entered = {name: threading.Event() for name in gates}
     seen, task = {}, {}
@@ -4523,7 +4546,8 @@ def test_a_withdrawal_mark_binds_only_the_conversation_not_a_background_graft_se
     assert user_texts(seen["c1"]) == ["BG go"]  # the graft's request is unmarked in its own view
     assert [r["withdrawn"] for r in store.view("c1") if r["content"] == "BG go"] == [0]
     assert [r["withdrawn"] for r in store.view("o") if r["content"] == "BG go"] == [1]
-    assert store.timeline("c1")["join_reason"] == "done"
+    assert store.timeline("c1")["join_reason"] == "cancelled" and "wake" not in seen
+    assert [r for r in store.view("c1") if r["role"] == "assistant"] == []  # its late response was not stored
     assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
 
 

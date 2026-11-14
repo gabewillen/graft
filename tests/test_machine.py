@@ -1152,15 +1152,154 @@ def test_a_focus_graft_whose_request_was_withdrawn_still_answers_the_next_messag
     run(go)
 
 
-def test_a_background_clone_carried_out_while_its_request_is_withdrawn_then_ends_the_run():
+def test_a_background_clone_carried_out_while_its_request_is_withdrawn_starts_no_graft_run_and_wakes_nothing():
+    """The withdrawal lands while the clone call commits: the step finishes whole (the call ran),
+    but the graft it makes never runs: it joins `cancelled` at once. The run then ends, and the
+    join is applied with no wake: nothing is run or said for the withdrawn request."""
     async def go():
         host, m = await started()
         reply = await say(m=m, text="go")
         _withdraws_inside(host=host, m=m, method="commit_clone", reply=reply)
         children, _, _ = await clone(m=m, pairs=[("c1", False)])
-        assert children == ["c1"] and host.status["c1"] == "background"  # the step finished whole
+        assert children == ["c1"]  # the step finished whole
         assert await reply == "ended" and ("run_cancelled", "o") in host.log  # then the run ended
-        assert host.logged("close", "o")
+        assert await at_rest(m) == "ended"
+        assert host.logged("close", "o") and ("reason", "c1", CANCELLED) in host.log
+        assert ("apply", "c1", CANCELLED) in host.log and host.status["c1"] == "joined"
+        assert host.logged("run", "c1") == [] and host.logged("note") == []  # it never ran; no wake
+        assert host.logged("run", "o") == [("run", "o", "turn")]
+        await m.stop()
+    run(go)
+
+
+def test_a_background_graft_stops_when_the_request_it_was_made_for_is_withdrawn_and_wakes_nothing():
+    """The graft runs; then the caller of the request its turn answered goes away (the reply is
+    cancelled, as a cancelled `user_says` does, before the withdrawal arrives): at its next step
+    the graft stops and joins `cancelled`, and its join wakes nothing. A graft made for a request
+    that was answered keeps running after its turn and wakes its source when it joins."""
+    async def go():
+        host, m = await started()
+        reply = await say(m=m, text="go")
+        ran = host.next("run", "c1")
+        await clone(m=m, pairs=[("c1", False)])
+        await asyncio.wait_for(ran, GUARD)
+        reply.cancel()
+        stopped = host.next("run_cancelled", "c1")
+        await m.send(tl="c1", name="may_continue", data=m.future())  # its run asks before its next step
+        await asyncio.wait_for(stopped, GUARD)
+        await m.send(tl="o", name="withdraw", data=REQUESTS[reply])
+        assert await at_rest(m) == "ended"
+        assert ("reason", "c1", CANCELLED) in host.log and ("apply", "c1", CANCELLED) in host.log
+        assert host.logged("note") == [] and host.logged("run", "o") == [("run", "o", "turn")]
+        # a graft made for a request that its turn answered goes on and wakes its source
+        second = await say(m=m, text="again")
+        ran = host.next("run", "c2")
+        await clone(m=m, pairs=[("c2", False)])
+        host.end("o")
+        assert await second == "ended"
+        await asyncio.wait_for(ran, GUARD)
+        assert host.status["c2"] == "background"  # still running
+        reporting = host.next("run", "o", "report")
+        host.end("c2")
+        await asyncio.wait_for(reporting, GUARD)
+        host.end("o")
+        assert await at_rest(m) == "ended" and ("note", ("c2",), False) in host.log
+        await m.stop()
+    run(go)
+
+
+def _held_start_of(monkeypatch, child, fails=False):
+    """hsm.Started holds `child`'s machine until released (or raises for it): (starting, release)."""
+    import graft.machine as machine_module
+    real = machine_module.hsm.Started
+    loop = asyncio.get_running_loop()
+    starting, release = loop.create_future(), loop.create_future()
+
+    async def held_start(ctx, sm, model, config=None):
+        if getattr(sm, "timeline_id", None) == child:
+            starting.set_result(None)
+            await release
+            if fails:
+                raise RuntimeError(f"cannot start {child}")
+        return await real(ctx, sm, model, config)
+
+    monkeypatch.setattr(machine_module.hsm, "Started", held_start)
+    return starting, release
+
+
+def test_a_background_graft_made_before_a_withdrawal_mid_spawn_stops_and_the_next_never_runs(monkeypatch):
+    """Two background grafts; the caller goes away while the second one's machine is started: the
+    first, already running, stops at its next step and the second never runs; both join
+    `cancelled`, and nothing is woken."""
+    async def go():
+        host, m = await started()
+        reply = await say(m=m, text="go")
+        starting, release = _held_start_of(monkeypatch=monkeypatch, child="c2")
+        ran = host.next("run", "c1")
+        asking = asyncio.ensure_future(clone(m=m, pairs=[("c1", False), ("c2", False)]))
+        await asyncio.wait_for(starting, GUARD)
+        await asyncio.wait_for(ran, GUARD)
+        reply.cancel()  # the caller goes away: its reply first, then its withdrawal
+        m.post(tl="o", name="withdraw", data=REQUESTS[reply])
+        stopped = host.next("run_cancelled", "c1")
+        await m.send(tl="c1", name="may_continue", data=m.future())  # c1's run asks before its next step
+        await asyncio.wait_for(stopped, GUARD)
+        release.set_result(None)
+        assert (await asyncio.wait_for(asking, GUARD))[0] == ["c1", "c2"]
+        assert await at_rest(m) == "ended"
+        assert ("reason", "c1", CANCELLED) in host.log and ("reason", "c2", CANCELLED) in host.log
+        assert host.logged("run", "c2") == [] and host.logged("note") == []
+        await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
+        await m.stop()
+    run(go)
+
+
+@pytest.mark.parametrize("reply_cancelled", [True, False])
+def test_a_withdrawal_mid_spawn_reaches_the_focus_graft_made_after_it(monkeypatch, reply_cancelled):
+    """A background graft and a focus graft; the request is withdrawn while the background graft's
+    machine is started, before the focus graft is made. However the withdrawal reaches the focus
+    graft (its request's reply already cancelled, as a cancelled `user_says` does, or by id alone,
+    forwarded once the grafts are made), the focus graft never answers it: its run is ended or
+    never started, and the request's written row is marked once, in its view and the original's."""
+    async def go():
+        host, m = await started()
+        reply = await say(m=m, text="go")
+        row = host.log.index(("request", "o", "go")) + 1
+        starting, release = _held_start_of(monkeypatch=monkeypatch, child="c1")
+        asking = asyncio.ensure_future(clone(m=m, pairs=[("c1", False), ("c2", True)]))
+        await asyncio.wait_for(starting, GUARD)
+        if reply_cancelled:
+            reply.cancel()
+        m.post(tl="o", name="withdraw", data=REQUESTS[reply])
+        release.set_result(None)
+        _, focus, _ = await asyncio.wait_for(asking, GUARD)
+        assert focus == "c2" and await at_rest(m=m, tl="c2") == "ended"
+        assert host.logged("withdrawn") == [("withdrawn", ("c2", "o"), [row])]
+        if reply_cancelled:
+            assert host.logged("run", "c2") == []  # it never started a run
+        else:
+            assert host.logged("run_cancelled", "c2") == [("run_cancelled", "c2")]  # its run was ended
+        await m.stop()
+    run(go)
+
+
+def test_a_graft_that_joined_at_once_in_a_clone_call_undone_at_its_start_is_never_applied(monkeypatch):
+    """The call is withdrawn as it commits, so its first graft joins `cancelled` at once; its
+    second graft's machine cannot be started, so the call is undone and refused. The first
+    graft's join, held for the step, is then not applied to the original, and settle returns."""
+    async def go():
+        host, m = await started()
+        reply = await say(m=m, text="go")
+        _withdraws_inside(host=host, m=m, method="commit_clone", reply=reply)
+        starting, release = _held_start_of(monkeypatch=monkeypatch, child="c2", fails=True)
+        asking = asyncio.ensure_future(clone(m=m, pairs=[("c1", False), ("c2", False)]))
+        await asyncio.wait_for(starting, GUARD)
+        release.set_result(None)
+        assert (await asyncio.wait_for(asking, GUARD))[0] is None  # refused: the call was undone
+        assert await at_rest(m) == "ended"
+        assert host.logged("apply") == [] and ("abandoned", ("c1", "c2")) in host.log
+        assert host.logged("run", "c1") == [] and host.logged("note") == []
+        await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
         await m.stop()
     run(go)
 
@@ -1274,8 +1413,9 @@ async def answered(host, m, reply, tl="o"):
 
 
 def test_the_withdrawal_record_holds_only_requests_still_held():
-    """Withdrawn ids are kept only while their requests are held: once a withdrawn request has
-    left, its id decides nothing, however many calls were withdrawn."""
+    """Withdrawn ids are kept only while their requests are held (or a background graft made for
+    one has not joined): once a withdrawn request has left, its id decides nothing, however many
+    calls were withdrawn; an id kept for a graft's join is dropped once that join is applied."""
     async def go():
         host, m = await started()
         for n in range(5):
@@ -1289,6 +1429,19 @@ def test_the_withdrawal_record_holds_only_requests_still_held():
                 again = await say_as(m=m, text=f"again {n}.{k}", id=gone)
                 assert ("request", "o", f"again {n}.{k}") in host.log, (n, k)  # not read as withdrawn
                 await answered(host=host, m=m, reply=again)
+        reply = await say(m=m, text="go")
+        await clone(m=m, pairs=[("c1", False)])
+        await withdraw(m=m, reply=reply)
+        assert await at_rest(m) == "ended"
+        kept = await say_as(m=m, text="kept", id=REQUESTS[reply])  # c1 was made for it and has not joined
+        assert await asyncio.wait_for(kept, GUARD) == "ended" and not host.logged("request", "o", "kept")
+        host.end("c1")  # it was made before the withdrawal; its run ends now and it joins
+        await asyncio.wait_for(host.next("apply", "c1"), GUARD)
+        assert await at_rest(m) == "ended"
+        assert host.logged("note") == []  # its join wakes nothing: its request was withdrawn
+        again = await say_as(m=m, text="after the join", id=REQUESTS[reply])
+        assert ("request", "o", "after the join") in host.log  # the id was dropped with the join
+        await answered(host=host, m=m, reply=again)
         await m.stop()
     run(go)
 
