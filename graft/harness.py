@@ -505,7 +505,7 @@ class Harness:
         """Wait until nothing is in flight: no background graft running, no join waiting that can
         be applied (joins queued on a suspended original wait for its focus graft), no wake run.
         Returns the user-facing texts emitted since the last return. Raises what failed meanwhile
-        (in background grafts, wakes, join commits): the one error, or an ExceptionGroup of all of
+        (in background grafts, wakes, join commits): the one error, or an exception group (a BaseExceptionGroup if one is not an Exception) of all of
         them; each is raised once."""
         reply = self.machines.future()
         await self.machines.send(tl="session", name="settle_request", data=reply)

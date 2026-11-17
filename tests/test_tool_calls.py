@@ -1382,3 +1382,28 @@ def test_a_stop_whose_counting_always_fails_is_still_bounded_and_stops_every_gra
     out, calls, world, said = withdraw_three(tmp_path=tmp_path, monkeypatch=monkeypatch, failing=set())
     assert len(counted) == 3  # one try per graft, each stopped by it
     assert {"site_write", "slides_create", "calendar_book"} <= world.cancelled
+
+
+def test_several_kept_errors_that_are_not_exceptions_are_raised_together(tmp_path, monkeypatch):
+    """Errors kept for settle that are not Exceptions are raised in one group, never a TypeError."""
+    import graft.machine as machine
+
+    def always(ctx, inst, event):
+        raise Abort("INJECTED abort")
+    monkeypatch.setattr(machine, "tell_given_up", always)  # runs at every rest gate: kept again and again
+    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    out = {}
+
+    async def go():
+        await h.start()
+        for key, coro in (("said", lambda: h.user_says(REQUEST)), ("joined", lambda: h.join_queued("c1")),
+                          ("settled", h.settle), ("settled2", h.settle), ("closed", h.close)):
+            try:
+                await asyncio.wait_for(coro(), WAIT_TIMEOUT)
+                out[key] = "ok"
+            except asyncio.TimeoutError:
+                out[key] = "TIMEOUT"
+            except BaseException as error:  # noqa: BLE001 - what each call raised
+                out[key] = type(error).__name__
+    asyncio.run(go())
+    assert "TypeError" not in out.values() and "TIMEOUT" not in out.values() and out["closed"] == "ok"

@@ -3464,7 +3464,7 @@ def bg_tell_end_fault(ctx, inst, event) -> None:
     """Its errors are told (one line, kept for settle)."""
     errors, inst.unreported = [e for _, _, e, _ in inst.unreported], []
     if errors:
-        error = errors[HEAD] if len(errors) == 1 else ExceptionGroup("a step failed", errors)
+        error = errors[HEAD] if len(errors) == 1 else BaseExceptionGroup("a step failed", errors)
         _report(inst=inst, kind="task", clones=[inst.timeline_id], error=error, src=inst.source_id)
 
 
@@ -4288,7 +4288,7 @@ def _tell(inst: SessionSM, errors: list[BaseException]) -> None:
     """A fault's errors that no caller was given: shown as one line (the scribe's), and kept for
     `settle` once it is out (the scribe hands it back, `failure`)."""
     if errors:
-        error = errors[HEAD] if len(errors) == 1 else ExceptionGroup("a step failed", errors)
+        error = errors[HEAD] if len(errors) == 1 else BaseExceptionGroup("a step failed", errors)
         _note(inst=inst, method="report", keep=error, kind="machine", src=None, clones=[], error=error, quiet=False,
               background=False)
 
@@ -4333,7 +4333,7 @@ def s_answer(ctx, inst, event) -> None:
     if len(errors) == 1:
         _fail(reply=first, error=errors[HEAD])
     elif errors:
-        _fail(reply=first, error=ExceptionGroup("background grafts failed", errors))
+        _fail(reply=first, error=BaseExceptionGroup("background grafts failed", errors))
     else:
         _resolve(reply=first, value=None)
     inst.errors = [(e, calls) for e, calls in inst.errors if all(e is not x for x in errors)]
@@ -4452,7 +4452,7 @@ def s_closed(ctx, inst, event) -> None:
     closers, settles, errors = list(inst.closers), list(inst.settles), list(inst.stop_errors)
     if closers and errors:
         first, *closers = closers
-        _fail(reply=first, error=errors[0] if len(errors) == 1 else ExceptionGroup("stopping machines failed", errors))
+        _fail(reply=first, error=errors[0] if len(errors) == 1 else BaseExceptionGroup("stopping machines failed", errors))
     for reply in closers + settles:
         _resolve(reply=reply, value=None)
     # left only once answered: a step that fails here leaves them for its recovery to answer
