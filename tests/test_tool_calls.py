@@ -689,3 +689,98 @@ def test_a_graft_whose_join_is_abandoned_still_writes_the_close_out_it_carried(t
     assert store.timeline("c1")["status"] == "abandoned"
     assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]
     assert violations(store=store, tl="c1") == []
+
+
+def test_a_join_retried_after_its_write_failed_writes_the_carried_close_out_once(tmp_path):
+    world = Hanging()
+    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
+    real, fired = store.commit_join, []
+
+    def failing(*args, **kw):
+        if not fired and kw.get("closing"):
+            fired.append(1)
+            raise OSError("INJECTED commit_join")
+        return real(*args, **kw)
+    store.commit_join = failing
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await asyncio.wait_for(world.started.wait(), WAIT_TIMEOUT)
+        fail_once(h=h, name="close_tool_uses")
+        await asyncio.wait_for(h.user_says(STOP), WAIT_TIMEOUT)  # cancels c1; its join's write fails once
+        if store.timeline("c1")["status"] != "joined":
+            await asyncio.wait_for(h.drain_and_wake("o"), WAIT_TIMEOUT)  # the next commit point retries it
+        try:
+            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        except OSError:
+            pass
+        await h.close()
+
+    asyncio.run(go())
+    assert fired and store.timeline("c1")["status"] == "joined"
+    assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_WHILE_RUNNING, True)]
+    assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
+
+
+class SeveralWaiting(World):
+    """Every capability tool waits for ever; each records that it started and that it was cancelled."""
+
+    def __init__(self):
+        super().__init__()
+        self.started: dict[str, asyncio.Event] = {}
+        self.cancelled: set[str] = set()
+
+    async def execute(self, name, args):
+        self.started.setdefault(name, asyncio.Event()).set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.add(name)
+            raise
+
+
+def test_a_withdrawal_stops_several_background_grafts_whose_tools_await(tmp_path):
+    world, gate = SeveralWaiting(), threading.Event()
+    tools = {"website": use("w1", "site_write", page="i", content="x"),
+             "slides": use("s1", "slides_create", title="D"),
+             "calendar": use("k1", "calendar_book", what="x", date="2026-12-05", time="10:00")}
+
+    def policy(system, messages, tool_list):
+        names = {t["name"] for t in tool_list}
+        last = messages[-1]["content"][-1]
+        if "clone" in names:
+            if last["type"] == "tool_result":
+                assert gate.wait(WAIT_TIMEOUT)
+                return text("Started.")
+            if is_wake(last):
+                return text("Report.")
+            return [clone_use(*[clone_entry(skills=[k], focus=False) for k in tools], id="k1") | {"type": "tool_use"}]
+        skill = "website" if "site_write" in names else "slides" if "slides_create" in names else "calendar"
+        return [tools[skill]]
+
+    store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
+
+    async def go():
+        await h.start()
+        call = asyncio.create_task(h.user_says(REQUEST))
+        for name in ("site_write", "slides_create", "calendar_book"):
+            while name not in world.started:
+                await asyncio.sleep(0.01)
+        call.cancel()
+        gate.set()
+        try:
+            await call
+        except asyncio.CancelledError:
+            pass
+        for c in ("c1", "c2", "c3"):
+            await asyncio.wait_for(h.join_queued(c), WAIT_TIMEOUT)  # each stopped at the withdrawal
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert world.cancelled == {"site_write", "slides_create", "calendar_book"} and h.wakes == []
+    for c in ("c1", "c2", "c3"):
+        assert store.timeline(c)["join_reason"] == "cancelled"
+        assert [content for _, content, _ in tool_results(store=store, tl=c)] == [CANCELLED_WHILE_RUNNING]
