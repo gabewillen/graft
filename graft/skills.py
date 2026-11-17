@@ -33,9 +33,13 @@ JOIN_TOOL = {
     "input_schema": obj({"reason": {"type": "string", "enum": ["done", "out_of_scope", "failed"]}},
                         ["reason"])}
 
-# Graft ids in one cancel call, by default: twice the live cap (anything longer is noise). A
-# harness with another cap takes twice its cap (`cancel_limit`).
-MAX_CANCEL_IDS = 8
+def cancel_limit(max_live_background: int) -> int:
+    """Graft ids one cancel call takes: twice the live cap (anything longer is noise)."""
+    return 2 * max_live_background
+
+
+# Graft ids in one cancel call at the default cap; a harness with another cap takes twice its cap.
+MAX_CANCEL_IDS = cancel_limit(MAX_LIVE_BACKGROUND)
 
 # `cancelled` is not a reason a clone can give: only the harness sets it, when the original cancels.
 CANCEL_TOOL = {
@@ -269,16 +273,13 @@ def skill_listing(store: Store, names: list[str], heading: str) -> str:
 LIVE_CAP_SENTENCE = "At most four background clones of yours may be live at a time."
 
 
-def cancel_limit(max_live_background: int) -> int:
-    """Graft ids one cancel call takes: twice the live cap (MAX_CANCEL_IDS at the default cap)."""
-    return 2 * max_live_background
-
-
 def catalog(max_live_background: int = MAX_LIVE_BACKGROUND) -> list[Skill]:
     """The catalog for a harness whose cap on live background grafts is `max_live_background`.
     At the default cap it is CATALOG itself, byte for byte (prompts and caches depend on it);
     another cap is said in the clone skill's text (a cap above the four entries a clone call
     takes is reached across calls) and bounds the cancel tool's list."""
+    if LIVE_CAP_SENTENCE not in CLONE_INSTRUCTIONS:  # the text drifted: the cap could not be said
+        raise ValueError("the clone skill no longer says the live cap as LIVE_CAP_SENTENCE")
     if max_live_background == MAX_LIVE_BACKGROUND:
         return CATALOG
     said = (f"At most {max_live_background} background clones of yours may be live at a time"
@@ -297,11 +298,16 @@ def catalog(max_live_background: int = MAX_LIVE_BACKGROUND) -> list[Skill]:
 
 
 def says_live_cap(store: Store, max_live_background: int) -> bool:
-    """Does the store's installed clone skill say this cap (as `install` wrote it)? True where no
-    clone skill is installed (nothing says another cap)."""
+    """Does the store's installed clone skill say this cap, and its cancel tool take twice it, as
+    `install` wrote them? True if no clone skill is installed: a store a host fills itself (tests,
+    a bare harness) has no text that could say another cap, so there is nothing to disagree."""
     row = store.con.execute("SELECT instructions FROM skills WHERE name='clone'").fetchone()
+    tool = store.con.execute("SELECT input_schema FROM tools WHERE name='cancel'").fetchone()
+    if row is None or tool is None:
+        return True
     want = next(s.instructions for s in catalog(max_live_background) if s.name == "clone")
-    return row is None or row[0] == want
+    taken = json.loads(tool[0])["properties"]["cancel"].get("maxItems")
+    return row[0] == want and taken == cancel_limit(max_live_background)
 
 
 def install(store: Store, max_live_background: int = MAX_LIVE_BACKGROUND) -> None:

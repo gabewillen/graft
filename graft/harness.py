@@ -57,7 +57,7 @@ import json
 import re
 import threading
 from dataclasses import dataclass
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, Sequence
 
 from . import callsites, compaction
 from . import seeder as seeder_mod
@@ -65,7 +65,7 @@ from .db import Graft, Store, render, validate
 from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, MAX_LIVE_BACKGROUND, Cancel, CancelCall, Clone, Machines, Mode, Prepared,
                       QueuedJoin, RunOutcome, ToolCall, TransitionRefused, Unwritten)
 from .providers import Provider, prefix_nonce, window_tokens_for
-from .skills import (BASE_SYSTEM, BUILTIN, MAX_CANCEL_IDS, MAX_CLONE_ENTRIES, World, cancel_limit, load_skill,
+from .skills import (BASE_SYSTEM, BUILTIN, MAX_CLONE_ENTRIES, World, cancel_limit, load_skill,
                      says_live_cap, skill_listing)
 
 # Seconds one model call may take before it is abandoned as a mechanical failure (the harness's
@@ -206,10 +206,10 @@ def _echo(value: object) -> str:
     return repr(value) if len(value) <= ECHO_CHARS else repr(value[:ECHO_CHARS]) + "..."
 
 
-def cancel_ids(args: object, limit: int = MAX_CANCEL_IDS) -> tuple[list[str], list[str]]:
+def cancel_ids(args: object, limit: int) -> tuple[list[str], list[str]]:
     """The graft ids of a cancel call's input, in order and without repeats, and what is wrong
-    with the rest. `cancel` is a list of one to `limit` ids (the harness's: twice its live cap,
-    MAX_CANCEL_IDS by default), each shaped like a graft id
+    with the rest. `cancel` is a list of one to `limit` ids (the harness's: twice its live cap),
+    each shaped like a graft id
     (GRAFT_ID). The input is model-written: nothing about its shape is assumed. A call that is
     not such a list names no graft at all; an item that is not shaped like an id is reported by
     its index, shown as a short repr, and the others stand."""
@@ -618,9 +618,8 @@ class Harness:
         src's view now ends on a user message it must answer)."""
         self.trace(f"JOIN {{clone: {join.child}, reason: {join.reason}, trigger: {join.trigger}}} -> {src}")
         self.store.set_join(tl=join.child, reason=join.reason, trigger=join.trigger)
-        carried = {} if join.closing is None else {"closing": join.closing}  # a close-out it carries
         committed = self.default_join(src=src, child=join.child, reason=join.reason, trigger=join.trigger,
-                                      running=running, **carried)
+                                      running=running, closing=join.closing)
         return committed, self.request_of(join=join, at_clone=cloned_for), self._ends_on_user_message(src)
 
     def report(self, kind: str, src: str | None, clones: list[str], error: BaseException, quiet: bool,
@@ -866,7 +865,7 @@ class Harness:
 
     def _missing_results(self, tl: str, known: dict[str, tuple[str, bool]] | None) -> list[ToolResult]:
         """The results tl's last assistant turn still lacks (see `_close_tool_uses`), unwritten:
-        a known result for a call that ran, else not executed. None once every call has one."""
+        a known result for a call that ran, else not executed. [] once every call has one."""
         rows = self.store.view(tl)
         last = max((i for i, r in enumerate(rows) if r["role"] == "assistant"), default=None)
         if last is None:
@@ -1050,7 +1049,7 @@ class Harness:
             self._store_results(tl=tl, results=results)
 
     # ------------------------------------------------------------ cancel record, parts, blocks
-    def tools_run(self, child: str, closing: list[ToolResult] = ()) -> list[str]:
+    def tools_run(self, child: str, closing: Sequence[ToolResult] = ()) -> list[str]:
         """The capability tools child executed itself, in order: the results the harness marked
         as run (`Ran`) where it executed the tool; the mark is read, never the result's wording,
         and no pairing by tool-use id is needed, so a repeated id hides nothing. A tool that
@@ -1171,7 +1170,7 @@ class Harness:
 
     # ------------------------------------------------------------ default join (deterministic)
     def default_join_rows(self, src: str, child: str, reason: str, trigger: int | None,
-                          closing: list[ToolResult] = ()) -> tuple[list[int], str | None]:
+                          closing: Sequence[ToolResult] = ()) -> tuple[list[int], str | None]:
         """Spec 'Default join': text rows (user + assistant) of the clone's working view that the
         source lacks; out_of_scope ends with the trigger; failed adds a harness error record, and
         cancelled a harness record of the tools the graft had run.

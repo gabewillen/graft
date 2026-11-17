@@ -89,3 +89,13 @@ def test_a_cap_the_installed_clone_skill_does_not_say_is_refused(tmp_path):
     install(store)  # the default text says four
     with pytest.raises(ValueError, match="max_live_background"):
         Harness(store, FakeProvider(lambda *a: text("ok")), seeder=None, max_live_background=5)
+
+
+def test_a_cancel_tool_that_does_not_take_twice_the_cap_is_refused(tmp_path):
+    store = Store(str(tmp_path / "p.db"))
+    install(store)
+    schema = stored_cancel(store)
+    schema["properties"]["cancel"]["maxItems"] = 9
+    store.con.execute("UPDATE tools SET input_schema=? WHERE name='cancel'", (json.dumps(schema),))
+    with pytest.raises(ValueError, match="max_live_background"):
+        Harness(store, FakeProvider(lambda *a: text("ok")), seeder=None)
