@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import re
 import threading
@@ -62,7 +63,7 @@ from . import callsites, compaction
 from . import seeder as seeder_mod
 from .db import Graft, Store, render, validate
 from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, Cancel, CancelCall, Clone, Machines, Mode, Prepared,
-                      QueuedJoin, RunOutcome, TransitionRefused, Unwritten)
+                      QueuedJoin, RunOutcome, ToolCall, TransitionRefused, Unwritten)
 from .providers import Provider, prefix_nonce, window_tokens_for
 from .skills import (BASE_SYSTEM, BUILTIN, MAX_CANCEL_IDS, MAX_CLONE_ENTRIES, World, load_skill,
                      skill_listing)
@@ -103,6 +104,9 @@ class ToolResult(NamedTuple):
 NOT_RUN_INTERRUPTED = NotRun("not executed: the turn was interrupted")
 NOT_RUN_JOINING = NotRun("not executed: this task is being joined")
 NOT_RUN_BESIDE_CLONE = NotRun("not executed: call clone on its own")
+# A host tool call cut short while it ran (its run was left: a cancel, a withdrawal, shutdown).
+# It may have acted before it stopped, so it is recorded as run, with an error.
+CANCELLED_WHILE_RUNNING = Ran("cancelled while running: it may have acted before it stopped")
 _NONCE_TAG = re.compile(r"^\[conversation [^\]]*\]\s*")
 # Why a seed row is refused when the user withdrew the message it holds (spec: State machine).
 WITHDRAWN_SEED = "row {row} is a message the user withdrew; it is not a request and cannot be seeded"
@@ -558,6 +562,18 @@ class Harness:
     def store_result(self, tl: str, use: dict, content: str, is_error: bool) -> None:
         self._store_results(tl=tl, results=[ToolResult(use=use, content=content, is_error=is_error)])
 
+    async def call_tool(self, tl: str, use: dict) -> tuple[Ran, bool]:
+        """A host tool call (the activity of tl's machine's `calling` state). A World whose
+        `execute` returns an awaitable (an `async def execute`) is awaited here, so other
+        timelines go on while it waits; a cancel of the activity reaches the tool where it waits.
+        A synchronous result is used as it is."""
+        outcome = self.world.execute(use["name"], use["input"])
+        if inspect.isawaitable(outcome):
+            outcome = await outcome
+        content, err = outcome
+        self.trace(f"[{tl}] tool {use['name']}({json.dumps(use['input'])[:120]}) -> {content[:80]}")
+        return Ran(content), err
+
     def close_tool_uses(self, tl: str, known: dict[str, tuple[str, bool]]) -> None:
         self._close_tool_uses(tl=tl, known=known)
 
@@ -849,7 +865,13 @@ class Harness:
         response or a compaction is then not stored, said or acted on), after each text it says
         (nothing more of that response is said or run), and before each tool call and the
         response's cancel calls. A run whose request was withdrawn is ended by its machine
-        there (the calls it stored but did not run are closed by the machine as not run)."""
+        there (the calls it stored but did not run are closed by the machine as not run).
+
+        A host tool call is asked of the machine (`tool_request`) and made by it: the activity of
+        its `calling` state runs the tool, awaiting it if it returns an awaitable (other timelines
+        go on meanwhile), and writes its result row; the run waits for the reply, one call at a
+        time, so a turn's results are stored in call order. Leaving the run while a tool runs
+        cancels the tool where it waits, and the call is closed as run with an error."""
         background = kind == "background"
         # The run starts inside a machine step, so this first question is answered in that step
         # and the answer reaches the run only after it: a caller cancelled in that step has
@@ -935,10 +957,9 @@ class Harness:
                     content, err = self.load(tl, str(u["input"].get("name", "")))
                     self.trace(f"[{tl}] load_skill({u['input'].get('name')}) -> {'error' if err else 'ok'}")
                     await self._store_ran(tl=tl, result=ToolResult(use=u, content=content, is_error=err))
-                else:
-                    content, err = self.world.execute(u["name"], u["input"])
-                    self.trace(f"[{tl}] tool {u['name']}({json.dumps(u['input'])[:120]}) -> {content[:80]}")
-                    await self._store_ran(tl=tl, result=ToolResult(use=u, content=Ran(content), is_error=err))
+                else:  # the activity of the machine's `calling` state; it also writes the result row
+                    await self.machines.ask(tl=tl, name="tool_request", build=lambda reply, u=u: ToolCall(
+                        use=u, reply=reply, interrupted=CANCELLED_WHILE_RUNNING))
             # The cancel calls run after every other call's result is stored: one request to the
             # machine, which stores each call's real result once the grafts have stopped.
             if cancels:

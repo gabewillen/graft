@@ -269,6 +269,13 @@ def install(store: Store) -> None:
 
 @dataclass
 class World:
+    """The host's tools, run by the harness for a graft's capability tool calls. `execute(name,
+    args)` returns (content, is_error), or an awaitable of it: a host World may define
+    `async def execute`. Each call is the activity of its timeline's `calling` state, awaited
+    there while every other timeline goes on, so one graft's tool may wait for what another
+    graft's tool produces. A call cut short while it waits (its graft cancelled, its request
+    withdrawn, shutdown) is cancelled where it waits and recorded as run with an error. No timeout
+    is applied: a tool that never returns keeps its graft live."""
     site: dict[str, str] = field(default_factory=dict)
     decks: list[dict] = field(default_factory=list)
     calendar: list[dict] = field(default_factory=list)

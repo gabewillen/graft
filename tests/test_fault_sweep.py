@@ -51,7 +51,8 @@ import pytest
 
 import graft.machine as machine
 from graft.machine import DecisionFault, TransitionRefused
-from test_parallel import BAD, BG, FOCUS, STAY, STOP, FaultScript, make, violations
+from test_parallel import (BAD, BG, FOCUS, STAY, STOP, FaultScript, clone_entry, clone_use, is_wake, make, text,
+                           user_texts, violations)
 
 WAIT = 3.0  # seconds a call may take before the case counts it as slow
 # Seconds more a slow call is waited for before the case counts it as hung: a deadlock never ends,
@@ -88,11 +89,15 @@ ACTIVITY_HELPERS = {"_mark_pending", "_close_out"} | _work_functions()
 # The host calls the machines make (every one from an activity, or the scribe's).
 HOST = ("run_busy", "run_background", "mirror", "report", "graft_failed", "begin_request", "mark_withdrawn",
         "prepare_clone", "roll_back_clone", "commit_clone", "refuse_clone", "store_result", "close_tool_uses",
-        "record_join", "apply_join", "wake_note", "cancel_text", "join_of", "abandon_clone", "recover")
+        "record_join", "apply_join", "wake_note", "cancel_text", "join_of", "abandon_clone", "recover",
+        "call_tool")
+# A graft that makes a host tool call (site_write) and then replies: in the background (TOOL), or
+# holding the conversation (TOOL_FOCUS: it then joins done).
+TOOL, TOOL_FOCUS = "TOOL: build a website with a tool.", "TOOL_FOCUS: build a website with a tool."
 LONG = "LONG: " + "a detail of the request " * 60  # a message long enough that the next turn compacts
 
 SCENARIOS = ["plain", "BG", "FOCUS", "STAY", "BAD", "STOP", "withdrawn", "late", "prepare", "AB", "close", "compaction",
-             "spawn"]
+             "spawn", "tool", "tool_focus"]
 
 
 def functions() -> list[str]:
@@ -132,10 +137,28 @@ class Case:
 
 
 class Policy(FaultScript):
-    """The fault script, and a compaction call answered by compressing every row into one."""
+    """The fault script, a compaction call answered by compressing every row into one, and TOOL and
+    TOOL_FOCUS: the original clones one website graft (background, or focus), which calls
+    site_write and then replies (a focus graft then joins done)."""
 
     def __call__(self, system, messages, tools):
-        if {t["name"] for t in tools} == {"compact"}:
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        request = user_texts(messages)[-1]
+        if request in (TOOL, TOOL_FOCUS) and names != {"compact"}:
+            if "clone" in names:
+                if last["type"] == "text" and last["text"] == request:
+                    entry = clone_entry(skills=["website"], focus=request == TOOL_FOCUS, quotes=[request])
+                    return [clone_use(entry, id=f"k{len(messages)}") | {"type": "tool_use"}]
+                return text("Reported." if is_wake(last) else "Started.")
+            if last["type"] == "tool_result" and request == TOOL_FOCUS:
+                return [{"type": "text", "text": "site done"},
+                        {"type": "tool_use", "id": f"j{len(messages)}", "name": "join", "input": {"reason": "done"}}]
+            if last["type"] == "tool_result":
+                return text("site done")
+            return [{"type": "tool_use", "id": f"w{len(messages)}", "name": "site_write",
+                     "input": {"page": "index", "content": "hi"}}]
+        if names == {"compact"}:
             ids = [int(x) for x in re.findall(r"row_id=(\d+) ", messages[-1]["content"][-1]["text"])]
             return [{"type": "tool_use", "id": "compaction", "name": "compact", "input": {"items": [
                 {"op": "compress", "role": "user", "text": "the user asked for a long thing",
@@ -209,10 +232,10 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
     await h.start()
     for key in (BG, FOCUS, STAY):
         script.gate(f"graft:{key}")
-    if scenario in ("plain", "BG", "FOCUS", "BAD", "spawn"):
+    if scenario in ("plain", "BG", "FOCUS", "BAD", "spawn", "tool", "tool_focus"):
         script.open()
         await call_(label="user_says", coro=h.user_says({"plain": "plain", "BG": BG, "FOCUS": FOCUS, "BAD": BAD,
-                                              "spawn": BG}[scenario]))
+                                              "spawn": BG, "tool": TOOL, "tool_focus": TOOL_FOCUS}[scenario]))
     elif scenario == "STAY":
         script.open()
         await call_(label="user_says", coro=h.user_says(STAY))
@@ -668,7 +691,7 @@ def test_the_sweep_leaves_out_only_plumbing_builders_and_activities():
     activities = {n for n in every if inspect.iscoroutinefunction(getattr(machine, n))}
     assert every - set(functions()) == EXCLUDED | activities
     assert activities == {"busy_activity", "background_activity", "prepare_activity", "spawn_activity",
-                          "unspawn_activity", "s_stop_machines"}
+                          "unspawn_activity", "s_stop_machines", "tool_activity"}
 
 
 # ---------------------------------------------------------------- regressions (run by default)

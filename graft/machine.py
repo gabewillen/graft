@@ -82,6 +82,9 @@ marks that request's row, and then at rest):
           run         a run of the model loop: its activity
           driven      a turn its caller drives (tests, replay): no activity
             running
+            calling     a host tool call (activity: the tool, awaited if it returns an awaitable,
+                        then its result row); leaving the run cancels it where it waits, and the
+                        run's closing records it as run with an error (it may have acted)
             clone_gate  (choice) may the clone call be tried at all; decided before seeding
             preparing   the harness seeds and validates the call (activity; leaving the run ends it)
             prepared_gate, clone_choice, handed, cancels_done, resume   choices (cancels whose rows
@@ -134,8 +137,9 @@ marks that request's row, and then at rest):
                       not; queued passes a user message back to its source once; a fault that
                       ends a step in a final state other than joined or abandoned has closed)
 
-A background graft: `background` (its run, or `held` when a caller drives the turn that made it;
-never entered if the request it was made for was withdrawn before it was made)
+A background graft: `background` (its run, `running`, in `stepping` or `calling` a host tool
+(activity, as above); or `held` when a caller drives the turn that made it; never entered if the
+request it was made for was withdrawn before it was made)
 --finish (`ending`, a choice on how the run ended) | cancel | shutdown | join (forced) | error
 | a fault (reason failed) | `may_continue` once the request it was made for is withdrawn (reason
 cancelled)-->
@@ -312,6 +316,18 @@ class Cancel:
     request: int | None = None
 
 
+@dataclass
+class ToolCall:
+    """A host tool call its run asks its machine to make: the call is the activity of the run's
+    `calling` state, so leaving the run ends it where it waits. `use`: the model's tool call;
+    `interrupted`: the result (the harness's own, marked as run) the call is closed with if the
+    run is left while the tool runs: it may have acted before it stopped, so it is never closed
+    as not run."""
+    use: dict
+    reply: asyncio.Future
+    interrupted: str
+
+
 class Host(Protocol):
     """What the machines need from the harness: I/O only, always called from an activity (or the
     scribe's), always by keyword. Whatever the host needs to know about a timeline (its kind, the
@@ -330,6 +346,7 @@ class Host(Protocol):
     def commit_clone(self, src: str, clone: Clone) -> str: ...
     def refuse_clone(self, src: str, clone: Clone, why: str, error: BaseException | None) -> str: ...
     def store_result(self, tl: str, use: dict, content: str, is_error: bool) -> None: ...
+    def call_tool(self, tl: str, use: dict) -> Any: ...
     def close_tool_uses(self, tl: str, known: dict[str, tuple[str, bool]]) -> None: ...
     def record_join(self, child: str, reason: str) -> None: ...
     def apply_join(self, src: str, join: QueuedJoin, cloned_for: int | None, running: list[str]
@@ -415,6 +432,7 @@ class TimelineSM(hsm.Instance):
         self.outcomes: dict[str, str] = {}
         self.claims: dict[str, int] = {}  # graft -> the call of the response that names it first
         self.unstored: dict[str, tuple[str, bool]] = {}  # tool_use id -> a result not yet written
+        self.tool: ToolCall | None = None  # the host tool call its run is making (`calling`)
         # Cancel calls of a step a recovery ended after it had stopped grafts: each call with what
         # became of its ids, for the recovery to write its real result (it ran: never "not run").
         self.cut_cancels: list[tuple[CancelCall, dict[str, str]]] = []
@@ -1470,6 +1488,26 @@ async def background_activity(ctx, inst: TimelineSM, event) -> None:
     await inst.dispatch(inst.context(), hsm.Event(name="finish", data=outcome))
 
 
+async def tool_activity(ctx, inst: TimelineSM, event) -> None:
+    """A host tool call of the run (the activity of `calling`): the tool runs, awaited if it
+    returns an awaitable, and its result row is written in the same activity, so no step comes
+    between a tool that returned and its row. Before the tool is called the call is kept as one
+    that ran (`unstored`, with the run's `interrupted` result): leaving the state cancels the
+    tool where it waits, and the run's closing records it as run with an error, since it may
+    have acted before it stopped. The outcome is `tool_ran`: the result and, if its row could
+    not be written, that error. A tool that raises is `hsm/error`. Its inputs are taken before
+    its first await."""
+    host, tl, call = inst.host, inst.timeline_id, inst.tool
+    inst.unstored[call.use["id"]] = (call.interrupted, True)
+    content, is_error = await host.call_tool(tl=tl, use=call.use)
+    try:
+        host.store_result(tl=tl, use=call.use, content=content, is_error=is_error)
+    except Exception as error:  # noqa: BLE001 - the outcome event carries it
+        inst.dispatch(inst.context(), hsm.Event(name="tool_ran", data=(content, is_error, error)))
+        return
+    inst.dispatch(inst.context(), hsm.Event(name="tool_ran", data=(content, is_error, None)))
+
+
 async def prepare_activity(ctx, inst: TimelineSM, event) -> None:
     """The harness seeds and validates the clone call (its seeder may take a while: a withdrawal
     or shutdown ends this activity, and `unpreparing` rolls the call's audit back). The outcome is
@@ -2048,6 +2086,31 @@ def calls_closed(ctx, inst, event) -> None:
     inst.unstored = {}
 
 
+def take_tool(ctx, inst, event) -> None:
+    inst.tool = event.data
+
+
+def tool_returned(ctx, inst, event) -> None:
+    """The tool returned and its row was written: the run goes on. If the row could not be
+    written, the real result is kept for the run's closing (it ran) and the run ends with the
+    error."""
+    call, inst.tool = inst.tool, None
+    content, is_error, error = event.data
+    if error is None:
+        inst.unstored.pop(call.use["id"], None)
+        _resolve(reply=call.reply)
+    else:
+        inst.unstored[call.use["id"]] = (content, is_error)
+        _fail(reply=call.reply, error=error)
+
+
+def tool_raised(ctx, inst, event) -> None:
+    """The tool raised: the run ends with its error, and the call is closed as not run."""
+    call, inst.tool = inst.tool, None
+    inst.unstored.pop(call.use["id"], None)
+    _fail(reply=call.reply, error=event.data)
+
+
 def keep_unstored(ctx, inst, event) -> None:
     """A tool its run executed whose result row could not be written: its real result is kept,
     and written when the run's open calls are closed (it ran: it is never closed as not run)."""
@@ -2313,6 +2376,9 @@ def drop_clone(ctx, inst, event) -> None:
 
 def answer_pending(ctx, inst, event) -> None:  # exit of a run: a request it never answered is refused
     clone, inst.clone = inst.clone, None
+    tool, inst.tool = inst.tool, None
+    if tool is not None:  # its run is ended with the state: the reply it waits on goes with it
+        tool.reply.cancel()
     cancel, inst.cancel = inst.cancel, None
     if cancel is not None and inst.claims:  # left mid-way (a fault): the calls that stopped grafts ran
         inst.cut_cancels = [(call, {c: _cut_outcome(inst=inst, child=c, index=index) for c in call.ids})
@@ -3168,6 +3234,13 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
             T(On("clone_request"), S("../clone_gate"), G(no_cancels), Effect(take_clone, judge_call)),
             T(On("clone_request"), Call(checked(carries_cancels, no_cancels, effects=(refuse_clone_call,)))),
             T(On("cancel_request"), S("../cancel_gate"), Effect(take_cancel)),
+            T(On("tool_request"), S("../calling"), Effect(take_tool)),
+        ),
+        hsm.State(
+            # a host tool call (activity): leaving the run cancels it where it waits
+            "calling", Activity(work=tool_activity, done="tool_ran"),
+            T(On("tool_ran"), S("../running"), Effect(tool_returned)),
+            T(On(E), S("../running"), Effect(tool_raised)),
         ),
         hsm.Choice(
             "cancel_gate",  # a step that failed taking the cancels does not carry them out: the
@@ -3353,7 +3426,7 @@ def _timeline(name: str) -> hsm.Model:
             T(S("live/engaged/withdrawing"), G(starts_withdrawn), Effect(engage)),
             T(S("live/idle"), Effect(checked(starts_busy, starts_withdrawn))),
         ),
-        T(On(*REQUESTS, RETURNED, "when_queued", "may_continue"), Call(refuse_request)),
+        T(On(*REQUESTS, RETURNED, "when_queued", "may_continue", "tool_request"), Call(refuse_request)),
         # in every state: recorded, never ignored (one of a request it answered: the cancel wins)
         T(On("withdraw"), G(withdraws_late), Call(note_late_withdrawal)),
         T(On("withdraw"), Call(checked(withdraws_late, effects=(note_withdrawn,)))),
@@ -3368,7 +3441,7 @@ def _timeline(name: str) -> hsm.Model:
         *_join_arrivals(T=T, On=On, G=G),
         T(On("clone_request"), Call(refuse_clone_call)),
         T(On("cancel_request"), Call(refuse_cancel_call)),
-        T(On("poke", "shutdown", "check"), Call(ignore)),
+        T(On("poke", "shutdown", "check", "tool_ran"), Call(ignore)),  # tool_ran: its run was left
         # a run that raised during a step that then ended it (a hand-over, its request withdrawn)
         T(On("run_failed"), Call(run_failed_after_it_ended)),
         T(On("closing"), Call(set_closing)),
@@ -3662,12 +3735,12 @@ BACKGROUND = hsm.Define(
         _T(_S("live/recording"), Effect(checked(is_held, starts_running, starts_cancelled,
                                                 effects=(ended_as(reason="failed", close_first=False),)))),
     ),
-    _T(_On(*REQUESTS, "rest_request", "may_continue"), Effect(refuse_request)),  # not a timeline that rests
+    _T(_On(*REQUESTS, "rest_request", "may_continue", "tool_request"), Effect(refuse_request)),  # not a timeline that rests
     _T(_On("when_queued"), Effect(answer_true)),
     _T(_On("result_unstored"), Effect(keep_unstored)),
     _T(_On("cancel_request"), Effect(refuse_cancel_call)),
     _T(_On("clone_request"), Effect(refuse_clone_call)),
-    _T(_On("cancel", "shutdown", "finish", "closing"), Effect(ignore)),
+    _T(_On("cancel", "shutdown", "finish", "closing", "tool_ran"), Effect(ignore)),
     _T(_On(FAULT), Effect(bg_fault_at_end)),  # joined, abandoned: the fault is told
     hsm.State(
         "live",  # until its join event is raised: callers waiting for it are kept
@@ -3693,6 +3766,14 @@ BACKGROUND = hsm.Define(
                    Effect(ended_as(reason=CANCELLED, close_first=True))),
                 _T(_On("may_continue"), _S("../../recording"), Effect(checked(
                     made_for_live, made_for_withdrawn, effects=(ended_as(reason="failed", close_first=True),)))),
+                hsm.Initial(_S("stepping")),
+                hsm.State("stepping", _T(_On("tool_request"), _S("../calling"), Effect(take_tool))),
+                hsm.State(
+                    # a host tool call (activity): leaving `background` cancels it where it waits
+                    "calling", Activity(work=tool_activity, done="tool_ran"),
+                    _T(_On("tool_ran"), _S("../stepping"), Effect(tool_returned)),
+                    _T(_On(_E), _S("../stepping"), Effect(tool_raised)),
+                ),
             ),
         ),
         hsm.Choice(

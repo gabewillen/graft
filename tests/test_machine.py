@@ -102,6 +102,10 @@ class Host:
     def store_result(self, tl, use, content, is_error):
         self.record("result", tl, use["id"], content, is_error)
 
+    async def call_tool(self, tl, use):
+        self.record("tool", tl, use["id"])
+        return "ran", False
+
     def close_tool_uses(self, tl, known):
         self.record("close", tl, dict(known))
 
