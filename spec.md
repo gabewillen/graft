@@ -199,7 +199,7 @@ Architecture rules (routing, cloning, joining) are not part of the persona; they
 
 ### Join
 
-1. The clone decides it is done, out of scope, or failed, and uses its **join** skill (a background graft: the `join` tool of its **background** skill).
+1. The clone decides it is done, out of scope, or failed, and uses its **join** skill (a background graft: the `join` tool of its **background** skill). A focus graft does not join because it has answered: it keeps the conversation until one of those holds, so a join means the clone has ended, not that its result is ready (its replies are already rows in the store; see [User Experience](#user-experience)).
 2. The harness raises a join event. Everything after this is a deterministic state transition, with no model call:
    - focus graft: `active → queued` (frozen permanently, its join last on the source's queue); source: `cloned → joining`. When the join has been written to the source: `queued → joined`.
    - background graft: `background → queued` (frozen permanently, its join waiting on the source's queue), then `queued → joined` when the join is applied to the source at rest (see [Parallel grafts](#parallel-grafts))
@@ -428,6 +428,7 @@ Clones are single-use. A clone joins once and never runs again. Agents never mes
 
 - **Clones are invisible to the user.** There is one agent and one conversation; the user never sees the seams.
 - **A clone never says "I can't do that."** Anything out of scope joins back silently and the source handles it.
+- **A focus graft joins when it has ended, not when it has answered.** A focus graft does not join after it answers: it holds the conversation and joins only when it is done, hands a message back out of scope, or fails. There is no implicit join and no separate record of a result. A host that shows a clone's progress shows its replies as they are written (they are rows in the store), and reads a join as "this clone has ended", not "its result is ready".
 - **Background work is reported by the agent, not by the clone.** While background grafts run the user keeps talking to the same agent; when they finish, the agent says so in its own words.
 - **A clone does only its own part of what it starts with.** The messages a clone is seeded with may ask for several things. It does the part its skills cover. The other parts belong to other clones: it does not attempt them, apologise for them or mention them, and they are never a reason to join `out_of_scope` or `failed`.
 - **A clone joins with the whole of a later message.** If a message the user sends after the clone started is partly in scope ("make the header darker and email the draft to Bob"), the clone joins before acting on any of it. Only the source splits a request. In the example, the source joins c7, sends the email itself, then creates c8 for the header.
