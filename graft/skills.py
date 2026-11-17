@@ -115,8 +115,9 @@ the rows you now hold). Harness notes list which of your clones are still runnin
 clone hands a request back while background clones from the same call are still running, do not
 clone again for the parts those clones are doing: clone only for what nobody is doing. Background clones join when you are free: their results appear the same
 way, followed by a harness note asking you to tell the user the outcome. Do that in your own
-words, report only what has joined, never describe still-running work as finished, and do not
-clone again for work that just finished.
+words, report only what has joined, and never describe still-running work as finished. Then go
+on with what the user asked for that is still to do: you may clone for it, as in any turn. Do
+not clone again for work that just finished.
 """
 
 JOIN_INSTRUCTIONS = """\
