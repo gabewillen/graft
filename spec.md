@@ -208,9 +208,11 @@ Architecture rules (routing, cloning, joining) are not part of the persona; they
 3. The join event carries only harness-generated fields, never clone-written text:
 
    ```text
-   {clone: c7, reason: done | out_of_scope | failed | cancelled, trigger: <row_id> | null}
+   {clone: c7, reason: done | out_of_scope | failed | cancelled, trigger: <row_id> | null,
+    closing: {<tool_use_id>: (<result>, <is_error>)} | null}
    ```
 
+   `closing` is the graft's close-out it could not write as it froze: when a graft's run ends early (cancelled, shut down, or failed) its open tool calls get results as it records its join (a background graft's `recording`, a focus graft's `failing`); if that write fails, the graft's machine keeps those results (the real result of a call that ran, "cancelled while running" for a tool cut short where it waited) and carries them with its join instead of dropping them, since a frozen graft never writes to its view again. The source writes them into the graft's own timeline in the join's single SQL transaction, before the join's record and pointers (`applying`), so the graft's view is valid once its join lands and the cancel record lists every tool it ran. Only results its last turn still lacks are written, so a retry after a failed join write, which left nothing in the store, writes each once. A call it does not name is closed as not executed.
 
    `cancelled` is a reason only the harness sets: when the original cancels a running background graft (see [Parallel grafts](#parallel-grafts)), and when the user's call a background graft was made for is withdrawn (see [State machine](#state-machine)). It is not among the reasons the `join` tool offers; a clone that sends it, like any reason outside `done`, `out_of_scope` and `failed`, is recorded as `failed`.
 

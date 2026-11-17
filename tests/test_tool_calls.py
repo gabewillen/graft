@@ -258,3 +258,95 @@ def test_a_synchronous_tool_that_raises_is_still_closed_as_not_run(tmp_path):
     assert tool_results(store=store, tl="c1") == [("site_write", "not executed: the turn was interrupted", True)]
     assert h.tools_run("c1") == []
 
+
+# ------------------------------------------------------------------ a frozen graft's close-out that cannot be written
+class RaisingTool(World):
+    def execute(self, name, args):
+        raise RuntimeError("backend down")
+
+
+def fail_once(h, name, tl="c1"):
+    """h's host call `name` for timeline `tl` raises once (the store write fails), then works."""
+    real, fired = getattr(h, name), []
+
+    def failing(**kw):
+        if not fired and kw.get("tl") == tl:
+            fired.append(name)
+            raise OSError(f"INJECTED {name}")
+        return real(**kw)
+    setattr(h, name, failing)
+    return fired
+
+
+async def settled(h):
+    """settle, which raises the injected error once (it was told); then nothing more."""
+    try:
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+    except OSError:
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+
+
+def test_a_background_graft_whose_close_out_cannot_be_written_carries_it_with_its_join(tmp_path):
+    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    store, h, _ = make(tmp_path=tmp_path, policy=policy, world=RaisingTool())
+    fired = fail_once(h=h, name="close_tool_uses")
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)
+        await settled(h)
+        await h.close()
+
+    asyncio.run(go())
+    assert fired == ["close_tool_uses"] and store.timeline("c1")["status"] == "joined"
+    assert tool_results(store=store, tl="c1") == [("site_write", "not executed: the turn was interrupted", True)]
+    assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
+
+
+def test_a_cancelled_graft_whose_close_out_cannot_be_written_still_names_the_running_tool(tmp_path):
+    world = Hanging()
+    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await asyncio.wait_for(world.started.wait(), WAIT_TIMEOUT)
+        fail_once(h=h, name="close_tool_uses")
+        await asyncio.wait_for(h.user_says(STOP), WAIT_TIMEOUT)
+        await settled(h)
+        await h.close()
+
+    asyncio.run(go())
+    assert world.cancelled and store.timeline("c1")["join_reason"] == "cancelled"
+    assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_WHILE_RUNNING, True)]
+    record = [r["content"] for r in store.view("o") if "was cancelled before it finished" in r["content"]]
+    assert len(record) == 1 and "site_write (returned an error)" in record[0]
+    assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
+
+
+def test_a_failed_focus_graft_whose_close_out_cannot_be_written_carries_it_with_its_join(tmp_path):
+    def original(last, messages):
+        if last["type"] == "tool_result" or is_wake(last) or last.get("harness"):
+            return text("Back.")
+        return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
+
+    store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=RaisingTool())
+    fired = fail_once(h=h, name="close_tool_uses")
+
+    async def go():
+        await h.start()
+        try:
+            await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT)
+        except OSError:
+            pass
+        await settled(h)
+        await h.close()
+
+    asyncio.run(go())
+    assert fired == ["close_tool_uses"] and store.timeline("c1")["status"] == "joined"
+    assert store.timeline("c1")["join_reason"] == "failed"
+    assert tool_results(store=store, tl="c1") == [("site_write", "not executed: the turn was interrupted", True)]
+    assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
+

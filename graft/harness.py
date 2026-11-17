@@ -588,8 +588,9 @@ class Harness:
         src's view now ends on a user message it must answer)."""
         self.trace(f"JOIN {{clone: {join.child}, reason: {join.reason}, trigger: {join.trigger}}} -> {src}")
         self.store.set_join(tl=join.child, reason=join.reason, trigger=join.trigger)
+        carried = {} if join.closing is None else {"closing": join.closing}  # a close-out it carries
         committed = self.default_join(src=src, child=join.child, reason=join.reason, trigger=join.trigger,
-                                      running=running)
+                                      running=running, **carried)
         return committed, self.request_of(join=join, at_clone=cloned_for), self._ends_on_user_message(src)
 
     def report(self, kind: str, src: str | None, clones: list[str], error: BaseException, quiet: bool,
@@ -690,14 +691,20 @@ class Harness:
 
 
     # ------------------------------------------------------------ main loop
+    @staticmethod
+    def _result_block(result: ToolResult) -> dict:
+        use, content, err = result
+        block = {"tool_use_id": use["id"], "content": content, "is_error": err}
+        if isinstance(content, NotRun):
+            block["not_run"] = True  # structural: the harness did not run this call
+        if isinstance(content, Ran):
+            block["ran"] = True  # structural: the harness ran this call
+        return block
+
     def _store_results(self, tl: str, results: list[ToolResult]) -> None:
-        for use, content, err in results:
-            block = {"tool_use_id": use["id"], "content": content, "is_error": err}
-            if isinstance(content, NotRun):
-                block["not_run"] = True  # structural: the harness did not run this call
-            if isinstance(content, Ran):
-                block["ran"] = True  # structural: the harness ran this call
-            self.store.add_turn(tl=tl, role="user", kind="tool_result", content=block, tool_name=use["name"])
+        for result in results:
+            self.store.add_turn(tl=tl, role="user", kind="tool_result", content=self._result_block(result),
+                                tool_name=result[0]["name"])
 
     def _store_blocks(self, tl: str, blocks: list[dict]) -> None:
         for b in blocks:
@@ -823,10 +830,17 @@ class Harness:
         result is stored by the machine step that ran it, before the run can end, so this never
         stands in for a call that ran. Calls of that turn that already have their result are left
         alone, whatever was stored after them."""
+        missing = self._missing_results(tl=tl, known=known)
+        if missing:
+            self._store_results(tl=tl, results=missing)
+
+    def _missing_results(self, tl: str, known: dict[str, tuple[str, bool]] | None) -> list[ToolResult]:
+        """The results tl's last assistant turn still lacks (see `_close_tool_uses`), unwritten:
+        a known result for a call that ran, else not executed. None once every call has one."""
         rows = self.store.view(tl)
         last = max((i for i, r in enumerate(rows) if r["role"] == "assistant"), default=None)
         if last is None:
-            return
+            return []
         first = last
         while first > 0 and rows[first - 1]["role"] == "assistant":
             first -= 1
@@ -841,8 +855,7 @@ class Harness:
                 continue
             content, err = (known or {}).get(use_id, (NOT_RUN_INTERRUPTED, True))
             missing.append(ToolResult(use={"id": use_id, "name": r["tool_name"]}, content=content, is_error=err))
-        if missing:
-            self._store_results(tl=tl, results=missing)
+        return missing
 
     async def may_continue(self, tl: str) -> None:
         """Ask tl's machine whether its run may take its next step (a model call, a tool, the next
@@ -1007,7 +1020,7 @@ class Harness:
             self._store_results(tl=tl, results=results)
 
     # ------------------------------------------------------------ cancel record, parts, blocks
-    def tools_run(self, child: str) -> list[str]:
+    def tools_run(self, child: str, closing: list[ToolResult] = ()) -> list[str]:
         """The capability tools child executed itself, in order: the results the harness marked
         as run (`Ran`) where it executed the tool; the mark is read, never the result's wording,
         and no pairing by tool-use id is needed, so a repeated id hides nothing. A tool that
@@ -1015,12 +1028,13 @@ class Harness:
         listed, marked "(returned an error)". Names only: tool input and output never leave a
         graft's timeline."""
         ran = []
-        for r in self.store.view(child):
-            if r["owner_timeline"] != child or r["kind"] != "tool_result":
-                continue
-            data = json.loads(r["content"])
+        blocks = [(r["tool_name"], json.loads(r["content"])) for r in self.store.view(child)
+                  if r["owner_timeline"] == child and r["kind"] == "tool_result"]
+        # `closing`: the results its join writes first (a close-out it could not write as it froze)
+        blocks += [(result[0]["name"], self._result_block(result)) for result in closing]
+        for name, data in blocks:
             if data.get("ran"):
-                ran.append(r["tool_name"] + (" (returned an error)" if data.get("is_error") else ""))
+                ran.append(name + (" (returned an error)" if data.get("is_error") else ""))
         return ran
 
     def part_of(self, child: str) -> frozenset[str]:
@@ -1126,8 +1140,8 @@ class Harness:
 
 
     # ------------------------------------------------------------ default join (deterministic)
-    def default_join_rows(self, src: str, child: str, reason: str, trigger: int | None
-                          ) -> tuple[list[int], str | None]:
+    def default_join_rows(self, src: str, child: str, reason: str, trigger: int | None,
+                          closing: list[ToolResult] = ()) -> tuple[list[int], str | None]:
         """Spec 'Default join': text rows (user + assistant) of the clone's working view that the
         source lacks; out_of_scope ends with the trigger; failed adds a harness error record, and
         cancelled a harness record of the tools the graft had run.
@@ -1138,7 +1152,7 @@ class Harness:
         error = (f"(harness note: clone {child} failed; its timeline is frozen)"
                  if reason == "failed" else None)
         if reason == CANCELLED:
-            ran = self.tools_run(child)
+            ran = self.tools_run(child, closing=closing)
             error = (f"(harness note: clone {child} was cancelled before it finished; its timeline is frozen. "
                      f"Before it was stopped it had run: {', '.join(ran) if ran else 'no tools'}. "
                      "Nothing it did outside this conversation was undone; a tool that returned an error "
@@ -1195,18 +1209,26 @@ class Harness:
                 return kept, record
         raise AssertionError("unreachable")
 
-    def default_join(self, src: str, child: str, reason: str, trigger: int | None, running: list[str]) -> bool:
+    def default_join(self, src: str, child: str, reason: str, trigger: int | None, running: list[str],
+                     closing: dict[str, tuple[str, bool]] | None = None) -> bool:
         """Apply the default join of child to src, once. True: committed. False: the resulting
         view was invalid and only the record (and trigger) were appended (rolled back). If the
         write fails, nothing of the join is in the store, its audit record says `failed`, and
-        the error is raised. `running`: src's grafts still running, named in the record."""
+        the error is raised. `running`: src's grafts still running, named in the record.
+        `closing`: the close-out child could not write as it froze (its machine carried it with the
+        join): the results its last turn still lacks are written into child's timeline first, in
+        the join's SQL transaction, so a retry after a failed write writes them once."""
         applied = self.store.join_outcome(child)
         if applied is not None:
             # The join is already in the store: an earlier attempt wrote it and then failed before
             # the machine recorded it. The store commit and the machine step are one unit, so the
             # retry finishes the machine step and writes nothing.
             return applied == "committed"
-        wanted, error = self.default_join_rows(src=src, child=child, reason=reason, trigger=trigger)
+        closed = self._missing_results(tl=child, known=closing) if closing is not None else []
+        closes = [(child, result[0]["name"], self._result_block(result)) for result in closed]
+        if closes:
+            self.trace(f"[{src}] join of {child} writes its close-out: {[c[2]['tool_use_id'] for c in closes]}")
+        wanted, error = self.default_join_rows(src=src, child=child, reason=reason, trigger=trigger, closing=closed)
         rows, record = self.fit_join(src=src, child=child, reason=reason, rows=wanted, error=error, trigger=trigger,
                                      running=running)
         if [r for r in wanted if r != trigger] and not [r for r in rows if r != trigger]:
@@ -1222,11 +1244,12 @@ class Harness:
                 self.trace(f"[{src}] default join invalid: {v}; appending record + trigger only")
                 self.store.commit_join(src, record.replace("follow", "skipped (invalid view)"), [], error=None,
                                        trigger=trig, tx=tx, status="rolled_back", committed_sql=None,
-                                       scratch={"default": True, "violations": v})
+                                       scratch={"default": True, "violations": v}, closing=closes)
                 return False
             # record, pointers, error row, trigger and the audit outcome: one SQL transaction
             self.store.commit_join(src, record, [r for r in rows if r != trigger], error=error, trigger=trig,
-                                   tx=tx, status="committed", committed_sql=sql, scratch={"default": True})
+                                   tx=tx, status="committed", committed_sql=sql, scratch={"default": True},
+                                   closing=closes)
         except Exception as e:  # nothing of the join was written; the audit record says so
             self.store.end_tx(tx, status="failed", committed_sql=None,
                               scratch={"default": True, "error": f"{type(e).__name__}: {e}"})

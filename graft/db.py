@@ -350,12 +350,16 @@ class Store:
 
     def commit_join(self, source: str, record: str, rows: list[int], *, error: str | None,
                     trigger: int | None, tx: int, status: str, committed_sql: str | None,
-                    scratch: Any) -> int:
-        """One join, one SQL transaction: the record row, the remembered pointers, the error row
-        of a failed clone, the trigger pointer, and the outcome of the join's audit record `tx`.
-        All of it or none of it, so a join that failed halfway leaves nothing and can be retried."""
+                    scratch: Any, closing: Sequence[tuple[str, str, Any]] = ()) -> int:
+        """One join, one SQL transaction: the clone's close-out it could not write as it froze
+        (`closing`: (timeline, tool name, tool_result block) rows, written first, into its own
+        timeline), the record row, the remembered pointers, the error row of a failed clone, the
+        trigger pointer, and the outcome of the join's audit record `tx`. All of it or none of it,
+        so a join that failed halfway leaves nothing and can be retried."""
         self.con.execute("BEGIN")
         try:
+            for tl, tool_name, block in closing:
+                self.add_turn(tl, "user", "tool_result", block, tool_name=tool_name)
             rec = self.add_turn(source, "user", "text", record, harness=True)
             for rid in rows:
                 self.append(source, rid)

@@ -208,10 +208,14 @@ class Unwritten(str):
 
 
 class QueuedJoin(NamedTuple):
-    """A join event waiting on its source: who, why, and the user message it hands back."""
+    """A join event waiting on its source: who, why, and the user message it hands back.
+    `closing`: the graft's close-out it could not write as it froze (its open tool calls, each
+    with the result it is closed with, by tool_use id; a call not named is closed as not run),
+    carried for its source to write into the graft's timeline with the join; None: nothing."""
     child: str
     reason: str
     trigger: int | None
+    closing: dict[str, tuple[str, bool]] | None = None
 
 
 class Mode(NamedTuple):
@@ -433,6 +437,9 @@ class TimelineSM(hsm.Instance):
         self.claims: dict[str, int] = {}  # graft -> the call of the response that names it first
         self.unstored: dict[str, tuple[str, bool]] = {}  # tool_use id -> a result not yet written
         self.tool: ToolCall | None = None  # the host tool call its run is making (`calling`)
+        # A frozen graft's close-out it could not write (its open calls' known results), carried
+        # with its join for its source to write (`QueuedJoin.closing`).
+        self.unclosed: dict[str, tuple[str, bool]] | None = None
         # Cancel calls of a step a recovery ended after it had stopped grafts: each call with what
         # became of its ids, for the recovery to write its real result (it ran: never "not run").
         self.cut_cancels: list[tuple[CancelCall, dict[str, str]]] = []
@@ -1712,18 +1719,20 @@ def _wake_note(inst, event):
 
 def _record(inst, event):
     """A background graft's join reason is written; its open calls first get results if its run
-    ended early. Each failure is collected: the join is queued whatever the store does."""
-    errors = []
+    ended early. Each failure is collected: the join is queued whatever the store does, and a
+    close-out that could not be written goes with it (`recorded`: QueuedJoin.closing)."""
+    errors, closed = [], True
     if inst.close_first:
         try:
             inst.host.close_tool_uses(tl=inst.timeline_id, known=dict(inst.unstored))
         except Exception as e:  # noqa: BLE001
             errors.append(e)
+            closed = False
     try:
         inst.host.record_join(child=inst.timeline_id, reason=inst.reason)
     except Exception as e:  # noqa: BLE001
         errors.append(e)
-    return errors
+    return errors, closed
 
 
 def _recover(inst, event):
@@ -2646,6 +2655,8 @@ def _hand_back(inst: TimelineSM, event: hsm.Event | None) -> None:
     fault after this keeps it, and the recovery sends it), then goes to its source."""
     join, also = _hand_back_of(event=event)
     join = join or QueuedJoin(child=inst.timeline_id, reason="failed", trigger=None)
+    if inst.unclosed is not None:  # a close-out it could not write goes with its join
+        join = join._replace(closing=inst.unclosed)
     users = [w for w in inst.waiters if w.user] + also
     others = [w for w in inst.waiters if not w.user]
     inst.handed_back = (join, users, list(inst.inbox), inst.answering, set(inst.withdrawn), list(inst.unmarked),
@@ -2675,8 +2686,10 @@ def hand_back_join(ctx, inst, event) -> None:
 
 
 def focus_failure_not_recorded(ctx, inst, event) -> None:
-    """Its failure could not be recorded: the user is told; it joins `failed` next."""
+    """Its failure could not be recorded: the user is told; it joins `failed` next, carrying its
+    close-out (its open calls may be left without results), which its source writes with the join."""
     _report(inst=inst, kind="task", clones=[inst.timeline_id], error=event.data, src=inst.source_id)
+    inst.unclosed = dict(inst.unstored)
 
 
 def focus_failed_unrecorded(ctx, inst, event) -> None:
@@ -2712,11 +2725,19 @@ def _unreported(inst: TimelineSM, errors: list[BaseException]) -> list[tuple]:
 
 
 def recorded(ctx, inst, event) -> None:
-    inst.unreported += _unreported(inst=inst, errors=event.data)
+    """Its failures are to be told; a close-out it could not write goes with its join."""
+    errors, closed = event.data
+    inst.unreported += _unreported(inst=inst, errors=errors)
+    if not closed:
+        inst.unclosed = dict(inst.unstored)
 
 
 def record_crashed(ctx, inst, event) -> None:
+    """Its record raised: the close-out, if it had one, goes with its join (written again where it
+    was written: a call that has its result is left alone)."""
     inst.unreported += _unreported(inst=inst, errors=[event.data])
+    if inst.close_first:
+        inst.unclosed = dict(inst.unstored)
 
 
 def join_raised(ctx, inst, event) -> None:
@@ -2732,7 +2753,7 @@ def _send_join(inst: TimelineSM) -> None:
     """A background graft's join event goes to its source (recorded once sent: a fault in the step
     that sends it, before the send, leaves it unsent, and the recovery sends it)."""
     _forward(target=inst.machines.timelines.get(inst.source_id), name="graft_queued",
-             data=QueuedJoin(child=inst.timeline_id, reason=inst.reason, trigger=None))
+             data=QueuedJoin(child=inst.timeline_id, reason=inst.reason, trigger=None, closing=inst.unclosed))
     inst.join_sent = True
 
 
