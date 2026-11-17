@@ -174,6 +174,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
 import functools
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Protocol
@@ -351,6 +352,7 @@ class Host(Protocol):
     def report(self, kind: str, src: str | None, clones: list[str], error: BaseException, quiet: bool,
                background: bool) -> None: ...
     def trace(self, text: str) -> None: ...
+    def trace_line(self, text: str) -> None: ...  # the user's trace callback, written by the scribe
     def graft_failed(self, tl: str, error: BaseException) -> None: ...
     def begin_request(self, tl: str, text: str) -> int: ...
     def mark_withdrawn(self, timelines: list[str], rows: list[int]) -> None: ...
@@ -1521,6 +1523,9 @@ async def tool_activity(ctx, inst: TimelineSM, event) -> None:
     its row could not be written, that error. A tool that raises is `hsm/error`. Its inputs are
     taken before its first await (`known` is the record the run's closing reads)."""
     host, tl, call, known = inst.host, inst.timeline_id, inst.tool, inst.unstored
+    # Kept here, in the activity, not by the step that entered `calling`: a step that fails holds
+    # its activity back, and the call it would have made never runs, so it must close as not run.
+    # Only a call this activity is about to invoke is kept as one that ran.
     known[call.use["id"]] = (call.interrupted, True)
     try:
         content, is_error = await host.call_tool(tl=tl, use=call.use)
@@ -2152,9 +2157,11 @@ def take_tool(ctx, inst, event) -> None:
 def tool_returned(ctx, inst, event) -> None:
     """The tool returned and its row was written: the run goes on. If the row could not be
     written, the real result is kept for the run's closing (it ran) and the run ends with the
-    error."""
+    error. Its trace line goes through the scribe, so a trace that fails never touches the result."""
     call, inst.tool = inst.tool, None
     content, is_error, error = event.data
+    _note(inst=inst, method="trace_line", text=f"[{inst.timeline_id}] tool {call.use['name']}"
+                                          f"({json.dumps(call.use['input'])[:120]}) -> {content[:80]}")
     if error is None:
         inst.unstored.pop(call.use["id"], None)
         _resolve(reply=call.reply)

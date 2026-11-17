@@ -6,6 +6,8 @@ as not executed: it may have acted before it stopped."""
 import asyncio
 import threading
 
+import pytest
+
 from graft.skills import World
 from test_parallel import (REQUEST, WAIT_TIMEOUT, clone_entry, clone_use, is_wake, make, text, tool_results,
                            violations)
@@ -238,9 +240,9 @@ def test_close_while_a_background_graft_s_tool_awaits_returns_and_records_the_ca
     assert h.tools_run("c1") == ["site_write (returned an error)"]
 
 
-def test_a_synchronous_tool_that_raises_is_still_closed_as_not_run(tmp_path):
-    """The `calling` state's error: the run ends with the tool's error, and the call, which never
-    returned, is closed as not executed (as before awaited tools)."""
+def test_a_synchronous_tool_that_raises_ends_as_run_with_an_error(tmp_path):
+    """A tool that was invoked has run, whatever it then raised: its call gets a result marked
+    run, with an error naming what was raised, and the run goes on (the model sees it)."""
     class Raising(World):
         def execute(self, name, args):
             raise RuntimeError("backend down")
@@ -256,17 +258,13 @@ def test_a_synchronous_tool_that_raises_is_still_closed_as_not_run(tmp_path):
         await h.close()
 
     asyncio.run(go())
-    assert h.graft_errors == [("c1", "RuntimeError: backend down")]
-    assert tool_results(store=store, tl="c1") == [("site_write", "not executed: the turn was interrupted", True)]
-    assert h.tools_run("c1") == []
+    assert h.graft_errors == [] and store.timeline("c1")["join_reason"] == "done"
+    assert tool_results(store=store, tl="c1") == [
+        ("site_write", "raised RuntimeError: backend down; it may have acted", True)]
+    assert h.tools_run("c1") == ["site_write (returned an error)"]
 
 
 # ------------------------------------------------------------------ a frozen graft's close-out that cannot be written
-class RaisingTool(World):
-    def execute(self, name, args):
-        raise RuntimeError("backend down")
-
-
 def fail_once(h, name, tl="c1"):
     """h's host call `name` for timeline `tl` raises once (the store write fails), then works."""
     real, fired = getattr(h, name), []
@@ -290,7 +288,8 @@ async def settled(h):
 
 def test_a_background_graft_whose_close_out_cannot_be_written_carries_it_with_its_join(tmp_path):
     policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
-    store, h, _ = make(tmp_path=tmp_path, policy=policy, world=RaisingTool())
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
+    fail_once(h=h, name="store_result")  # its row cannot be written: the run ends, the real result kept
     fired = fail_once(h=h, name="close_tool_uses")
 
     async def go():
@@ -302,7 +301,8 @@ def test_a_background_graft_whose_close_out_cannot_be_written_carries_it_with_it
 
     asyncio.run(go())
     assert fired == ["close_tool_uses"] and store.timeline("c1")["status"] == "joined"
-    assert tool_results(store=store, tl="c1") == [("site_write", "not executed: the turn was interrupted", True)]
+    assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]
+    assert h.tools_run("c1") == ["site_write"]  # the carried close-out holds the real result, marked run
     assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
 
 
@@ -334,7 +334,8 @@ def test_a_failed_focus_graft_whose_close_out_cannot_be_written_carries_it_with_
             return text("Back.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
-    store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=RaisingTool())
+    store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original))
+    fail_once(h=h, name="store_result")  # its row cannot be written: the run ends, the real result kept
     fired = fail_once(h=h, name="close_tool_uses")
 
     async def go():
@@ -349,7 +350,8 @@ def test_a_failed_focus_graft_whose_close_out_cannot_be_written_carries_it_with_
     asyncio.run(go())
     assert fired == ["close_tool_uses"] and store.timeline("c1")["status"] == "joined"
     assert store.timeline("c1")["join_reason"] == "failed"
-    assert tool_results(store=store, tl="c1") == [("site_write", "not executed: the turn was interrupted", True)]
+    assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]
+    assert h.tools_run("c1") == ["site_write"]
     assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
 
 
@@ -578,3 +580,78 @@ def test_a_graft_whose_tool_awaits_work_a_cancelled_sibling_shared_goes_on(tmp_p
     assert tool_results(store=store, tl="c1") == [("slides_create", CANCELLED_WHILE_RUNNING, True)]
     assert tool_results(store=store, tl="c2") == [("site_write", CANCELLED_BY_THE_TOOL, True)]
     assert store.timeline("c2")["join_reason"] == "done"
+
+
+# ------------------------------------------------------------------ a tool that was invoked is never closed as not run
+def one_background(world, **kw):
+    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    return make(tmp_path=kw.pop("tmp_path"), policy=policy, world=world, **kw)
+
+
+def run_one(h):
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)
+        try:
+            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        except Exception:  # noqa: BLE001 - a failure told meanwhile is raised once here
+            pass
+        await h.close()
+    asyncio.run(go())
+
+
+class ActsThenRaises(World):
+    """site_write acts, then its own deadline raises."""
+
+    def __init__(self):
+        super().__init__()
+        self.acted = False
+
+    async def execute(self, name, args):
+        if name == "site_write":
+            self.acted = True
+            raise TimeoutError("the host's own deadline passed")
+        return super().execute(name=name, args=args)
+
+
+def test_a_tool_that_raises_after_it_was_invoked_ends_as_run_with_an_error(tmp_path):
+    world = ActsThenRaises()
+    store, h, _ = one_background(world, tmp_path=tmp_path)
+    run_one(h)
+    assert world.acted
+    assert tool_results(store=store, tl="c1") == [
+        ("site_write", "raised TimeoutError: the host's own deadline passed; it may have acted", True)]
+    assert h.tools_run("c1") == ["site_write (returned an error)"]
+    assert store.timeline("c1")["join_reason"] == "done" and h.graft_errors == []  # its run went on
+
+
+class BadShape(World):
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
+    async def execute(self, name, args):
+        if name == "site_write":
+            return self.value
+        return super().execute(name=name, args=args)
+
+
+@pytest.mark.parametrize("value, kind", [((123, False), "tuple"), ({"ok": True}, "dict"), (("text", "no"), "tuple")])
+def test_a_tool_that_returns_a_bad_shape_ends_as_run_with_an_error(tmp_path, value, kind):
+    store, h, _ = one_background(BadShape(value), tmp_path=tmp_path)
+    run_one(h)
+    assert tool_results(store=store, tl="c1") == [
+        ("site_write", f"returned a {kind}, not (text, is_error); it may have acted", True)]
+    assert h.tools_run("c1") == ["site_write (returned an error)"]
+
+
+def test_a_trace_callback_that_raises_leaves_the_tool_s_result_alone(tmp_path):
+    def trace(line):
+        if "] tool site_write" in line:
+            raise RuntimeError("trace sink down")
+
+    store, h, _ = one_background(World(), tmp_path=tmp_path, trace=trace)
+    run_one(h)
+    assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]
+    assert h.tools_run("c1") == ["site_write"]

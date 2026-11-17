@@ -5006,6 +5006,8 @@ def test_a_message_waiting_when_the_original_hands_over_is_answered_before_a_lat
 
 
 def test_a_tool_that_ran_keeps_its_result_when_a_later_call_of_the_response_raises(tmp_path):
+    """Both calls of the response were invoked: the first keeps its real result, and the one that
+    raised gets a result marked run, with an error naming what it raised (it may have acted)."""
     class Raising(World):
         def execute(self, name, args):
             if name == "site_read":
@@ -5017,6 +5019,8 @@ def test_a_tool_that_ran_keeps_its_result_when_a_later_call_of_the_response_rais
             if messages[-1]["content"][-1]["type"] == "tool_result":
                 return text("Started.")
             return [clone_use(clone_entry(skills=["website"], focus=False), id="t1") | {"type": "tool_use"}]
+        if messages[-1]["content"][-1]["type"] == "tool_result":
+            return text("site done")
         return [{"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "index", "content": "hi"}},
                 {"type": "tool_use", "id": "r1", "name": "site_read", "input": {"page": "index"}}]
 
@@ -5025,15 +5029,17 @@ def test_a_tool_that_ran_keeps_its_result_when_a_later_call_of_the_response_rais
     async def go():
         await h.start()
         await h.user_says(REQUEST)
-        await h.join_queued("c1")  # its run raised on the second call: it joins failed
+        await h.join_queued("c1")
         await h.settle()
         await h.close()
 
     asyncio.run(go())
-    assert h.graft_errors == [("c1", "RuntimeError: backend down")] and h.world.site == {"index": "hi"}
+    assert h.graft_errors == [] and h.world.site == {"index": "hi"}
     assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False),
-                                                  ("site_read", NOT_RUN_INTERRUPTED, True)]
-    assert h.tools_run("c1") == ["site_write"] and violations(store=store, tl="c1") == []
+                                                  ("site_read", "raised RuntimeError: backend down; it may have acted",
+                                                   True)]
+    assert h.tools_run("c1") == ["site_write", "site_read (returned an error)"]
+    assert violations(store=store, tl="c1") == []
 
 
 @pytest.mark.parametrize("who", ["background", "focus", "original"])

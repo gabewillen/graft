@@ -77,6 +77,7 @@ JOIN_WINDOW_FRACTION = 0.85
 # What a graft id may look like in a cancel call: the harness's own ids are `c<number>`. Anything
 # else is malformed input and is never looked up or echoed in full.
 GRAFT_ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,15}")
+ERROR_CHARS = 200  # characters of a tool's own error shown in its result
 ECHO_CHARS = 24  # characters of a malformed model-written value shown back, as a repr
 
 
@@ -550,6 +551,10 @@ class Harness:
     async def run_background(self, tl: str) -> RunOutcome:
         return await self._loop(tl=tl, kind="background")
 
+    def trace_line(self, text: str) -> None:
+        """A trace line the machines write through the scribe (its failure is the scribe's to tell)."""
+        self.trace(text)
+
     def mirror(self, tl: str, status: str) -> None:
         self.store.set_status(tl=tl, status=status)
 
@@ -582,12 +587,20 @@ class Harness:
         """A host tool call (the activity of tl's machine's `calling` state). A World whose
         `execute` returns an awaitable (an `async def execute`) is awaited here, so other
         timelines go on while it waits; a cancel of the activity reaches the tool where it waits.
-        A synchronous result is used as it is."""
-        outcome = self.world.execute(use["name"], use["input"])
-        if inspect.isawaitable(outcome):
-            outcome = await outcome
+        A synchronous result is used as it is. Once the tool is invoked it has run, whatever
+        follows: a tool that raises, or returns anything but (text, is_error), gets a result
+        marked run, with an error naming what happened (it may have acted), never a failure of
+        the run. Its trace line is the machine's (through the scribe), off this result's path."""
+        try:
+            outcome = self.world.execute(use["name"], use["input"])
+            if inspect.isawaitable(outcome):
+                outcome = await outcome
+        except Exception as error:  # noqa: BLE001 - it was invoked: it ran, with an error
+            return Ran(f"raised {type(error).__name__}: {str(error)[:ERROR_CHARS]}; it may have acted"), True
+        if not (isinstance(outcome, tuple) and len(outcome) == 2 and isinstance(outcome[0], str)
+                and isinstance(outcome[1], bool)):
+            return Ran(f"returned a {type(outcome).__name__}, not (text, is_error); it may have acted"), True
         content, err = outcome
-        self.trace(f"[{tl}] tool {use['name']}({json.dumps(use['input'])[:120]}) -> {content[:80]}")
         return Ran(content), err
 
     def close_tool_uses(self, tl: str, known: dict[str, tuple[str, bool]]) -> None:

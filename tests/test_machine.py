@@ -144,6 +144,9 @@ class Host:
     def trace(self, text):
         pass
 
+    def trace_line(self, text):
+        pass
+
 
 def holders(host) -> list[str]:
     """The timelines holding the conversation, by the states the machines mirrored to the host."""
