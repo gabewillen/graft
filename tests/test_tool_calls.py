@@ -1024,3 +1024,72 @@ def test_a_join_record_write_that_raises_a_base_exception_still_queues_the_join(
     h.record_join = broken
     out = drive_one(h=h, store=store)
     assert out["joined"] is True and out["closed"] is True
+
+
+# ------------------------------------------------------------------ a stop that always fails is given up
+def withdraw_three(tmp_path, monkeypatch, failing):
+    """Three background grafts whose tools wait; the call that made them is withdrawn. `stop_one`
+    raises every time for the grafts in `failing`. Returns (calls to stop_one, the world, store, h)."""
+    import graft.machine as machine
+    real, calls = machine.stop_one, []
+
+    def stop(ctx, inst, event):
+        child = machine._stop_target(inst)
+        calls.append(child)
+        if child in failing or failing == "all":
+            raise RuntimeError(f"INJECTED stop_one {child}")
+        return real(ctx=ctx, inst=inst, event=event)
+    monkeypatch.setattr(machine, "stop_one", stop)
+    world, gate = SeveralWaiting(), threading.Event()
+    tools = {"website": use("w1", "site_write", page="i", content="x"),
+             "slides": use("s1", "slides_create", title="D"),
+             "calendar": use("k1", "calendar_book", what="x", date="2026-12-05", time="10:00")}
+
+    def policy(system, messages, tool_list):
+        names = {t["name"] for t in tool_list}
+        last = messages[-1]["content"][-1]
+        if "clone" in names:
+            if last["type"] == "tool_result":
+                assert gate.wait(WAIT_TIMEOUT)
+                return text("Started.")
+            if is_wake(last):
+                return text("Report.")
+            return [clone_use(*[clone_entry(skills=[k], focus=False) for k in tools], id="k1") | {"type": "tool_use"}]
+        skill = "website" if "site_write" in names else "slides" if "slides_create" in names else "calendar"
+        return [tools[skill]]
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy, world=world)
+    out = {}
+
+    async def go():
+        await h.start()
+        call = asyncio.create_task(h.user_says(REQUEST))
+        for name in ("site_write", "slides_create", "calendar_book"):
+            while name not in world.started:
+                await asyncio.sleep(0.01)
+        call.cancel()
+        gate.set()
+        try:
+            await call
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.5)
+        out["calls"] = len(calls)
+        await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+
+    asyncio.run(go())
+    return out, calls, world, said
+
+
+def test_a_stop_that_always_fails_is_given_up_after_a_bounded_number_of_attempts(tmp_path, monkeypatch):
+    from graft.machine import MAX_STOP_ATTEMPTS
+    out, calls, world, said = withdraw_three(tmp_path=tmp_path, monkeypatch=monkeypatch, failing="all")
+    assert out["calls"] <= 3 * MAX_STOP_ATTEMPTS  # bounded: never a spin
+    assert any("could not be stopped" in line for line in said)  # each give-up is told
+
+
+def test_a_graft_whose_stop_always_fails_does_not_keep_the_others_from_stopping(tmp_path, monkeypatch):
+    from graft.machine import MAX_STOP_ATTEMPTS
+    out, calls, world, _ = withdraw_three(tmp_path=tmp_path, monkeypatch=monkeypatch, failing={"c1"})
+    assert 1 <= calls.count("c1") <= MAX_STOP_ATTEMPTS  # tried, then given up (a try is counted before it runs)
+    assert {"slides_create", "calendar_book"} <= world.cancelled  # c2 and c3 were stopped at the withdrawal

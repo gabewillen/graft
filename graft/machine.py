@@ -194,6 +194,10 @@ MAX_WAKE_CLONE_CALLS = 1
 MAX_REQUEST_HANDBACKS = 8
 # Clone calls committed for one user message, across every hand-back and wake it sets off.
 MAX_CLONE_CALLS_PER_MESSAGE = 4
+# Stops a source tries for one background graft made for a withdrawn request before it gives that
+# stop up (it is told, and the graft stops at its next step instead): a stop that always fails
+# never keeps the source stopping it.
+MAX_STOP_ATTEMPTS = 3
 # Clone calls a run may make: the first, and one retry after a refusal. A committed call uses
 # them all (one committed clone call per run).
 CLONE_TRIES = 2
@@ -461,6 +465,8 @@ class TimelineSM(hsm.Instance):
         # Its background grafts it stopped because the request each was made for was withdrawn
         # (`stop_one`): each is stopped once.
         self.stopped_unwanted: set[str] = set()
+        self.stop_attempts: dict[str, int] = {}  # graft -> stops tried for it (given up at MAX_STOP_ATTEMPTS)
+        self.stops_told: set[str] = set()  # grafts whose stop was given up and told
         # Cancel calls of a step a recovery ended after it had stopped grafts: each call with what
         # became of its ids, for the recovery to write its real result (it ran: never "not run").
         self.cut_cancels: list[tuple[CancelCall, dict[str, str]]] = []
@@ -1051,6 +1057,8 @@ def _prune(inst: TimelineSM) -> None:
     not applied yet: it is bounded by them."""
     inst.withdrawn &= {r.id for r in _known(inst)}
     inst.stopped_unwanted &= set(inst.grafts)  # only grafts still its own (live) are remembered
+    inst.stop_attempts = {g: n for g, n in inst.stop_attempts.items() if g in inst.grafts}
+    inst.stops_told &= set(inst.grafts)
 
 
 def _unwanted(inst: TimelineSM, child: str) -> bool:
@@ -1974,11 +1982,33 @@ def note_late_withdrawal(ctx, inst, event) -> None:
           rows=[request.row] if request.row is not None else [])
 
 
+def _unstopped(inst: TimelineSM) -> list[str]:
+    """Its running background grafts made for a withdrawn request that it has not stopped yet."""
+    return [g for g in _still_running(inst) if _unwanted(inst=inst, child=g) and g not in inst.stopped_unwanted]
+
+
 def _stop_target(inst: TimelineSM) -> str | None:
-    """The next of its running background grafts made for a withdrawn request that it has not
-    stopped yet, if any."""
-    return next((g for g in _still_running(inst) if _unwanted(inst=inst, child=g)
-                 and g not in inst.stopped_unwanted), None)
+    """The next of them whose stop has not been given up, if any."""
+    return next((g for g in _unstopped(inst) if inst.stop_attempts.get(g, 0) < MAX_STOP_ATTEMPTS), None)
+
+
+def count_stop(ctx, inst, event) -> None:
+    """A stop is about to be tried (a behavior of its own, before `stop_one`, so a stop whose every
+    try fails is still counted, and given up at MAX_STOP_ATTEMPTS)."""
+    child = _stop_target(inst)
+    inst.stop_attempts[child] = inst.stop_attempts.get(child, 0) + 1
+
+
+def tell_given_up(ctx, inst, event) -> None:
+    """Stops given up since the last told are told, in one line: those grafts stop at their next
+    step instead (`graft_step`)."""
+    given = [g for g in _unstopped(inst) if g not in inst.stops_told
+             and inst.stop_attempts.get(g, 0) >= MAX_STOP_ATTEMPTS]
+    if given:
+        inst.stops_told |= set(given)
+        _report(inst=inst, kind="task", clones=given, error=RuntimeError(
+            f"{', '.join(given)} could not be stopped after {MAX_STOP_ATTEMPTS} attempts; "
+            f"{'it stops' if len(given) == 1 else 'they stop'} at its next step"))
 
 
 def stops_due(ctx, inst, event) -> bool:
@@ -3411,11 +3441,12 @@ def _stopping(T, S, On, G) -> list:
     entry, and `stop_next` sends the next stop and ticks again, until none is due (`still`)."""
     return [
         hsm.Initial(S("gate")),
-        hsm.Choice("gate", T(S("stopping"), G(stops_due)), T(S("still"), Effect(checked(stops_due)))),
+        hsm.Choice("gate", T(S("stopping"), G(stops_due)),
+                   T(S("still"), Effect(checked(stops_due, effects=(tell_given_up,))))),
         hsm.State("still"),
         hsm.State("stopping", Entry(tick_stop), T(On("stop_tick"), S("../stop_next"))),
-        hsm.Choice("stop_next", T(S("stopping"), G(stops_due), Effect(stop_one)),
-                   T(S("still"), Effect(checked(stops_due)))),
+        hsm.Choice("stop_next", T(S("stopping"), G(stops_due), Effect(count_stop, stop_one)),
+                   T(S("still"), Effect(checked(stops_due, effects=(tell_given_up,))))),
     ]
 
 
@@ -3834,13 +3865,13 @@ def _timeline(name: str) -> hsm.Model:
                     # after a run: grafts made for a request withdrawn meanwhile are stopped first
                     "rest",
                     T(S("stops"), G(stops_due)),
-                    T(S("resting"), Effect(checked(stops_due))),
+                    T(S("resting"), Effect(checked(stops_due, effects=(tell_given_up,)))),
                 ),
                 hsm.State("stops", Entry(tick_stop), T(On("stop_tick"), S("../stops_next"))),
                 hsm.Choice(
                     "stops_next",
-                    T(S("stops"), G(stops_due), Effect(stop_one)),
-                    T(S("resting"), Effect(checked(stops_due))),
+                    T(S("stops"), G(stops_due), Effect(count_stop, stop_one)),
+                    T(S("resting"), Effect(checked(stops_due, effects=(tell_given_up,)))),
                 ),
                 hsm.Choice(
                     "resting",
