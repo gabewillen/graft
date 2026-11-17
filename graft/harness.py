@@ -62,11 +62,11 @@ from typing import Callable, NamedTuple
 from . import callsites, compaction
 from . import seeder as seeder_mod
 from .db import Graft, Store, render, validate
-from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, Cancel, CancelCall, Clone, Machines, Mode, Prepared,
+from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, MAX_LIVE_BACKGROUND, Cancel, CancelCall, Clone, Machines, Mode, Prepared,
                       QueuedJoin, RunOutcome, ToolCall, TransitionRefused, Unwritten)
 from .providers import Provider, prefix_nonce, window_tokens_for
-from .skills import (BASE_SYSTEM, BUILTIN, MAX_CANCEL_IDS, MAX_CLONE_ENTRIES, World, load_skill,
-                     skill_listing)
+from .skills import (BASE_SYSTEM, BUILTIN, MAX_CANCEL_IDS, MAX_CLONE_ENTRIES, World, cancel_limit, load_skill,
+                     says_live_cap, skill_listing)
 
 # Seconds one model call may take before it is abandoned as a mechanical failure (the harness's
 # `call_timeout`; None disables it). Without it a hung call keeps a graft live for ever.
@@ -201,17 +201,18 @@ def _echo(value: object) -> str:
     return repr(value) if len(value) <= ECHO_CHARS else repr(value[:ECHO_CHARS]) + "..."
 
 
-def cancel_ids(args: object) -> tuple[list[str], list[str]]:
+def cancel_ids(args: object, limit: int = MAX_CANCEL_IDS) -> tuple[list[str], list[str]]:
     """The graft ids of a cancel call's input, in order and without repeats, and what is wrong
-    with the rest. `cancel` is a list of one to MAX_CANCEL_IDS ids, each shaped like a graft id
+    with the rest. `cancel` is a list of one to `limit` ids (the harness's: twice its live cap,
+    MAX_CANCEL_IDS by default), each shaped like a graft id
     (GRAFT_ID). The input is model-written: nothing about its shape is assumed. A call that is
     not such a list names no graft at all; an item that is not shaped like an id is reported by
     its index, shown as a short repr, and the others stand."""
     raw = args.get("cancel") if isinstance(args, dict) else None
     if not isinstance(raw, list) or not raw:
         return [], ["`cancel` must be a list of one or more clone ids, for example [\"c2\"]"]
-    if len(raw) > MAX_CANCEL_IDS:
-        return [], [f"a cancel call takes at most {MAX_CANCEL_IDS} clone ids (got {len(raw)})"]
+    if len(raw) > limit:
+        return [], [f"a cancel call takes at most {limit} clone ids (got {len(raw)})"]
     ids: list[str] = []
     problems: list[str] = []
     for i, x in enumerate(raw):
@@ -289,12 +290,24 @@ class Harness:
                  persona: str = BASE_SYSTEM, nonce: str | None = None,
                  compact_tokens: int | None = None, compaction_mode: str = "turns", seeder=...,
                  window_tokens: int | None = ..., emit: Callable[[str], None] | None = None,
-                 call_timeout: float | None = MODEL_CALL_TIMEOUT):
+                 call_timeout: float | None = MODEL_CALL_TIMEOUT,
+                 max_live_background: int = MAX_LIVE_BACKGROUND):
         self.store = store
         self.persona = persona  # user-provided; identical, verbatim, on every timeline
         self.provider = provider
         self.world = world or World()
-        self.machines = Machines(self)
+        # The cap on a source's live background grafts (the machines' clone rule reads it). The
+        # installed clone skill must say the same cap (`install(store, max_live_background=...)`).
+        if isinstance(max_live_background, bool) or not isinstance(max_live_background, int):
+            raise TypeError(f"max_live_background must be an int, got {type(max_live_background).__name__}")
+        if max_live_background < 1:
+            raise ValueError(f"max_live_background must be at least 1, got {max_live_background}")
+        if not says_live_cap(store, max_live_background):
+            raise ValueError(f"the installed clone skill does not say max_live_background={max_live_background}: "
+                             f"install(store, max_live_background={max_live_background}) first")
+        self.max_live_background = max_live_background
+        self.max_cancel_ids = cancel_limit(max_live_background)  # ids one cancel call takes
+        self.machines = Machines(self, max_live_background=max_live_background)
         self.trace = trace or (lambda s: None)
         self.max_steps = max_steps
         # Seconds a model call may take (None: no limit). A call that exceeds it raises
@@ -998,7 +1011,7 @@ class Harness:
         then stored here (they are this run's own tool results)."""
         calls = []
         for u in uses:
-            ids, problems = cancel_ids(u.get("input"))
+            ids, problems = cancel_ids(u.get("input"), limit=self.max_cancel_ids)
             calls.append(CancelCall(use=u, ids=ids, problems=problems))
         return Cancel(calls=calls, reply=self.machines.future(), request=self.current_request(tl))
 
@@ -1013,7 +1026,7 @@ class Harness:
             self.trace(f"[{tl}] cancel refused: {answer}")
             results = []
             for u in uses:
-                ids, problems = cancel_ids(u.get("input"))
+                ids, problems = cancel_ids(u.get("input"), limit=self.max_cancel_ids)
                 content, err = self.cancel_text(call=CancelCall(use=u, ids=ids, problems=problems),
                                                 outcomes={c: answer for c in ids})
                 results.append(ToolResult(use=u, content=content, is_error=err))

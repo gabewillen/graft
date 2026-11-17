@@ -6,10 +6,12 @@ Tool names use underscores because API tool names cannot contain dots.
 
 from __future__ import annotations
 
+import copy
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .db import Skill, Store
+from .machine import MAX_LIVE_BACKGROUND
 
 
 def obj(props: dict, required: list[str]) -> dict:
@@ -31,7 +33,9 @@ JOIN_TOOL = {
     "input_schema": obj({"reason": {"type": "string", "enum": ["done", "out_of_scope", "failed"]}},
                         ["reason"])}
 
-MAX_CANCEL_IDS = 8  # graft ids in one cancel call (twice the live cap: anything longer is noise)
+# Graft ids in one cancel call, by default: twice the live cap (anything longer is noise). A
+# harness with another cap takes twice its cap (`cancel_limit`).
+MAX_CANCEL_IDS = 8
 
 # `cancelled` is not a reason a clone can give: only the harness sets it, when the original cancels.
 CANCEL_TOOL = {
@@ -262,8 +266,46 @@ def skill_listing(store: Store, names: list[str], heading: str) -> str:
     return heading + "\n" + "\n".join(f"- {r[0]}: {r[1]}" for r in rows if r)
 
 
-def install(store: Store) -> None:
-    for s in CATALOG:
+LIVE_CAP_SENTENCE = "At most four background clones of yours may be live at a time."
+
+
+def cancel_limit(max_live_background: int) -> int:
+    """Graft ids one cancel call takes: twice the live cap (MAX_CANCEL_IDS at the default cap)."""
+    return 2 * max_live_background
+
+
+def catalog(max_live_background: int = MAX_LIVE_BACKGROUND) -> list[Skill]:
+    """The catalog for a harness whose cap on live background grafts is `max_live_background`.
+    At the default cap it is CATALOG itself, byte for byte (prompts and caches depend on it);
+    another cap is said in the clone skill's text (a cap above the four entries a clone call
+    takes is reached across calls) and bounds the cancel tool's list."""
+    if max_live_background == MAX_LIVE_BACKGROUND:
+        return CATALOG
+    said = (f"At most {max_live_background} background clones of yours may be live at a time"
+            + (" (across clone calls: one call takes at most four)." if max_live_background > MAX_CLONE_ENTRIES
+               else "."))
+    out = []
+    for skill in CATALOG:
+        if skill.name == "clone":
+            tools = copy.deepcopy(skill.tools)
+            for t in tools:
+                if t["name"] == "cancel":
+                    t["input_schema"]["properties"]["cancel"]["maxItems"] = cancel_limit(max_live_background)
+            skill = replace(skill, instructions=skill.instructions.replace(LIVE_CAP_SENTENCE, said), tools=tools)
+        out.append(skill)
+    return out
+
+
+def says_live_cap(store: Store, max_live_background: int) -> bool:
+    """Does the store's installed clone skill say this cap (as `install` wrote it)? True where no
+    clone skill is installed (nothing says another cap)."""
+    row = store.con.execute("SELECT instructions FROM skills WHERE name='clone'").fetchone()
+    want = next(s.instructions for s in catalog(max_live_background) if s.name == "clone")
+    return row is None or row[0] == want
+
+
+def install(store: Store, max_live_background: int = MAX_LIVE_BACKGROUND) -> None:
+    for s in catalog(max_live_background):
         store.add_skill(s)
 
 

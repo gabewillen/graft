@@ -161,7 +161,7 @@ stopped is reported (`telling`) and raised by `close`, and the rest are still st
 
 Rules the graph enforces. Only the original clones, only in a turn or routing wake, never while
 closing, at most CLONE_TRIES clone calls per run (one, and one retry; a committed call is the
-run's last; a call past them is not prepared), never more than one focus graft per call, never beyond MAX_LIVE_BACKGROUND live background grafts, never
+run's last; a call past them is not prepared), never more than one focus graft per call, never beyond the harness's cap of live background grafts (MAX_LIVE_BACKGROUND by default), never
 more than MAX_CLONE_CALLS_PER_MESSAGE committed clone calls per user message, never for a request
 handed back MAX_REQUEST_HANDBACKS times, and never for a part of the current request that failed,
 came back twice, or was cancelled (the re-clone blocks are the original's own data). A clone call
@@ -180,7 +180,9 @@ from typing import Any, Callable, NamedTuple, Protocol
 
 import hsm
 
-MAX_LIVE_BACKGROUND = 4  # live (running or queued, not cancelled) background grafts per source
+# Live (running or queued, not cancelled) background grafts per source, by default; a harness may
+# set another cap (`Machines.max_live_background`).
+MAX_LIVE_BACKGROUND = 4
 CANCELLED = "cancelled"  # the join reason of a cancelled graft: set by the harness only
 # Times a join's commit is tried, at successive commit points, before it is given up.
 MAX_JOIN_ATTEMPTS = 3
@@ -441,6 +443,7 @@ class TimelineSM(hsm.Instance):
         self.outcomes: dict[str, str] = {}
         self.claims: dict[str, int] = {}  # graft -> the call of the response that names it first
         self.unstored: dict[str, tuple[str, bool]] = {}  # tool_use id -> a result not yet written
+        self.max_live_background = machines.max_live_background  # the harness's cap (the clone rule)
         self.tool: ToolCall | None = None  # the host tool call its run is making (`calling`)
         # A frozen graft's close-out it could not write (its open calls' known results), carried
         # with its join for its source to write (`QueuedJoin.closing`).
@@ -900,8 +903,9 @@ def clone_refusal(inst: TimelineSM, grafts: list[tuple[str, bool]]) -> str | Non
     if len(focus) > 1:
         return f"at most one graft may take the conversation, got {focus}"
     live = [g for g, is_focus in inst.grafts.items() if not is_focus]
-    if len(live) + sum(1 for _, f in grafts if not f) > MAX_LIVE_BACKGROUND:
-        return (f"at most {MAX_LIVE_BACKGROUND} background clones may be live at once "
+    cap = inst.max_live_background
+    if len(live) + sum(1 for _, f in grafts if not f) > cap:
+        return (f"at most {cap} background clones may be live at once "
                 f"({', '.join(live) or 'none'} still {'is' if len(live) == 1 else 'are'}); use fewer "
                 "background entries or wait for them to join")
     return None
@@ -4377,8 +4381,9 @@ class Machines:
     """The registry of machines and the requests the harness puts to them. It decides nothing and
     exposes nothing of a machine's data: every request is an event, and the graph answers it."""
 
-    def __init__(self, host: Host):
+    def __init__(self, host: Host, max_live_background: int = MAX_LIVE_BACKGROUND):
         self.host = host
+        self.max_live_background = max_live_background  # the cap the clone rule reads (data, not a graph)
         self.timelines: dict[str, TimelineSM] = {}
         self.session: SessionSM | None = None
         self.scribe: ScribeSM | None = None
