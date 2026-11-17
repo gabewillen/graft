@@ -250,21 +250,26 @@ async def in_daemon_thread(fn: Callable[[], object]) -> object:
     future: asyncio.Future = loop.create_future()
 
     def deliver(result: object, error: BaseException | None) -> None:
-        if future.cancelled():
+        if future.done():
             return
-        if error is not None:
-            future.set_exception(error)
-        else:
+        if error is None:
             future.set_result(result)
+            return
+        try:
+            future.set_exception(error)
+        except TypeError:  # an error a future cannot carry: carried as one it can
+            future.set_exception(RuntimeError(f"in a model call: {described(error)}"))
 
     def work() -> None:
+        """The call, and its outcome handed to the loop whatever it raised: nothing that goes wrong
+        here (an error whose message raises included) leaves the future unset."""
         result, error = None, None
         try:
             result = fn()
-        except StopIteration as e:  # cannot be set on a future
-            error = RuntimeError(f"StopIteration in a model call: {e}")
-        except BaseException as e:
+        except BaseException as e:  # noqa: BLE001 - every outcome is the caller's to have
             error = e
+        if isinstance(error, StopIteration):  # cannot be set on a future
+            error = RuntimeError(f"in a model call: {described(error)}")
         try:
             loop.call_soon_threadsafe(deliver, result, error)
         except RuntimeError:  # the loop is closed: nobody is waiting

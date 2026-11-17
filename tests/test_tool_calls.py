@@ -1206,3 +1206,23 @@ def test_an_effect_that_raises_a_base_exception_is_a_fault_the_machine_recovers_
 
     asyncio.run(go())
     assert fired and out["first"] != "TIMEOUT" and out["second"] == ["ok"] and out["closed"] is True
+
+
+class BadStop(StopIteration):
+    def __str__(self):
+        raise Abort2("no message")
+
+
+def test_a_model_call_raising_a_stop_iteration_with_a_bad_message_fails_its_run_without_a_timeout(tmp_path):
+    """The worker thread delivers an outcome whatever its call raises, so with no call timeout
+    (call_timeout=None) nothing waits for ever."""
+    def policy(system, messages, tools):
+        if "clone" in {t["name"] for t in tools}:
+            return background_original([clone_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
+                                                                                         messages)
+        raise BadStop()
+
+    store, h, _ = make(tmp_path=tmp_path, policy=policy, call_timeout=None)
+    out = drive_one(h=h, store=store)
+    assert out["joined"] is True and out["closed"] is True
+    assert store.timeline("c1")["join_reason"] == "failed"
