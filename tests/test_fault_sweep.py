@@ -67,7 +67,7 @@ SPIN = 4  # a message forwarded more often than this one way is a spin: the case
 # the graphs (run once, at import), and the async activities (reached as host calls instead).
 PLUMBING = {"_rule", "_step", "_guard", "_holds", "_failed", "_signal", "_keep_fault", "_handling_failed", "_take_fault",
             "_held_back", "_pending", "checked", "Effect", "Call", "Recovers", "Entry", "Exit", "Guard", "_G"}
-BUILDERS = {"mirrored", "into", "io", "Activity", "held_back_in", "_work", "_stopping", "_timeline", "ended_as", "restating",
+BUILDERS = {"mirrored", "into", "io", "Activity", "held_back_in", "_work", "_stopping", "_aborting", "_timeline", "ended_as", "restating",
             "_join_arrivals"}
 EXCLUDED = PLUMBING | BUILDERS
 

@@ -827,14 +827,26 @@ def Guard(expression: Callable) -> hsm.RedefinableConstraint:
     return hsm.Guard(_guard(expression))
 
 
+class Aborted(Exception):
+    """An activity raised something that is not an Exception (and not a cancel or an interpreter
+    exit): the library tells only an Exception (`hsm/error`), so it is raised as this one, and the
+    state handles it like any failure of its activity. No activity ends without an outcome."""
+
+
 def Activity(work: Callable, done: str) -> hsm.RedefinableBehaviors:
     """A state's activity that runs on its own (a run of the model loop, a clone call's preparation,
     stopping the machines): entered by a step that failed, it does nothing (`_held_back`, recorded
-    as `done`, the outcome it would have dispatched)."""
+    as `done`, the outcome it would have dispatched). What it raises that is not an Exception is
+    raised as `Aborted`, so the state's `hsm/error` transition takes it."""
     async def activity(ctx, inst, event) -> None:
         if _held_back(inst=inst, event=event, activity=done):
             return
-        await work(ctx=ctx, inst=inst, event=event)
+        try:
+            await work(ctx=ctx, inst=inst, event=event)
+        except (asyncio.CancelledError, *EXITS, Exception):
+            raise
+        except BaseException as error:  # noqa: BLE001 - told as an Exception, so it has an outcome
+            raise Aborted(f"{type(error).__name__}: {error}") from error
     activity.__name__ = work.__name__
     return hsm.Activity(activity)
 
@@ -897,7 +909,12 @@ def io(done: str, work: Callable) -> hsm.RedefinableBehaviors:
     async def activity(ctx, inst, event) -> None:
         if _held_back(inst=inst, event=event, activity=done):
             return
-        result = _rule(work)(inst=inst, event=event)
+        try:
+            result = _rule(work)(inst=inst, event=event)
+        except (asyncio.CancelledError, *EXITS, Exception):
+            raise
+        except BaseException as error:  # noqa: BLE001 - told as an Exception, so it has an outcome
+            raise Aborted(f"{type(error).__name__}: {error}") from error
         inst.dispatch(inst.context(), hsm.Event(name=done, data=result))
     activity.__name__ = f"io_{done}"
     return hsm.Activity(activity)
@@ -1574,8 +1591,11 @@ async def store_activity(ctx, inst: TimelineSM, event) -> None:
     content, is_error = inst.unstored[call.use["id"]]
     try:
         host.store_result(tl=tl, use=call.use, content=content, is_error=is_error)
-    except Exception as error:  # noqa: BLE001 - the outcome event carries it
-        inst.dispatch(inst.context(), hsm.Event(name="tool_unstored", data=error))
+    except (asyncio.CancelledError, *EXITS):
+        raise
+    except BaseException as error:  # noqa: BLE001 - the outcome event carries it, Exception or not
+        inst.dispatch(inst.context(), hsm.Event(name="tool_unstored", data=error if isinstance(error, Exception)
+                                                else Aborted(f"{type(error).__name__}: {error}")))
         return
     inst.dispatch(inst.context(), hsm.Event(name="tool_stored"))
 
@@ -1617,7 +1637,9 @@ async def spawn_activity(ctx, inst: TimelineSM, event) -> None:
             machines.timelines[plan.child] = sm
             made.append(sm)
             await hsm.Started(None, sm, TIMELINE if plan.focus else BACKGROUND, hsm.Config(ID=plan.child))
-    except Exception as e:  # noqa: BLE001 - the outcome event carries it
+    except (asyncio.CancelledError, *EXITS):
+        raise
+    except BaseException as e:  # noqa: BLE001 - the outcome event carries it, Exception or not
         inst.dispatch(inst.context(), hsm.Event(name="spawn_failed", data=([sm.timeline_id for sm in made], e)))
         return
     inst.dispatch(inst.context(), hsm.Event(name="spawned", data=clone))
@@ -1635,6 +1657,20 @@ async def unspawn_activity(ctx, inst: TimelineSM, event) -> None:
             await hsm.Stop(sm)
     host.abandon_clone(src=source, grafts=grafts)
     inst.dispatch(inst.context(), hsm.Event(name="unspawned", data=error))
+
+
+def _aborting(work: Callable) -> Callable:
+    """An activity declared without `Activity` (it must not hold back): what it raises that is not
+    an Exception is raised as `Aborted`, so its state's `hsm/error` transition takes it."""
+    @functools.wraps(work)
+    async def activity(ctx, inst, event) -> None:
+        try:
+            await work(ctx=ctx, inst=inst, event=event)
+        except (asyncio.CancelledError, *EXITS, Exception):
+            raise
+        except BaseException as error:  # noqa: BLE001 - told as an Exception, so it has an outcome
+            raise Aborted(f"{type(error).__name__}: {error}") from error
+    return activity
 
 
 def _mark_pending(inst: TimelineSM) -> None:
@@ -3493,7 +3529,7 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
                     T(S("unspawning"), Effect(checked(step_intact, effects=(spawn_not_started,), first=True))),
                 ),
                 hsm.State(
-                    "spawning", hsm.Activity(spawn_activity),
+                    "spawning", hsm.Activity(spawn_activity),  # its every failure is its outcome
                     # a withdrawal waits for the grafts' machines (the activity reads no data of
                     # this one after it starts), then is handled by `cloning` like any later one
                     # a fault waits too: the call is then undone (`unspawning`), and recovered from
@@ -3502,7 +3538,7 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
                     T(On("spawn_failed"), S("../unspawning"), Effect(spawn_failed)),
                 ),
                 hsm.State(
-                    "unspawning", hsm.Activity(unspawn_activity),
+                    "unspawning", hsm.Activity(_aborting(unspawn_activity)),
                     # a graft's question waits too: while a fault is pending no guard holds, and it would be stopped
                     hsm.Defer("graft_step", FAULT),
                     T(On("unspawned"), S("../refusing"), Effect(undone)),
@@ -4374,7 +4410,9 @@ async def s_stop_machines(ctx, inst: SessionSM, event) -> None:
         if sm is not None and sm.state():
             try:
                 await hsm.Stop(sm)
-            except Exception as e:  # noqa: BLE001 - the outcome event carries it
+            except (asyncio.CancelledError, *EXITS):
+                raise
+            except BaseException as e:  # noqa: BLE001 - the outcome event carries it, Exception or not
                 errors.append(e)
     inst.dispatch(inst.context(), hsm.Event(name="stopped", data=errors))
 

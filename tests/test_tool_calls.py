@@ -996,3 +996,31 @@ def test_a_tool_that_returns_a_hostile_str_subclass_is_stored_as_plain_text(tmp_
     store, h, _ = one_background(ReturnsHostile(), tmp_path=tmp_path)
     assert drive_one(h=h, store=store) == {"joined": True, "settled": True, "closed": True}
     assert tool_results(store=store, tl="c1") == [("site_write", "ok", False)]
+
+
+# ------------------------------------------------------------------ no activity ends without an outcome
+def test_a_row_write_that_raises_a_base_exception_still_ends_the_call(tmp_path):
+    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    real = h.store_result
+
+    def broken(**kw):
+        if kw.get("tl") == "c1":
+            raise Abort("store abort")
+        return real(**kw)
+    h.store_result = broken
+    out = drive_one(h=h, store=store)
+    assert out["joined"] is True and out["closed"] is True
+    assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]  # the closing's
+
+
+def test_a_join_record_write_that_raises_a_base_exception_still_queues_the_join(tmp_path):
+    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    real = h.record_join
+
+    def broken(**kw):
+        if kw.get("child") == "c1":
+            raise Abort("record abort")
+        return real(**kw)
+    h.record_join = broken
+    out = drive_one(h=h, store=store)
+    assert out["joined"] is True and out["closed"] is True
