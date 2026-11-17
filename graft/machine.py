@@ -2867,11 +2867,20 @@ def close_abandoned(ctx, inst, event) -> None:
         _note(inst=inst, method="close_tool_uses", tl=inst.timeline_id, known=dict(inst.unclosed))
 
 
+def _closing_of(inst: TimelineSM) -> dict[str, tuple[str, bool]] | None:
+    """The close-out a background graft's join carries: the one its record could not write, or,
+    whenever its run ended early, its open calls' known results (a step of its record that failed
+    may not have said whether the close was written; its source writes only results still missing)."""
+    if inst.unclosed is not None:
+        return inst.unclosed
+    return dict(inst.unstored) if inst.close_first else None
+
+
 def _send_join(inst: TimelineSM) -> None:
     """A background graft's join event goes to its source (recorded once sent: a fault in the step
     that sends it, before the send, leaves it unsent, and the recovery sends it)."""
     _forward(target=inst.machines.timelines.get(inst.source_id), name="graft_queued",
-             data=QueuedJoin(child=inst.timeline_id, reason=inst.reason, trigger=None, closing=inst.unclosed))
+             data=QueuedJoin(child=inst.timeline_id, reason=inst.reason, trigger=None, closing=_closing_of(inst)))
     inst.join_sent = True
 
 

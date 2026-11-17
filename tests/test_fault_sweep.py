@@ -39,6 +39,7 @@ out runs by default."""
 
 import asyncio
 import collections
+import contextlib
 import dataclasses
 import gc
 import inspect
@@ -51,6 +52,7 @@ import pytest
 
 import graft.machine as machine
 from graft.machine import DecisionFault, TransitionRefused
+from graft.skills import World
 from test_parallel import (BAD, BG, FOCUS, STAY, STOP, FaultScript, clone_entry, clone_use, is_wake, make, text,
                            user_texts, violations)
 
@@ -65,7 +67,7 @@ SPIN = 4  # a message forwarded more often than this one way is a spin: the case
 # the graphs (run once, at import), and the async activities (reached as host calls instead).
 PLUMBING = {"_rule", "_step", "_guard", "_holds", "_failed", "_signal", "_keep_fault", "_handling_failed", "_take_fault",
             "_held_back", "_pending", "checked", "Effect", "Call", "Recovers", "Entry", "Exit", "Guard", "_G"}
-BUILDERS = {"mirrored", "into", "io", "Activity", "held_back_in", "_work", "_timeline", "ended_as", "restating",
+BUILDERS = {"mirrored", "into", "io", "Activity", "held_back_in", "_work", "_stopping", "_timeline", "ended_as", "restating",
             "_join_arrivals"}
 EXCLUDED = PLUMBING | BUILDERS
 
@@ -94,10 +96,34 @@ HOST = ("run_busy", "run_background", "mirror", "report", "graft_failed", "begin
 # A graft that makes a host tool call (site_write) and then replies: in the background (TOOL), or
 # holding the conversation (TOOL_FOCUS: it then joins done).
 TOOL, TOOL_FOCUS = "TOOL: build a website with a tool.", "TOOL_FOCUS: build a website with a tool."
+# Three background grafts whose tools wait for ever; the user's call is withdrawn while they wait.
+WAITING = "WAITING: build a website, a deck and a booking."
+TOOLS_START = 2.0  # seconds the scenario waits for every tool to be waiting before it withdraws the call
+WAITING_TOOLS = {"website": ("site_write", {"page": "i", "content": "x"}), "slides": ("slides_create", {"title": "D"}),
+                 "calendar": ("calendar_book", {"what": "x", "date": "2026-12-05", "time": "10:00"})}
+
+
+class WaitingWorld(World):
+    """Every tool waits until it is cancelled, or until `release` (set by the scenario only when a
+    fault ended the user's call before it could be withdrawn: nothing would stop the grafts then,
+    and a tool that never returns keeps its graft live by design). `started` says which began."""
+
+    def __init__(self):
+        super().__init__()
+        self.started: set[str] = set()
+        self.all_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def execute(self, name, args):
+        self.started.add(name)
+        if len(self.started) == len(WAITING_TOOLS):
+            self.all_started.set()
+        await self.release.wait()
+        return "released", False
 LONG = "LONG: " + "a detail of the request " * 60  # a message long enough that the next turn compacts
 
 SCENARIOS = ["plain", "BG", "FOCUS", "STAY", "BAD", "STOP", "withdrawn", "late", "prepare", "AB", "close", "compaction",
-             "spawn", "tool", "tool_focus"]
+             "spawn", "tool", "tool_focus", "withdraw_tools"]
 
 
 def functions() -> list[str]:
@@ -132,6 +158,9 @@ class Case:
     injected: set[str] = dataclasses.field(default_factory=set)  # the targets that raised
     late: dict[str, asyncio.Task] = dataclasses.field(default_factory=dict)  # the call the late scenario cancels
     seeding: asyncio.Event | None = None  # the prepare scenario: its clone call's seeder began
+    # the withdraw_tools scenario: a fault ended the user's call before it could be withdrawn, so its
+    # grafts' tools were released (nothing stops them otherwise) and the grafts went on
+    released: bool = False
     graft_errors: list[tuple[str, str]] = dataclasses.field(default_factory=list)  # graft runs that raised (host)
     scenario: bool = True  # the scenario's calls are being made (only they are counted, and fault)
 
@@ -145,6 +174,19 @@ class Policy(FaultScript):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         request = user_texts(messages)[-1]
+        if request == WAITING and names != {"compact"}:
+            if "clone" in names:
+                if last["type"] == "text" and last["text"] == request:
+                    entries = [clone_entry(skills=[k], focus=False, quotes=[request]) for k in WAITING_TOOLS]
+                    return [clone_use(*entries, id=f"k{len(messages)}") | {"type": "tool_use"}]
+                if last["type"] == "tool_result":
+                    self.answer_gate.wait(WAIT + HANG)  # the call is withdrawn before it is answered
+                return text("Reported." if is_wake(last) else "Started.")
+            if last["type"] == "tool_result":
+                return text("done")
+            skill = next(k for k, (tool, _) in WAITING_TOOLS.items() if tool in names)
+            tool, args = WAITING_TOOLS[skill]
+            return [{"type": "tool_use", "id": f"t{len(messages)}", "name": tool, "input": args}]
         if request in (TOOL, TOOL_FOCUS) and names != {"compact"}:
             if "clone" in names:
                 if last["type"] == "text" and last["text"] == request:
@@ -307,6 +349,25 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
         if live:
             case.problems.append(f"machines left running after close: {live}")
         return
+    elif scenario == "withdraw_tools":  # three grafts' tools wait; the call that made them is withdrawn
+        first = len(case.said)
+        task = asyncio.create_task(h.user_says(WAITING))
+        # every tool waits, or a fault kept one from starting (then the others are withdrawn anyway)
+        async def all_waiting():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(h.world.all_started.wait(), TOOLS_START)
+        await _first_of(waiting=all_waiting(), task=task)
+        if task.done():  # a fault ended the call first: there is nothing left to withdraw
+            h.world.release.set()
+            case.released = True
+        task.cancel()
+        script.answer_gate.set()
+        done, _ = await asyncio.wait({task}, timeout=WAIT + HANG)
+        if not done:
+            case.problems.append("user_says hung")
+        outcome = ("hung" if not done else "cancelled" if task.cancelled() else task.exception() or task.result())
+        case.calls.append(("user_says", outcome))
+        case.windows.append(("user_says", first, len(case.said)))
     elif scenario == "compaction":
         script.open()
         await call_(label="user_says", coro=h.user_says(LONG))
@@ -434,6 +495,9 @@ def run(tmp_path, monkeypatch, scenario: str, target: str | None = None, nth: in
                 case.seeding.set()
                 await asyncio.get_running_loop().create_future()
         h.seeder = Waiting()
+    script.answer_gate = threading.Event()
+    if scenario == "withdraw_tools":
+        h.world = WaitingWorld()
     if scenario == "spawn":
         real_started = machine.hsm.Started
 
@@ -575,7 +639,13 @@ def judge(case: Case, dry: Case, target: str, scenario: str, second: str | None 
     d_original, d_graft, d_commits = dry.acts
     # a failed write may refuse a clone call, which the model then retries: only a fault of the
     # machines' own code is held to the dry run's model calls (plus the one run a hand-back sets off)
-    if commits > d_commits or graft > d_graft or (not activity and original > d_original + 1):
+    # withdraw_tools: in the dry run every graft's tool is cancelled at the withdrawal, so no graft
+    # answers a tool result; a graft whose tool did return (the host's call failed, and the call is
+    # recorded as run: it answers it) or whose call was not withdrawn (a fault ended it first, and
+    # its tools were released) goes on by design, and so may the original's wake for its join
+    goes_on = scenario == "withdraw_tools" and (case.released or "host.call_tool" in (target, second))
+    if commits > d_commits or (graft > d_graft and not goes_on) or (
+            not activity and not goes_on and original > d_original + 1):
         problems.append(f"acted beyond the dry run: {case.acts} > {dry.acts}")
     if case.withdrawals > dry.withdrawals:
         problems.append(f"{case.withdrawals} withdrawal marks, the user caused {dry.withdrawals}")
@@ -608,6 +678,12 @@ UNREACHED: dict[str, str] = {
                      "restate_through_focus_again", "_closing_out", "close_out_failed"], _THIRD),
     **dict.fromkeys(["s_shut_late", "s_stop_crashed", "s_take_stop_errors", "s_tell_crashed", "s_keep_lost_line"],
                     _CLOSE),
+    # the backstop: a graft that takes a step after its request was withdrawn, before the original
+    # stood to stop it (the original stops it first in every scenario)
+    "stop_graft": _TIMING,
+    # `calling`'s error: the activity turns every failure of the host's call into its outcome, so
+    # only its own code raising (before or after the call) reaches it
+    "tool_raised": "reached only if tool_activity's own code raises (it maps every failure of the host's call to its outcome)",
 }
 
 
