@@ -854,24 +854,21 @@ def test_a_fault_after_a_focus_graft_hands_its_request_back_fails_that_call(monk
     writes nothing), the decision's safe branch finds it held and reports the broken decision, and
     the user's call gets that error, never "ended" with nothing answered."""
     import graft.machine as machine_module
-    real, armed = machine_module._wakes, []
+    real, armed = machine_module.wakes_to_run, []
 
     def raising(*args, **kw):
-        # the `after` choice reads `_wakes` in `answers_handback` first, then in `wakes_to_run`:
-        # the second read raises
         if armed:
-            armed.pop()
-            if not armed:
-                raise RuntimeError("guard bug")
+            armed.clear()
+            raise RuntimeError("guard bug")
         return real(*args, **kw)
-    monkeypatch.setattr(machine_module, "_wakes", raising)
+    monkeypatch.setattr(machine_module, "wakes_to_run", raising)
 
     async def go():
         host, m = await started()
         reply = await say(m=m, text="go")
         await clone(m=m, pairs=[("c1", True)])
         applied = host.next("apply", "c1")
-        armed.extend(["answers_handback", "wakes_to_run"])  # the wake guard's next read raises
+        armed.append("armed")  # the wake guard's next read raises
         host.end(tl="c1", result=RunOutcome(kind="join", reason="out_of_scope"))
         await asyncio.wait_for(applied, GUARD)
         with pytest.raises(machine_module.DecisionFault, match="wakes_to_run held"):
