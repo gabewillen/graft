@@ -1027,6 +1027,7 @@ def _prune(inst: TimelineSM) -> None:
     whose calls are not done, and of requests its background grafts were made for whose joins are
     not applied yet: it is bounded by them."""
     inst.withdrawn &= {r.id for r in _known(inst)}
+    inst.stopped_unwanted &= set(inst.grafts)  # only grafts still its own (live) are remembered
 
 
 def _unwanted(inst: TimelineSM, child: str) -> bool:
@@ -1908,11 +1909,12 @@ def _stop_next_unwanted(inst: TimelineSM) -> None:
     """The next of its running background grafts made for a withdrawn request is stopped (`cancel`,
     asking it to say when it has the cancel, `stop_next`, so the next one is stopped then): one
     send per step."""
-    child = next((g for g in _still_running(inst) if _unwanted(inst=inst, child=g)
-                  and g not in inst.stopped_unwanted), None)
-    if child is not None:
+    for child in [g for g in _still_running(inst) if _unwanted(inst=inst, child=g) and g not in inst.stopped_unwanted]:
         inst.stopped_unwanted.add(child)
-        _forward(target=inst.machines.timelines.get(child), name="cancel", data=STOP_NEXT)
+        target = inst.machines.timelines.get(child)
+        if target is not None:  # a graft whose machine is gone is skipped: the chain goes on to the next
+            _forward(target=target, name="cancel", data=STOP_NEXT)
+            return
 
 
 def stop_unwanted(ctx, inst, event) -> None:

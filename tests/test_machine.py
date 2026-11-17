@@ -2243,3 +2243,18 @@ def test_no_activity_reads_its_machine_s_data_after_it_first_awaits():
             if after or id(node) in looped:
                 late.append(f"{name}: inst.{node.attr} (line {node.lineno})")
     assert late == []
+
+
+def test_a_withdrawal_stops_every_graft_made_for_it_even_when_one_machine_is_gone():
+    """The stops go one per step; a graft whose machine is gone is skipped, and the next is stopped."""
+    async def go():
+        host, m = await started()
+        reply = await say(m=m, text="go")
+        await clone(m=m, pairs=[("g0", False), ("g1", False), ("g2", False)])
+        stopped = host.next("run_cancelled", "g2")
+        m.timelines.pop("g0")  # forgotten: a stop sent to it is lost
+        await withdraw(m=m, reply=reply)
+        await asyncio.wait_for(stopped, GUARD)
+        assert host.logged("run_cancelled", "g1") and host.logged("run_cancelled", "g2")
+        await m.stop()
+    run(go)
