@@ -185,18 +185,17 @@ async def withdraw(m, reply):
     await m.send(tl="o", name="withdraw", data=REQUESTS[reply])
 
 
-async def clone(m, pairs, parts=None, request=None):
-    """A clone call of the original. `parts`: each graft's catalog skills (default: none);
-    `request`: the original's current request, as the harness reads it from the store."""
+async def clone(m, pairs, parts=None):
+    """A clone call of the original. `parts`: each graft's catalog skills (default: none). The
+    request it is decided under is the original machine's own."""
     parts = [(i, frozenset(p)) for i, p in enumerate(parts or [()] * len(pairs))]
     return await m.ask(tl="o", name="clone_request", build=lambda reply: Clone(
-        use={"id": "k"}, reply=reply, store=True, pairs=pairs, parts=parts, request=request))
+        use={"id": "k"}, reply=reply, store=True, pairs=pairs, parts=parts))
 
 
-async def cancel(m, tl, ids, request=None):
+async def cancel(m, tl, ids):
     call = CancelCall(use={"id": "x"}, ids=ids, problems=[])
-    return await m.ask(tl=tl, name="cancel_request", build=lambda reply: Cancel(calls=[call], reply=reply,
-                                                                                  request=request))
+    return await m.ask(tl=tl, name="cancel_request", build=lambda reply: Cancel(calls=[call], reply=reply))
 
 
 async def at_rest(m, tl="o"):
@@ -405,6 +404,83 @@ def test_a_withdrawn_message_does_not_restart_the_clone_calls_of_the_one_before(
         await asyncio.wait_for(waking, GUARD)
         _, _, text = await clone(m=m, pairs=[("c2", False)])
         assert "clone calls for this user message are used up" in text and "c2" not in host.status
+        await m.stop()
+    run(go)
+
+
+def test_a_message_withdrawn_through_a_recovery_does_not_restart_the_clone_calls_of_the_one_before(monkeypatch):
+    """As above, but the step that would mark W's row fails (`to_mark` raises), so the row is
+    marked by the recovery instead: "go"'s count still holds, and the wake's call is refused."""
+    import graft.machine as machine_module
+    monkeypatch.setattr(machine_module, "MAX_CLONE_CALLS_PER_MESSAGE", 1)
+    real, armed = machine_module.to_mark, ["armed"]
+
+    def raising(*args, **kw):
+        if armed:
+            armed.clear()
+            raise RuntimeError("mark step bug")
+        return real(*args, **kw)
+    monkeypatch.setattr(machine_module, "to_mark", raising)
+
+    async def go():
+        host, m = await started()
+        await say(m=m, text="go")
+        await clone(m=m, pairs=[("c1", False)])
+        host.end("o")
+        assert await at_rest(m) == "ended"
+        running = host.next("run", "o", "turn")
+        reply = await say(m=m, text="W")
+        await asyncio.wait_for(running, GUARD)
+        await withdraw(m=m, reply=reply)
+        assert await at_rest(m) == "ended" and not armed  # the mark step failed, and o recovered
+        waking = host.next("run", "o", "wake")
+        host.end("c1")  # c1's join is applied, then a wake: a full run
+        await asyncio.wait_for(waking, GUARD)
+        _, _, text = await clone(m=m, pairs=[("c2", False)])
+        assert "clone calls for this user message are used up" in text and "c2" not in host.status
+        await m.stop()
+    run(go)
+
+
+def test_a_withdrawn_hand_back_counts_nothing_for_the_request_before_it(monkeypatch):
+    """With a cap of two: "go" commits one call (c1, background), A one (c2, focus). The user says
+    M to c2, which hands M back as M is withdrawn. A is the request again, with its own count of
+    one, so the wake for c1's join may still clone."""
+    import graft.machine as machine_module
+    monkeypatch.setattr(machine_module, "MAX_CLONE_CALLS_PER_MESSAGE", 2)
+
+    async def go():
+        host, m = await started()
+        await say(m=m, text="go")
+        await clone(m=m, pairs=[("c1", False)])
+        host.end("o")
+        assert await at_rest(m) == "ended"
+        running = host.next("run", "o", "turn")
+        await say(m=m, text="A")
+        await asyncio.wait_for(running, GUARD)
+        focus_runs = host.next("run", "c2")
+        await clone(m=m, pairs=[("c2", True)])
+        await asyncio.wait_for(focus_runs, GUARD)
+        host.end("c2")  # c2 answers A
+        assert await at_rest(m=m, tl="c2") == "ended"
+        focus_runs = host.next("run", "c2")
+        reply = await say(m=m, text="M")  # passed to c2, which holds the conversation
+        await asyncio.wait_for(focus_runs, GUARD)
+        real = host.join_of
+
+        def join_of(tl, reason):  # the caller goes away as c2 hands M back
+            reply.cancel()
+            m.post(tl="o", name="withdraw", data=REQUESTS[reply])
+            return real(tl=tl, reason=reason)
+        host.join_of = join_of
+        host.end(tl="c2", result=RunOutcome(kind="join", reason="out_of_scope"))
+        await asyncio.wait_for(host.next("apply", "c2"), GUARD)
+        assert await at_rest(m) == "ended"
+        waking = host.next("run", "o", "wake")
+        host.end("c1")
+        await asyncio.wait_for(waking, GUARD)
+        _, _, text = await clone(m=m, pairs=[("c3", False)])
+        assert text == "cloned" and host.status["c3"] == "background"
         await m.stop()
     run(go)
 
@@ -1064,7 +1140,7 @@ def test_a_failed_graft_blocks_its_part_for_the_request_it_was_cloned_for_only(r
     async def go():
         host, m = await started()
         await m.ask(tl="o", name="turn_request", build=lambda r: (Mode(name="external"), r))
-        await clone(m=m, pairs=[("c1", False)], parts=[{"web"}], request=1)  # cloned for request 1
+        await clone(m=m, pairs=[("c1", False)], parts=[{"web"}])  # cloned for the original's request (none yet)
         await m.ask(tl="c1", name="join", build=lambda r: (QueuedJoin(child="c1", reason=reason, trigger=None), r))
         waking = host.next("run", "o", "wake")
         await m.ask(tl="o", name="driven_done", build=lambda r: r)
@@ -1072,10 +1148,15 @@ def test_a_failed_graft_blocks_its_part_for_the_request_it_was_cloned_for_only(r
         host.end(tl="o")
         assert await at_rest(m=m) == "ended"
         await m.ask(tl="o", name="turn_request", build=lambda r: (Mode(name="external"), r))
-        _, _, text = await clone(m=m, pairs=[("c2", False)], parts=[{"web"}], request=1)  # same part, same request
+        _, _, text = await clone(m=m, pairs=[("c2", False)], parts=[{"web"}])  # same part, same request
         assert ("already failed" in text if blocks else text == "cloned"), text
-        if blocks:  # the same part for another request is not blocked (a refused call leaves the turn its clone)
-            _, _, text = await clone(m=m, pairs=[("c3", False)], parts=[{"web"}], request=2)
+        if blocks:  # the same part for another request (a new user message) is not blocked
+            await m.ask(tl="o", name="driven_done", build=lambda r: r)
+            assert await at_rest(m=m) == "ended"
+            running = host.next("run", "o", "turn")
+            await say(m=m, text="another request")
+            await asyncio.wait_for(running, GUARD)
+            _, _, text = await clone(m=m, pairs=[("c3", False)], parts=[{"web"}])
             assert text == "cloned", text
         await asyncio.wait_for(m.ask(tl="session", name="shutdown", build=lambda r: r), timeout=GUARD)
         await m.stop()
@@ -1089,8 +1170,8 @@ def test_a_cancel_is_not_counted_as_a_hand_back_of_the_request_its_graft_was_clo
     async def go():
         host, m = await started()
         await driven_turn(m=m)
-        await clone(m=m, pairs=[("c1", False)], parts=[{"web"}], request=1)
-        answer = await cancel(m=m, tl="o", ids=["c1"], request=1)
+        await clone(m=m, pairs=[("c1", False)], parts=[{"web"}])
+        answer = await cancel(m=m, tl="o", ids=["c1"])
         assert answer[0][1] is False  # cancelled
         waking = host.next("run", "o", "wake")
         await end_driven_turn(m=m)
@@ -1098,7 +1179,7 @@ def test_a_cancel_is_not_counted_as_a_hand_back_of_the_request_its_graft_was_clo
         host.end(tl="o")
         assert await at_rest(m=m) == "ended"
         await driven_turn(m=m)
-        _, _, text = await clone(m=m, pairs=[("c2", False)], parts=[{"slides"}], request=1)
+        _, _, text = await clone(m=m, pairs=[("c2", False)], parts=[{"slides"}])
         assert text == "cloned"  # not "handed it back too many times"
         await asyncio.wait_for(m.ask(tl="session", name="shutdown", build=lambda r: r), timeout=GUARD)
         await m.stop()
@@ -1112,7 +1193,7 @@ def test_a_cancel_accepted_while_its_graft_ends_for_another_reason_blocks_nothin
     async def go():
         host, m = await started()
         first = await say(m=m, text="go")
-        await clone(m=m, pairs=[("c1", False)], parts=[{"web"}], request=1)
+        await clone(m=m, pairs=[("c1", False)], parts=[{"web"}])
         host.end(tl="o")
         assert await first == "ended"
         host.hold = m.future()  # c1's run, once cancelled, waits here before it ends
@@ -1121,14 +1202,14 @@ def test_a_cancel_accepted_while_its_graft_ends_for_another_reason_blocks_nothin
             QueuedJoin(child="c1", reason="done", trigger=None), r)))
         await stopping  # c1 is leaving its run for the forced join, mid-step
         await driven_turn(m=m)
-        asking = asyncio.ensure_future(cancel(m=m, tl="o", ids=["c1"], request=1))
+        asking = asyncio.ensure_future(cancel(m=m, tl="o", ids=["c1"]))
         reached = host.next("reason", "c1")
         host.hold.set_result(None)
         await reached
         answer = await asking
         await forcing
         assert answer == [(repr([("c1", "done")]), True)]  # accepted, and its join landed as done
-        _, _, text = await clone(m=m, pairs=[("c2", False)], parts=[{"web"}], request=1)
+        _, _, text = await clone(m=m, pairs=[("c2", False)], parts=[{"web"}])
         assert text == "cloned"  # its part is not blocked
         await end_driven_turn(m=m)
         await asyncio.wait_for(m.ask(tl="session", name="shutdown", build=lambda r: r), timeout=GUARD)

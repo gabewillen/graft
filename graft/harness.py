@@ -1051,7 +1051,7 @@ class Harness:
         for u in uses:
             ids, problems = cancel_ids(u.get("input"), limit=self.max_cancel_ids)
             calls.append(CancelCall(use=u, ids=ids, problems=problems))
-        return Cancel(calls=calls, reply=self.machines.future(), request=self.current_request(tl))
+        return Cancel(calls=calls, reply=self.machines.future())
 
     async def _cancels(self, tl: str, uses: list[dict]) -> None:
         cancel = self._cancel_request(tl=tl, uses=uses)
@@ -1157,8 +1157,9 @@ class Harness:
         return answered
 
     def current_request(self, tl: str) -> int | None:
-        """The request tl is answering: the last user message in its working view (harness notes
-        are not requests)."""
+        """The last user message in tl's working view (harness notes and withdrawn messages are not
+        requests): a read of the view, for tests and tools. No clone bound reads it: the original's
+        machine keeps its own requests, which no compaction changes."""
         users = [r["row_id"] for r in self.store.working_view(tl)
                  if r["role"] == "user" and seeder_mod.is_candidate(r)]
         return users[-1] if users else None
@@ -1432,7 +1433,7 @@ class Harness:
         text), or (None, None, refusal). `store`: the machine stores the call's result row, as the
         model loop needs."""
         children, focus, text = await self.machines.ask(tl=src, name="clone_request", build=lambda reply: Clone(
-            use=use, reply=reply, store=store, request=self.current_request(src), cancels=cancels))
+            use=use, reply=reply, store=store, cancels=cancels))
         if isinstance(text, Unwritten) and store:  # refused by a timeline that is not running: ours to write
             self._store_results(tl=src, results=[ToolResult(use=use, content=str(text), is_error=True)])
         return children, focus, text

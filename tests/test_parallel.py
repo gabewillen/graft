@@ -630,8 +630,8 @@ def test_a_background_failure_does_not_block_its_part_for_an_unrelated_handed_ba
         store.add_turn("o", "assistant", "tool_use", {"id": "t", "input": {}}, "clone")
         store.add_turn("o", "user", "tool_result", {"tool_use_id": "t", "content": msg}, "clone")
         await h.do_join(c2, "failed")  # the background graft fails while the source is suspended
-        store.add_turn(c1, "assistant", "text", "Site built.")
-        trig = store.add_turn(c1, "user", "text", "Now email it to Bob.")
+        await h.user_says("Now email it to Bob.")  # a real user message, to the focus graft
+        trig = h.current_request(c1)
         await h.do_join(c1, "out_of_scope")  # an unrelated request reaches the source, first time
         # the failed part's block is keyed on its own request: the new request may clone for that part
         assert h.current_request("o") == trig != req and not await blocked(h=h, skills=["slides"])
@@ -3202,6 +3202,66 @@ def test_a_withdrawn_message_does_not_lift_the_block_on_a_cancelled_part(tmp_pat
     assert clones(store) == ["c1", "c2"]  # the website part was never cloned again
     refused = [r["content"] for r in store.view("o") if r["kind"] == "tool_result" and "clone refused" in r["content"]]
     assert refused and all("was cancelled" in r for r in refused)
+
+
+class RecloneOnCompactingWake(RecloneOnWake):
+    """RecloneOnWake, compacting: a summary compaction call (no tools) gets a summary."""
+
+    def __call__(self, system, messages, tools):
+        return text("summary of the conversation") if not tools else super().__call__(
+            system=system, messages=messages, tools=tools)
+
+
+def test_a_block_on_a_cancelled_part_survives_a_compacting_wake(tmp_path):
+    """The original cancels the website part; the wakes that follow compact the view (the summary
+    covers the request's row), and each tries to clone the website again: the block is the
+    machine's own, keyed by its own request, so compaction does not lift it."""
+    script = RecloneOnCompactingWake(entries=TWO, ids=["c1"])
+    store, h, _ = make(tmp_path=tmp_path, policy=script, compact_tokens=60, compaction_mode="summary")
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await h.user_says(STOP)
+        script.open()  # c1 is cancelled already; a website graft cloned again would finish too
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    summaries = [r for r in store.working_view("o") if r["content"].startswith("(compaction summary")]
+    assert summaries and h.wakes  # the wakes compacted
+    assert clones(store) == ["c1", "c2"]  # the website part was never cloned again
+    refused = [r["content"] for r in store.view("o") if r["kind"] == "tool_result" and "clone refused" in r["content"]]
+    assert refused and all("was cancelled" in r for r in refused)
+
+
+def test_a_compacting_wake_chain_stops_at_the_per_message_cap(tmp_path):
+    """An original that always clones, with every wake compacting the view (the summary covers
+    the request's row): the count is the machine's own, keyed by its own request, so the chain
+    still stops at MAX_CLONE_CALLS_PER_MESSAGE."""
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        if not tools:
+            return text("summary of the conversation")
+        last = messages[-1]["content"][-1]
+        if "clone" in names:
+            if last["type"] == "tool_result":
+                return text("Okay.")
+            return [clone_use(clone_entry(skills=["website"], focus=False), id=f"c{len(messages)}") | {"type": "tool_use"}]
+        return text("site finished " * 20)
+
+    store, h, _ = make(tmp_path, policy, compact_tokens=60, compaction_mode="summary")
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    summaries = [r for r in store.view("o") if r["content"].startswith("(compaction summary")]
+    assert len(summaries) >= MAX_CLONE_CALLS_PER_MESSAGE - 1  # the wakes compacted
+    assert len(clones(store)) == MAX_CLONE_CALLS_PER_MESSAGE
 
 
 def test_the_original_may_cancel_in_a_wake_and_the_cancel_gets_its_own_wake(tmp_path):
