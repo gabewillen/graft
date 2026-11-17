@@ -1263,3 +1263,95 @@ def test_a_seeder_that_raises_a_base_exception_refuses_the_clone_call_and_leaves
     assert out["said"] != "TIMEOUT"
     assert store.con.execute("SELECT count(*) FROM transactions WHERE status='open'").fetchone()[0] == 0
     assert store.con.execute("SELECT count(*) FROM timelines WHERE source_id IS NOT NULL").fetchone()[0] == 0
+
+
+# ------------------------------------------------------------------ a CancelledError is a leaving only when the state is left
+def test_a_background_model_call_that_raises_cancelled_error_fails_its_run(tmp_path):
+    def policy(system, messages, tools):
+        if "clone" in {t["name"] for t in tools}:
+            return background_original([clone_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
+                                                                                         messages)
+        raise asyncio.CancelledError()  # a provider SDK's own cancellation surfacing
+
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
+    out = drive_one(h=h, store=store)
+    assert out["joined"] is True and out["closed"] is True
+    assert store.timeline("c1")["join_reason"] == "failed"
+
+
+def say_and_close(h):
+    out = {}
+
+    async def go():
+        await h.start()
+        try:
+            out["said"] = await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            out["said"] = "TIMEOUT"
+        except BaseException as error:  # noqa: BLE001 - the failure reaches the caller
+            out["said"] = type(error).__name__
+        try:
+            await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+            out["closed"] = True
+        except asyncio.TimeoutError:
+            out["closed"] = "TIMEOUT"
+    asyncio.run(go())
+    return out
+
+
+def test_an_original_model_call_that_raises_cancelled_error_fails_its_run(tmp_path):
+    def policy(system, messages, tools):
+        raise asyncio.CancelledError()
+
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
+    out = say_and_close(h)
+    assert out["said"] != "TIMEOUT" and out["closed"] is True
+
+
+def test_a_host_write_that_raises_cancelled_error_is_its_state_s_failure(tmp_path):
+    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    real = h.record_join
+
+    def broken(**kw):
+        if kw.get("child") == "c1":
+            raise asyncio.CancelledError()
+        return real(**kw)
+    h.record_join = broken
+    out = drive_one(h=h, store=store)
+    assert out["joined"] is True and out["closed"] is True
+
+
+def test_a_clone_preparation_that_raises_cancelled_error_is_refused(tmp_path):
+    store, h, _ = one_background(World(), tmp_path=tmp_path)
+
+    async def broken(**kw):
+        raise asyncio.CancelledError()
+    h.prepare_clone = broken
+    out = say_and_close(h)
+    assert out["said"] != "TIMEOUT" and out["closed"] is True
+
+
+def test_a_seeder_that_raises_cancelled_error_leaves_no_audit_open(tmp_path):
+    from graft.db import Store
+    from graft.providers import FakeProvider
+    from graft.harness import Harness
+    from graft.skills import install
+
+    class CancellingSeeder:
+        name = "cancelling"
+
+        async def score(self, purpose, cands, trigger):
+            raise asyncio.CancelledError()
+
+    def policy(system, messages, tools):
+        if messages[-1]["content"][-1]["type"] == "tool_result":
+            return text("Could not start it.")
+        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
+
+    store = Store(str(tmp_path / "p.db"))
+    install(store)
+    h = Harness(store, FakeProvider(policy), seeder=CancellingSeeder())
+    out = say_and_close(h)
+    assert out["said"] != "TIMEOUT" and out["closed"] is True
+    assert store.con.execute("SELECT count(*) FROM transactions WHERE status='open'").fetchone()[0] == 0
+

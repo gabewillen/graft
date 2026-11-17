@@ -1446,8 +1446,14 @@ class Harness:
         txs: list[int] = []
         try:
             prepared = await self._prepare_clone(src=src, use=clone.use, retry_left=retry_left, txs=txs)
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise  # a cancel: the machine rolls the call back in a state of its own
+        except asyncio.CancelledError:
+            # the run left (the machine also rolls the call back, in a state of its own), or a cancel
+            # that came from elsewhere (the machine takes it as the preparation's failure): either way
+            # nothing of the call stays open; rolling back what is already rolled back changes nothing
+            self._roll_back(src=src, txs=txs, scratch={"args": clone.use.get("input"), "error": "cancelled"})
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except BaseException as e:  # noqa: BLE001 - an error, Exception or not, is a refusal of the call
             err = _described(e)
             self._roll_back(src=src, txs=txs, scratch={"args": clone.use.get("input"), "error": err})
