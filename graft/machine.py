@@ -848,12 +848,19 @@ def described(error: BaseException) -> str:
     or its message cannot be had (its __str__ raises, whatever it raises but an interpreter exit):
     a fault path that tells an error never fails on the telling."""
     try:
+        name = type(error).__name__
+        name = name if isinstance(name, str) else "error"
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:  # noqa: BLE001 - its type's name cannot be had either
+        name = "error"
+    try:
         text = str(error)
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException:  # noqa: BLE001 - its message cannot be had: its type alone is shown
-        return type(error).__name__
-    return f"{type(error).__name__}: {text}" if text else type(error).__name__
+        return name
+    return f"{name}: {text}" if text else name
 
 
 def _failure(ctx, error: BaseException) -> BaseException:

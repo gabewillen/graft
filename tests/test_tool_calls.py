@@ -1355,3 +1355,16 @@ def test_a_seeder_that_raises_cancelled_error_leaves_no_audit_open(tmp_path):
     assert out["said"] != "TIMEOUT" and out["closed"] is True
     assert store.con.execute("SELECT count(*) FROM transactions WHERE status='open'").fetchone()[0] == 0
 
+
+def test_an_error_whose_type_name_cannot_be_had_is_described_as_an_error():
+    from graft.machine import described
+
+    class Nameless(type):
+        @property
+        def __name__(cls):
+            raise RuntimeError("no name")
+
+    class Odd(Exception, metaclass=Nameless):
+        pass
+
+    assert described(Odd("its message")) == "error: its message"
