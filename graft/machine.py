@@ -333,7 +333,7 @@ class ToolCall:
     """A host tool call its run asks its machine to make: the call is the activity of the run's
     `calling` state, so leaving the run ends it where it waits. `use`: the model's tool call;
     `interrupted`: the result (the harness's own, marked as run) the call is closed with if the
-    run is left while the tool runs: it may have acted before it stopped, so it is never closed
+    run is left while the tool runs: it may have acted, or may still act, so it is never closed
     as not run. `cancelled`: its result (also marked as run, an error) when the tool is cancelled
     by something other than its graft (the host cancelled what it awaited): the run goes on."""
     use: dict

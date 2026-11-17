@@ -106,8 +106,9 @@ NOT_RUN_INTERRUPTED = NotRun("not executed: the turn was interrupted")
 NOT_RUN_JOINING = NotRun("not executed: this task is being joined")
 NOT_RUN_BESIDE_CLONE = NotRun("not executed: call clone on its own")
 # A host tool call cut short while it ran (its run was left: a cancel, a withdrawal, shutdown).
-# It may have acted before it stopped, so it is recorded as run, with an error.
-CANCELLED_WHILE_RUNNING = Ran("cancelled while running: it may have acted before it stopped")
+# It may have acted, or may still act (cancellation is cooperative: work it handed to a thread, or
+# shielded, can go on after the cancel), so it is recorded as run, with an error.
+CANCELLED_WHILE_RUNNING = Ran("cancelled while running: it may have acted, or may still act")
 # A host tool call whose tool was cancelled by something other than its graft (the host cancelled a
 # future or task the tool awaited, while the graft still ran): it ran, with an error.
 CANCELLED_BY_THE_TOOL = Ran("cancelled by the tool: it may have acted")

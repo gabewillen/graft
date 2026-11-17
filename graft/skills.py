@@ -317,7 +317,9 @@ class World:
     there while every other timeline goes on, so one graft's tool may wait for what another
     graft's tool produces. A call cut short while it waits (its graft cancelled, its request
     withdrawn, shutdown) is cancelled where it waits and recorded as run with an error. No timeout
-    is applied: a tool that never returns keeps its graft live."""
+    is applied: a tool that never returns keeps its graft live. Cancellation is cooperative: a
+    tool that swallows CancelledError blocks its graft's cancel and close(), and work it handed
+    to a thread or shielded may still act after the cancel (its result says so)."""
     site: dict[str, str] = field(default_factory=dict)
     decks: list[dict] = field(default_factory=list)
     calendar: list[dict] = field(default_factory=list)

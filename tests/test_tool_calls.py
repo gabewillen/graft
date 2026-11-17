@@ -1,7 +1,7 @@
 """A host tool may return an awaitable: the call is the activity of its timeline's `calling` state,
 awaited there while every other timeline goes on. Leaving that state (a cancel, a withdrawal,
 shutdown) cancels the tool where it waits, and the call is recorded as run with an error, never
-as not executed: it may have acted before it stopped."""
+as not executed: it may have acted, or may still act."""
 
 import asyncio
 import threading
@@ -13,7 +13,7 @@ from test_parallel import (REQUEST, WAIT_TIMEOUT, clone_entry, clone_use, is_wak
                            violations)
 
 STOP = "stop the website"
-CANCELLED_WHILE_RUNNING = "cancelled while running: it may have acted before it stopped"
+CANCELLED_WHILE_RUNNING = "cancelled while running: it may have acted, or may still act"
 
 
 def use(id, name, **args):
