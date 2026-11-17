@@ -1513,12 +1513,15 @@ async def tool_activity(ctx, inst: TimelineSM, event) -> None:
     between a tool that returned and its row. Before the tool is called the call is kept as one
     that ran (`unstored`, with the run's `interrupted` result): leaving the state cancels the
     tool where it waits, and the run's closing records it as run with an error, since it may
-    have acted before it stopped. The outcome is `tool_ran`: the result and, if its row could
-    not be written, that error. A tool that raises is `hsm/error`. Its inputs are taken before
-    its first await."""
-    host, tl, call = inst.host, inst.timeline_id, inst.tool
-    inst.unstored[call.use["id"]] = (call.interrupted, True)
+    have acted before it stopped. Once the tool returns, its real result replaces that one before
+    the row is written, so a run left after a row that could not be written (before the outcome is
+    taken) closes the call with what it returned. The outcome is `tool_ran`: the result and, if
+    its row could not be written, that error. A tool that raises is `hsm/error`. Its inputs are
+    taken before its first await (`known` is the record the run's closing reads)."""
+    host, tl, call, known = inst.host, inst.timeline_id, inst.tool, inst.unstored
+    known[call.use["id"]] = (call.interrupted, True)
     content, is_error = await host.call_tool(tl=tl, use=call.use)
+    known[call.use["id"]] = (content, is_error)
     try:
         host.store_result(tl=tl, use=call.use, content=content, is_error=is_error)
     except Exception as error:  # noqa: BLE001 - the outcome event carries it

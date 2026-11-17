@@ -432,3 +432,45 @@ def test_a_withdrawal_after_the_answer_stops_a_background_graft_whose_tool_await
     assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_WHILE_RUNNING, True)]
     assert h.tools_run("c1") == ["site_write (returned an error)"] and h.wakes == []
     assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
+
+
+def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_result(tmp_path):
+    """The tool returns, its row cannot be written, and a withdrawal is taken before the
+    activity's outcome (`tool_ran`): the call is closed with what the tool returned, marked run,
+    not as cut short."""
+    def original(last, messages):
+        if last["type"] == "tool_result" or last.get("harness"):
+            return text("Back.")
+        return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
+
+    store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original))
+    real, call = h.store_result, {}
+
+    def failing(**kw):
+        if kw["tl"] == "c1" and not call.get("fired"):
+            call["fired"] = True
+            h.machines.post(tl="c1", name="withdraw", data=call["id"])  # taken before the outcome
+            call["task"].cancel()
+            raise OSError("INJECTED store_result")
+        return real(**kw)
+    h.store_result = failing
+
+    async def go():
+        await h.start()
+        call["id"] = h.machines.requests + 1  # the id the next user request gets
+        call["task"] = asyncio.create_task(h.user_says(REQUEST))
+        try:
+            await asyncio.wait_for(call["task"], WAIT_TIMEOUT)
+        except (asyncio.CancelledError, OSError):
+            pass
+        await asyncio.wait_for(h.until_rest("c1"), WAIT_TIMEOUT)
+        try:
+            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        except OSError:
+            pass
+        await h.close()
+
+    asyncio.run(go())
+    assert call["fired"]
+    assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]
+    assert h.tools_run("c1") == ["site_write"] and violations(store=store, tl="c1") == []
