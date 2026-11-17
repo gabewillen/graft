@@ -23,6 +23,7 @@ class Host:
 
     def __init__(self):
         self.log: list[tuple] = []
+        self.woken: set[str] = set()  # timelines a wake note was written for, whose run has not started
         self.status: dict[str, str] = {}
         self.runs: dict[str, asyncio.Future] = {}
         self.reports: list[tuple[str, list[str], str]] = []
@@ -60,8 +61,11 @@ class Host:
                 await self.hold
             raise
 
-    async def run_busy(self, tl, mode, kind):
-        self.record("run", tl, mode.name)
+    async def run_busy(self, tl, kind):
+        # the machine does not say which run this is: a run that follows a wake note for tl, with
+        # no message written since, is that wake's run; any other is a turn
+        self.record("run", tl, "wake" if tl in self.woken else "turn")
+        self.woken.discard(tl)
         return await self._run(tl)
 
     async def run_background(self, tl):
@@ -79,6 +83,7 @@ class Host:
         self.record("status", tl, status)
 
     def begin_request(self, tl, text):
+        self.woken.discard(tl)
         self.record("request", tl, text)
         return len(self.log)
 
@@ -123,6 +128,7 @@ class Host:
         return True, cloned_for, False
 
     def wake_note(self, src, joined, handed_back, running, background):
+        self.woken.add(src)
         self.record("note", tuple(c for c, _ in joined), handed_back)
 
     def cancel_text(self, call, outcomes):

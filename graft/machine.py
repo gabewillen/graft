@@ -353,7 +353,7 @@ class Host(Protocol):
     """What the machines need from the harness: I/O only, always called from an activity (or the
     scribe's), always by keyword. Whatever the host needs to know about a timeline (its kind, the
     grafts still running) comes in the call: the host never reads a machine."""
-    def run_busy(self, tl: str, mode: Mode, kind: str) -> Any: ...
+    def run_busy(self, tl: str, kind: str) -> Any: ...
     def run_background(self, tl: str) -> Any: ...
     def mirror(self, tl: str, status: str) -> None: ...
     def report(self, kind: str, src: str | None, clones: list[str], error: BaseException, quiet: bool,
@@ -1574,7 +1574,7 @@ async def busy_activity(ctx, inst: TimelineSM, event) -> None:
     try:
         _close_out(inst)
         _mark_pending(inst)
-        outcome = await inst.host.run_busy(tl=inst.timeline_id, mode=inst.mode, kind=inst.kind)
+        outcome = await inst.host.run_busy(tl=inst.timeline_id, kind=inst.kind)
     except BaseException as error:  # noqa: BLE001 - the outcome event carries it, Exception or not
         error = _failure(ctx, error)
         if not ctx.is_done():

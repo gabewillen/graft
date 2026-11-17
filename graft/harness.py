@@ -566,7 +566,7 @@ class Harness:
         await self.machines.ask(tl=child, name="join", build=lambda reply: (join, reply))
 
     # ------------------------------------------------------------ host: I/O for the machines
-    async def run_busy(self, tl: str, mode: Mode, kind: str) -> RunOutcome:
+    async def run_busy(self, tl: str, kind: str) -> RunOutcome:
         return await self._loop(tl=tl, kind=kind)
 
     async def run_background(self, tl: str) -> RunOutcome:
