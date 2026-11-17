@@ -3155,7 +3155,7 @@ def test_a_cancelled_join_wakes_a_full_run_that_clones_another_part(tmp_path):
 
 class RecloneOnWake(CancelScript):
     """Clones website and slides; on STOP cancels c1 (website); on every wake tries to clone the
-    website part again; answers "W" plainly (when it is not withdrawn first)."""
+    website part again. "W" is withdrawn before any run answers it, so no branch answers it."""
 
     def __call__(self, system, messages, tools):
         names = {t["name"] for t in tools}
@@ -3163,8 +3163,6 @@ class RecloneOnWake(CancelScript):
         if "clone" in names and last["type"] == "text" and is_wake(last):
             return [{"type": "text", "text": "Re-cloning the website."},
                     clone_use(clone_entry(skills=["website"], focus=False), id=f"r{len(messages)}") | {"type": "tool_use"}]
-        if "clone" in names and last["type"] == "text" and last["text"] == "W":
-            return text("Answer to W.")
         return super().__call__(system=system, messages=messages, tools=tools)
 
 
