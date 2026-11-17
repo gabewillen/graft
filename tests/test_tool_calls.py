@@ -474,3 +474,107 @@ def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_r
     assert call["fired"]
     assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]
     assert h.tools_run("c1") == ["site_write"] and violations(store=store, tl="c1") == []
+
+
+# ------------------------------------------------------------------ a tool cancelled by something other than its graft
+CANCELLED_BY_THE_TOOL = "cancelled by the tool: it may have acted"
+
+
+class SelfCancel(World):
+    """site_write awaits a future the host cancels itself (its own deadline): CancelledError reaches
+    the activity while its state is still active."""
+
+    async def execute(self, name, args):
+        if name == "site_write":
+            fut = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(fut.cancel)
+            await fut
+        return super().execute(name=name, args=args)
+
+
+def test_a_tool_that_is_cancelled_by_its_host_ends_as_run_with_an_error_and_its_run_goes_on(tmp_path):
+    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    store, h, _ = make(tmp_path=tmp_path, policy=policy, world=SelfCancel())
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)  # not wedged in `calling`
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_BY_THE_TOOL, True)]
+    assert store.timeline("c1")["join_reason"] == "done"  # its model saw the error and replied
+    assert h.tools_run("c1") == ["site_write (returned an error)"]
+
+
+def test_a_focus_graft_whose_tool_is_cancelled_by_its_host_goes_on(tmp_path):
+    def original(last, messages):
+        if last["type"] == "tool_result" or last.get("harness"):
+            return text("Back.")
+        return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
+
+    store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=SelfCancel())
+
+    async def go():
+        await h.start()
+        assert await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT) == ["done"]
+        await h.close()
+
+    asyncio.run(go())
+    assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_BY_THE_TOOL, True)]
+
+
+class SharedWork(World):
+    """slides_create (c1) starts a task and awaits it; site_write (c2) awaits the same task. When c1
+    is cancelled its await is cancelled, and so is the shared task c2 awaits: c2's state is not left."""
+
+    def __init__(self):
+        super().__init__()
+        self.task: asyncio.Future | None = None
+        self.both = asyncio.Event()
+
+    async def execute(self, name, args):
+        if name == "slides_create":
+            self.task = asyncio.ensure_future(asyncio.Event().wait())
+            await self.task
+        if name == "site_write":
+            while self.task is None:
+                await asyncio.sleep(0.01)
+            self.both.set()
+            await self.task
+        return super().execute(name=name, args=args)
+
+
+def test_a_graft_whose_tool_awaits_work_a_cancelled_sibling_shared_goes_on(tmp_path):
+    world = SharedWork()
+    original = background_original([clone_entry(skills=["slides"], focus=False),
+                                    clone_entry(skills=["website"], focus=False)])
+
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" in names:
+            return original(last, messages)
+        if last["type"] == "tool_result":
+            return text("done")
+        if "site_write" in names:
+            return [use("w1", "site_write", page="i", content="x")]
+        return [use("s1", "slides_create", title="D")]
+
+    store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await asyncio.wait_for(world.both.wait(), WAIT_TIMEOUT)
+        await asyncio.wait_for(h.user_says(STOP), WAIT_TIMEOUT)  # cancels c1
+        await asyncio.wait_for(h.join_queued("c2"), WAIT_TIMEOUT)  # c2 is not wedged
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert tool_results(store=store, tl="c1") == [("slides_create", CANCELLED_WHILE_RUNNING, True)]
+    assert tool_results(store=store, tl="c2") == [("site_write", CANCELLED_BY_THE_TOOL, True)]
+    assert store.timeline("c2")["join_reason"] == "done"

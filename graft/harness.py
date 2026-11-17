@@ -107,6 +107,9 @@ NOT_RUN_BESIDE_CLONE = NotRun("not executed: call clone on its own")
 # A host tool call cut short while it ran (its run was left: a cancel, a withdrawal, shutdown).
 # It may have acted before it stopped, so it is recorded as run, with an error.
 CANCELLED_WHILE_RUNNING = Ran("cancelled while running: it may have acted before it stopped")
+# A host tool call whose tool was cancelled by something other than its graft (the host cancelled a
+# future or task the tool awaited, while the graft still ran): it ran, with an error.
+CANCELLED_BY_THE_TOOL = Ran("cancelled by the tool: it may have acted")
 _NONCE_TAG = re.compile(r"^\[conversation [^\]]*\]\s*")
 # Why a seed row is refused when the user withdrew the message it holds (spec: State machine).
 WITHDRAWN_SEED = "row {row} is a message the user withdrew; it is not a request and cannot be seeded"
@@ -985,7 +988,7 @@ class Harness:
                     await self._store_ran(tl=tl, result=ToolResult(use=u, content=content, is_error=err))
                 else:  # the activity of the machine's `calling` state; it also writes the result row
                     await self.machines.ask(tl=tl, name="tool_request", build=lambda reply, u=u: ToolCall(
-                        use=u, reply=reply, interrupted=CANCELLED_WHILE_RUNNING))
+                        use=u, reply=reply, interrupted=CANCELLED_WHILE_RUNNING, cancelled=CANCELLED_BY_THE_TOOL))
             # The cancel calls run after every other call's result is stored: one request to the
             # machine, which stores each call's real result once the grafts have stopped.
             if cancels:

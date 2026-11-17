@@ -333,10 +333,12 @@ class ToolCall:
     `calling` state, so leaving the run ends it where it waits. `use`: the model's tool call;
     `interrupted`: the result (the harness's own, marked as run) the call is closed with if the
     run is left while the tool runs: it may have acted before it stopped, so it is never closed
-    as not run."""
+    as not run. `cancelled`: its result (also marked as run, an error) when the tool is cancelled
+    by something other than its graft (the host cancelled what it awaited): the run goes on."""
     use: dict
     reply: asyncio.Future
     interrupted: str
+    cancelled: str = "cancelled by the tool: it may have acted"  # the harness passes its own, marked run
 
 
 class Host(Protocol):
@@ -1520,7 +1522,16 @@ async def tool_activity(ctx, inst: TimelineSM, event) -> None:
     taken before its first await (`known` is the record the run's closing reads)."""
     host, tl, call, known = inst.host, inst.timeline_id, inst.tool, inst.unstored
     known[call.use["id"]] = (call.interrupted, True)
-    content, is_error = await host.call_tool(tl=tl, use=call.use)
+    try:
+        content, is_error = await host.call_tool(tl=tl, use=call.use)
+    except asyncio.CancelledError:
+        # Leaving the state cancels this activity (its context is done first) and that cancel is
+        # never swallowed. A cancel the tool met while the state is still active (the host
+        # cancelled a future or task the tool awaited) is the tool's outcome: it ran, with an
+        # error, and the run goes on, so the graft is never left in `calling` with no outcome.
+        if ctx.is_done() or asyncio.current_task().cancelling():
+            raise
+        content, is_error = call.cancelled, True
     known[call.use["id"]] = (content, is_error)
     try:
         host.store_result(tl=tl, use=call.use, content=content, is_error=is_error)
