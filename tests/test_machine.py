@@ -376,6 +376,33 @@ def test_a_wake_run_after_a_done_join_may_clone():
     run(go)
 
 
+def test_a_withdrawn_message_does_not_restart_the_clone_calls_of_the_one_before(monkeypatch):
+    """With a cap of one clone call per message: "go" commits its one call; "W" is written and
+    then withdrawn while its run is going. W never became a request a run answered, so "go"'s
+    count holds: the wake for c1's join is refused by the cap."""
+    import graft.machine as machine_module
+    monkeypatch.setattr(machine_module, "MAX_CLONE_CALLS_PER_MESSAGE", 1)
+
+    async def go():
+        host, m = await started()
+        await say(m=m, text="go")
+        await clone(m=m, pairs=[("c1", False)])
+        host.end("o")
+        assert await at_rest(m) == "ended"
+        running = host.next("run", "o", "turn")
+        reply = await say(m=m, text="W")
+        await asyncio.wait_for(running, GUARD)
+        await withdraw(m=m, reply=reply)
+        assert await at_rest(m) == "ended"
+        waking = host.next("run", "o", "wake")
+        host.end("c1")  # c1's join is applied, then a wake: a full run
+        await asyncio.wait_for(waking, GUARD)
+        _, _, text = await clone(m=m, pairs=[("c2", False)])
+        assert "clone calls for this user message are used up" in text and "c2" not in host.status
+        await m.stop()
+    run(go)
+
+
 def test_a_focus_clone_hands_the_conversation_over_and_its_join_goes_last():
     async def go():
         host, m = await started()

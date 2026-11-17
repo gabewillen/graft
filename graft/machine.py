@@ -475,6 +475,9 @@ class TimelineSM(hsm.Instance):
         self.arrivals: dict[tuple[int | None, frozenset[str]], int] = {}
         self.handbacks: dict[int | None, int] = {}
         self.clone_calls = 0  # committed since the last user message
+        # the count of the request before the one being answered: it counts again if that one is
+        # withdrawn unanswered (a withdrawn message never resets the bounds)
+        self.calls_before = 0
         self.reason = ""  # background: its join reason, while it is recorded
         self.close_first = False  # background: its run ended early (its open calls need results)
         self.forced: asyncio.Future | None = None
@@ -1917,25 +1920,28 @@ def take_inbox(ctx, inst, event) -> None:
 
 
 def request_written(ctx, inst, event) -> None:
-    """The message's row is written: it is the run's request; the bounds of the last one are
-    cleared (a new request may clone again)."""
+    """The message's row is written: it is the run's request, and may clone again. Its clone
+    calls are counted from none; the last request's count is kept (`calls_before`) and comes back
+    if this one is withdrawn unanswered (`to_mark`). The re-clone blocks are keyed by request row,
+    so none of the last request's blocks a part of this one, and they hold again for the last
+    request if this one is withdrawn."""
     closed_out(inst)
     request, inst.request = inst.request, None
     request.row = event.data
     inst.answering, inst.answered = request, False
     inst.mode, inst.clone_tries = TURN, 0
-    inst.blocks, inst.clone_calls = set(), 0
+    inst.calls_before, inst.clone_calls = inst.clone_calls, 0
     inst.waiters.append(Waiter(reply=request.reply, user=True, request=request))
 
 
 def request_dropped(ctx, inst, event) -> None:
     """The message's row is written, but its caller withdrew it meanwhile: no run starts for it.
     The row stays (rows are never removed) and is marked withdrawn next (`dropping`), so no later
-    turn reads it as a live request. A new message was written, so the bounds of the last one
-    are cleared."""
+    turn reads it as a live request. It never became a request, so the bounds of the last one
+    (its re-clone blocks and its committed clone calls) hold: the wakes that follow are still
+    under them."""
     closed_out(inst)
     request, inst.request = inst.request, None
-    inst.blocks, inst.clone_calls = set(), 0
     inst.unmarked.append(event.data)
     _prune(inst)
     _answer_dead([request])
@@ -2288,8 +2294,13 @@ def rows_marked(ctx, inst, event) -> None:
 
 
 def to_mark(ctx, inst, event) -> None:  # entry of `withdrawing`
-    """The row of the withdrawn request its run answered is to be marked."""
-    inst.unmarked += [r for r in _withdrawn_rows(inst) if r not in inst.unmarked]
+    """The row of the withdrawn request its run answered is to be marked. That request never
+    lifted the bounds of the one before it: the clone calls committed for that one count again."""
+    rows = _withdrawn_rows(inst)
+    inst.unmarked += [r for r in rows if r not in inst.unmarked]
+    restored = inst.calls_before if rows else NONE_YET
+    inst.clone_calls += restored
+    inst.calls_before -= restored
 
 
 def mark_failed(ctx, inst, event) -> None:

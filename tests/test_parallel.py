@@ -3038,6 +3038,59 @@ def test_close_waits_for_a_cancel_in_flight_and_contains_a_store_error_there(tmp
     assert violations(store=store, tl="o") == []
 
 
+class RecloneOnWake(CancelScript):
+    """Clones website and slides; on STOP cancels c1 (website); on every wake tries to clone the
+    website part again; answers "W" plainly (when it is not withdrawn first)."""
+
+    def __call__(self, system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" in names and last["type"] == "text" and is_wake(last):
+            return [{"type": "text", "text": "Re-cloning the website."},
+                    clone_use(clone_entry(skills=["website"], focus=False), id=f"r{len(messages)}") | {"type": "tool_use"}]
+        if "clone" in names and last["type"] == "text" and last["text"] == "W":
+            return text("Answer to W.")
+        return super().__call__(system=system, messages=messages, tools=tools)
+
+
+@pytest.mark.parametrize("withdraw", [False, True])
+def test_a_withdrawn_message_does_not_lift_the_block_on_a_cancelled_part(tmp_path, withdraw):
+    """The original cancels the website part; a later message is withdrawn as its row is written.
+    No run answered that message, so the block on the cancelled part holds: the full-run wake
+    that follows tries to clone the website again and is refused."""
+    script = RecloneOnWake(entries=TWO, ids=["c1"])
+    store, h, _ = make(tmp_path=tmp_path, policy=script)
+    task = {}
+    if withdraw:
+        real = h.begin_request
+
+        def begin_request(**kw):  # the caller withdraws "W" while its row is written
+            row = real(**kw)
+            if "W" in task and not task["W"].done():
+                task["W"].cancel()
+            return row
+        h.begin_request = begin_request
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)  # c1 website, c2 slides, both waiting on their gates
+        await h.user_says(STOP)  # cancels c1: the website part is blocked for REQUEST
+        if withdraw:
+            task["W"] = asyncio.create_task(h.user_says("W"))
+            with pytest.raises(asyncio.CancelledError):
+                await task["W"]
+        script.open("slides")  # c2 joins done: its wake tries the website again
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        script.open()
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert clones(store) == ["c1", "c2"]  # the website part was never cloned again
+    refused = [r["content"] for r in store.view("o") if r["kind"] == "tool_result" and "clone refused" in r["content"]]
+    assert refused and all("was cancelled" in r for r in refused)
+
+
 def test_the_original_may_cancel_in_a_wake_and_the_cancel_gets_its_own_wake(tmp_path):
     class InReport(CancelScript):
         def __call__(self, system, messages, tools):
