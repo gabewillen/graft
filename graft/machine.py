@@ -2748,13 +2748,16 @@ def refuse_head(ctx, inst, event) -> None:
 
 def cancel_landed(ctx, inst, event) -> None:
     """A graft this call cancelled has queued its join: its outcome is the join's reason, and its
-    part is blocked for the current request only if it was cancelled (a graft that finished
-    first is not)."""
+    part is blocked only if it was cancelled (a graft that finished first is not), under both the
+    request current at the cancel and the request the graft was made for, so a withdrawal of the
+    message that cancelled it does not lift the block."""
     join: QueuedJoin = event.data
     inst.queue.append(join)
     inst.pending.discard(join.child)
     inst.outcomes[join.child] = join.reason
-    inst.blocks |= {(inst.cancel.request, inst.parts.get(join.child, frozenset()))} if join.reason == CANCELLED else set()
+    part = inst.parts.get(join.child, frozenset())
+    keys = {inst.cancel.request, inst.cloned_for.get(join.child)}
+    inst.blocks |= {(key, part) for key in keys} if join.reason == CANCELLED else set()
     _session(inst=inst, name="graft_received", data=join.child)
 
 

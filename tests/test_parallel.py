@@ -3264,6 +3264,54 @@ def test_the_cap_survives_repeated_write_and_withdraw_cycles(tmp_path, monkeypat
     assert clones(store) == ["c1"]  # the wake's clone of the slides was refused by the cap
 
 
+class CancelThenWithdraw(CancelScript):
+    """STOP cancels c1; the call after the cancel result waits on gates["cancel"] so the test can
+    withdraw STOP meanwhile. Every wake tries to clone the website part again."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.after_cancel = threading.Event()
+
+    def __call__(self, system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" in names and last["type"] == "tool_result" and last["tool_use_id"].startswith("x"):
+            self.after_cancel.set()
+            assert self.gates["cancel"].wait(GATE_TIMEOUT)
+            return text("Stopped.")
+        if "clone" in names and last["type"] == "text" and is_wake(last):
+            return [clone_use(clone_entry(skills=["website"], focus=False), id=f"r{len(messages)}") | {"type": "tool_use"}]
+        return super().__call__(system=system, messages=messages, tools=tools)
+
+
+def test_a_cancel_block_survives_the_withdrawal_of_the_cancelling_message(tmp_path):
+    """STOP cancels c1 (website, made for REQUEST), and then the user withdraws STOP. REQUEST is
+    the current request again, and the website part stays blocked under it: the part is blocked
+    under the request the graft was made for, not only under the message that cancelled it."""
+    script = CancelThenWithdraw(entries=TWO, ids=["c1"])
+    store, h, _ = make(tmp_path=tmp_path, policy=script)
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)  # c1 website, c2 slides, both for REQUEST
+        task = asyncio.create_task(h.user_says(STOP))  # STOP's turn cancels c1 ...
+        await until(event=script.after_cancel, what="the call after the cancel")
+        task.cancel()  # ... and then the user withdraws STOP
+        script.open("cancel")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(h.until_rest("o"), WAIT_TIMEOUT)
+        script.open()  # c2 joins done: its wake tries the website again
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert store.timeline("c1")["join_reason"] == "cancelled"
+    assert clones(store) == ["c1", "c2"]  # the website part was never cloned again
+    refused = [r["content"] for r in store.view("o") if r["kind"] == "tool_result" and "clone refused" in r["content"]]
+    assert refused and all("was cancelled" in r for r in refused)
+
+
 class RecloneOnCompactingWake(RecloneOnWake):
     """RecloneOnWake, compacting: a summary compaction call (no tools) gets a summary."""
 
