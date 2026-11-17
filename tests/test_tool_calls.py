@@ -1441,3 +1441,28 @@ def test_failing_every_caller_with_an_error_a_future_cannot_carry_gives_each_one
         assert _fail_all(replies=replies, error=StopIteration("a bug")) is True
         return [type(r.exception()).__name__ for r in replies]
     assert asyncio.run(go()) == ["RuntimeError", "RuntimeError"]
+
+
+def test_a_rest_step_that_always_fails_still_answers_the_waiting_call(tmp_path, monkeypatch):
+    """A fault on the way to rest that comes back every time: the user's call gets the error (it
+    fails closed), and settle and close return."""
+    import graft.machine as machine
+
+    def always(ctx, inst, event):
+        raise RuntimeError("INJECTED come_to_rest")
+    monkeypatch.setattr(machine, "come_to_rest", always)
+    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    out = {}
+
+    async def go():
+        await h.start()
+        for key, coro in (("said", lambda: h.user_says(REQUEST)), ("settled", h.settle), ("closed", h.close)):
+            try:
+                await asyncio.wait_for(coro(), WAIT_TIMEOUT)
+                out[key] = "ok"
+            except asyncio.TimeoutError:
+                out[key] = "TIMEOUT"
+            except BaseException as error:  # noqa: BLE001 - what each call raised
+                out[key] = type(error).__name__
+    asyncio.run(go())
+    assert out["said"] == "RuntimeError" and out["settled"] != "TIMEOUT" and out["closed"] == "ok"

@@ -3226,14 +3226,18 @@ def fold_fault(ctx, inst, event) -> None:
 
 def give_up_fault(ctx, inst, event) -> None:
     """A fault past MAX_RECOVERIES in a row: the session gets the record as it stands (with the
-    errors), every caller waiting on the timeline's work gets the error, and the timeline goes on
-    from rest without closing anything out (the waiting messages are still taken, one at a time)."""
+    errors), every caller waiting on the timeline's work gets the error, also those waiting to be
+    answered at rest (a fault that comes back on the way to rest would never let them be: it fails
+    closed), and the timeline goes on from rest without closing anything out (the waiting messages
+    are still taken, one at a time)."""
     fault = _take_fault(inst=inst, event=event)
     inst.faulted = fault.event
     _salvage(inst=inst, event=fault.event)
     inst.stopping, inst.pending = inst.stopping | inst.pending, set()
     _requeue_strays(inst)
-    _restate_and_fail(inst=inst, fault=fault, errors=fault.errors, engaged=False)
+    at_rest = [w.reply for w in inst.waiters]
+    _restate_and_fail(inst=inst, fault=fault, errors=fault.errors, engaged=False, also=at_rest)
+    inst.waiters = [w for w in inst.waiters if not w.reply.done()]
     inst.faulted = None
 
 
