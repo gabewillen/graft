@@ -1034,7 +1034,7 @@ def withdraw_three(tmp_path, monkeypatch, failing):
     real, calls = machine.stop_one, []
 
     def stop(ctx, inst, event):
-        child = inst.stop_target  # the graft this stop was counted for
+        child = inst.stop_try[1] if inst.stop_try and inst.stop_try[0] is event else machine._stop_target(inst)
         calls.append(child)
         if child in failing or failing == "all":
             raise RuntimeError(f"INJECTED stop_one {child}")
@@ -1368,3 +1368,17 @@ def test_an_error_whose_type_name_cannot_be_had_is_described_as_an_error():
         pass
 
     assert described(Odd("its message")) == "error: its message"
+
+
+def test_a_stop_whose_counting_always_fails_is_still_bounded_and_stops_every_graft(tmp_path, monkeypatch):
+    """The bound holds even when the behavior that counts a try fails: the stop counts it itself."""
+    import graft.machine as machine
+    counted = []
+
+    def always(ctx, inst, event):
+        counted.append(1)
+        raise RuntimeError("INJECTED count_stop")
+    monkeypatch.setattr(machine, "count_stop", always)
+    out, calls, world, said = withdraw_three(tmp_path=tmp_path, monkeypatch=monkeypatch, failing=set())
+    assert len(counted) == 3  # one try per graft, each stopped by it
+    assert {"site_write", "slides_create", "calendar_book"} <= world.cancelled

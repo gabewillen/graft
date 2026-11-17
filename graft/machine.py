@@ -466,7 +466,8 @@ class TimelineSM(hsm.Instance):
         # (`stop_one`): each is stopped once.
         self.stopped_unwanted: set[str] = set()
         self.stop_attempts: dict[str, int] = {}  # graft -> stops tried for it (given up at MAX_STOP_ATTEMPTS)
-        self.stop_target: str | None = None  # the graft the stop being tried was counted for
+        # the try of a stop being made: (its event, the graft count_stop picked and counted for it)
+        self.stop_try: tuple[hsm.Event, str] | None = None
         self.stops_told: set[str] = set()  # grafts whose stop was given up and told
         # Cancel calls of a step a recovery ended after it had stopped grafts: each call with what
         # became of its ids, for the recovery to write its real result (it ran: never "not run").
@@ -2029,7 +2030,7 @@ def count_stop(ctx, inst, event) -> None:
     try fails is still counted, and given up at MAX_STOP_ATTEMPTS). The graft is picked here, once,
     and `stop_one` stops that one: the count can take it off the targets before it is stopped."""
     child = _stop_target(inst)
-    inst.stop_target = child
+    inst.stop_try = (event, child)
     inst.stop_attempts[child] = inst.stop_attempts.get(child, 0) + 1
 
 
@@ -2059,8 +2060,13 @@ def stop_one(ctx, inst, event) -> None:
     and a tool it awaits is cancelled where it waits). It is sent first and recorded as stopped
     last, so a step that fails sends nothing, records nothing, and the stop is made again. A graft
     whose machine is gone is recorded and skipped. The graft is the one `count_stop` picked and
-    counted for this try."""
-    child = inst.stop_target
+    counted for this try (the same event), or, if that failed, the one it picks and counts here, so
+    the bound on tries holds whichever of the two fails."""
+    if inst.stop_try is not None and inst.stop_try[0] is event:
+        child = inst.stop_try[1]
+    else:  # count_stop failed this try before it picked one: the stop picks and counts it itself
+        child = _stop_target(inst)
+        inst.stop_attempts[child] = inst.stop_attempts.get(child, 0) + 1
     _forward(target=inst.machines.timelines.get(child), name="cancel")
     inst.stopped_unwanted.add(child)
 
