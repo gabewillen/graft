@@ -205,6 +205,10 @@ HEAD = 0  # the first item of a list: queues and work lists are taken from their
 STOP_NEXT = "stop_next"
 NONE_YET = 0  # a count not started: no attempt, no hand-back, no arrival so far
 STATE_HEAD = 2  # a state path split at its first two separators: '', the model, and the rest
+# What an activity never takes for an outcome: the interpreter's own exits. CancelledError is told
+# apart by the activity's context (see tool_activity); every other exception, Exception or not, is
+# the activity's outcome, so no activity ends without one.
+EXITS = (KeyboardInterrupt, SystemExit, GeneratorExit)
 
 
 class TransitionRefused(Exception):
@@ -1504,7 +1508,9 @@ async def busy_activity(ctx, inst: TimelineSM, event) -> None:
         _close_out(inst)
         _mark_pending(inst)
         outcome = await inst.host.run_busy(tl=inst.timeline_id, mode=inst.mode, kind=inst.kind)
-    except Exception as error:  # noqa: BLE001 - the outcome event carries it
+    except (asyncio.CancelledError, *EXITS):
+        raise
+    except BaseException as error:  # noqa: BLE001 - the outcome event carries it, Exception or not
         if not ctx.is_done():
             inst.dispatch(inst.context(), hsm.Event(name="run_failed", data=error))
         return
@@ -1517,7 +1523,9 @@ async def background_activity(ctx, inst: TimelineSM, event) -> None:
     the run's failure for its tool's; it is sent only while the run's state is still active."""
     try:
         outcome = await inst.host.run_background(tl=inst.timeline_id)
-    except Exception as error:  # noqa: BLE001 - the outcome event carries it
+    except (asyncio.CancelledError, *EXITS):
+        raise
+    except BaseException as error:  # noqa: BLE001 - the outcome event carries it, Exception or not
         if not ctx.is_done():
             inst.dispatch(inst.context(), hsm.Event(name="run_failed", data=error))
         return
@@ -1548,6 +1556,10 @@ async def tool_activity(ctx, inst: TimelineSM, event) -> None:
         if ctx.is_done() or asyncio.current_task().cancelling():
             raise
         content, is_error = call.cancelled, True
+    except EXITS:
+        raise
+    except BaseException:  # noqa: BLE001 - not an Exception (hsm would not tell it): invoked, so it ran
+        content, is_error = call.failed, True
     inst.dispatch(inst.context(), hsm.Event(name="tool_returned", data=(content, is_error)))
 
 

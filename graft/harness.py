@@ -609,7 +609,9 @@ class Harness:
             outcome = self.world.execute(use["name"], use["input"])
             if inspect.isawaitable(outcome):
                 outcome = await outcome
-        except Exception as error:  # noqa: BLE001 - it was invoked: it ran, with an error
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise  # a cancel is the activity's to tell apart (it has the state's context)
+        except BaseException as error:  # noqa: BLE001 - it was invoked: it ran, with an error
             return Ran(f"raised {type(error).__name__}{_shown(error)}; it may have acted"), True
         if not (type(outcome) is tuple and tuple.__len__(outcome) == 2 and isinstance(outcome[0], str)
                 and isinstance(outcome[1], bool)):

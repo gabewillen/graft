@@ -842,3 +842,32 @@ def test_a_tool_whose_error_cannot_be_shown_still_ends_as_run_with_an_error(tmp_
     assert (name, is_error) == ("site_write", True) and content.startswith("raised BadStr")
     assert h.tools_run("c1") == ["site_write (returned an error)"]
 
+
+class Abort(BaseException):
+    pass
+
+
+class ActsThenAborts(World):
+    async def execute(self, name, args):
+        if name == "site_write":
+            raise Abort("host abort")
+        return super().execute(name=name, args=args)
+
+
+def test_a_tool_that_raises_a_base_exception_ends_as_run_with_an_error(tmp_path):
+    store, h, _ = one_background(ActsThenAborts(), tmp_path=tmp_path)
+    assert drive_one(h=h, store=store) == {"joined": True, "settled": True, "closed": True}
+    assert tool_results(store=store, tl="c1") == [("site_write", "raised Abort: host abort; it may have acted", True)]
+
+
+def test_a_run_whose_model_call_raises_a_base_exception_fails_and_does_not_wedge(tmp_path):
+    def policy(system, messages, tools):
+        if "clone" in {t["name"] for t in tools}:
+            return background_original([clone_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
+                                                                                         messages)
+        raise Abort("provider abort")
+
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
+    out = drive_one(h=h, store=store)
+    assert out["joined"] is True and out["closed"] is True and out["settled"] in (True, "raised Abort")
+    assert store.timeline("c1")["join_reason"] == "failed"
