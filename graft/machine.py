@@ -3123,7 +3123,7 @@ def _fail_all(replies: list[asyncio.Future | None], error: BaseException) -> boo
     told = False
     for reply in replies:
         if reply is not None and not reply.done():
-            reply.set_exception(error)
+            _fail(reply=reply, error=error)  # with its fallback for an error a future cannot carry
             told = True
     return told
 

@@ -1407,3 +1407,37 @@ def test_several_kept_errors_that_are_not_exceptions_are_raised_together(tmp_pat
                 out[key] = type(error).__name__
     asyncio.run(go())
     assert "TypeError" not in out.values() and "TIMEOUT" not in out.values() and out["closed"] == "ok"
+
+
+def test_an_effect_that_raises_stop_iteration_fails_its_callers_with_an_error_they_can_carry(tmp_path, monkeypatch):
+    import graft.machine as machine
+
+    def bad(ctx, inst, event):
+        raise StopIteration("a bug")
+    monkeypatch.setattr(machine, "take_message", bad)
+    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    out = {}
+
+    async def go():
+        await h.start()
+        for key, coro in (("said", lambda: h.user_says(REQUEST)), ("settled", h.settle), ("closed", h.close)):
+            try:
+                await asyncio.wait_for(coro(), WAIT_TIMEOUT)
+                out[key] = "ok"
+            except asyncio.TimeoutError:
+                out[key] = "TIMEOUT"
+            except BaseException as error:  # noqa: BLE001 - what each call raised
+                out[key] = type(error).__name__
+    asyncio.run(go())
+    assert out["said"] not in ("TIMEOUT", "ok") and "TIMEOUT" not in out.values() and out["closed"] == "ok"
+
+
+def test_failing_every_caller_with_an_error_a_future_cannot_carry_gives_each_one_it_can():
+    from graft.machine import _fail_all
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        replies = [loop.create_future(), loop.create_future()]
+        assert _fail_all(replies=replies, error=StopIteration("a bug")) is True
+        return [type(r.exception()).__name__ for r in replies]
+    assert asyncio.run(go()) == ["RuntimeError", "RuntimeError"]
