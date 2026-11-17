@@ -1034,7 +1034,7 @@ def withdraw_three(tmp_path, monkeypatch, failing):
     real, calls = machine.stop_one, []
 
     def stop(ctx, inst, event):
-        child = machine._stop_target(inst)
+        child = inst.stop_target  # the graft this stop was counted for
         calls.append(child)
         if child in failing or failing == "all":
             raise RuntimeError(f"INJECTED stop_one {child}")
@@ -1091,5 +1091,7 @@ def test_a_stop_that_always_fails_is_given_up_after_a_bounded_number_of_attempts
 def test_a_graft_whose_stop_always_fails_does_not_keep_the_others_from_stopping(tmp_path, monkeypatch):
     from graft.machine import MAX_STOP_ATTEMPTS
     out, calls, world, _ = withdraw_three(tmp_path=tmp_path, monkeypatch=monkeypatch, failing={"c1"})
-    assert 1 <= calls.count("c1") <= MAX_STOP_ATTEMPTS  # tried, then given up (a try is counted before it runs)
+    # every counted try is made, on its graft: c1's three, then c2's and c3's, never None
+    assert calls[:MAX_STOP_ATTEMPTS] == ["c1"] * MAX_STOP_ATTEMPTS and calls.count("c1") == MAX_STOP_ATTEMPTS
+    assert None not in calls
     assert {"slides_create", "calendar_book"} <= world.cancelled  # c2 and c3 were stopped at the withdrawal
