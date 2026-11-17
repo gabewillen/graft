@@ -29,6 +29,7 @@ class Host:
         self.failing_joins: set[str] = set()
         self.fail_commit = False
         self.hold: asyncio.Future | None = None  # set: a cancelled background run waits for it to end
+        self.hold_tl: str | None = None  # set: only that timeline's cancelled run waits for `hold`
         self.watches: list[tuple[tuple, asyncio.Future]] = []
 
     def record(self, *entry):
@@ -54,7 +55,7 @@ class Host:
             return await self.runs[tl]
         except asyncio.CancelledError:
             self.record("run_cancelled", tl)
-            if self.hold is not None:
+            if self.hold is not None and self.hold_tl in (None, tl):
                 await self.hold
             raise
 
@@ -874,8 +875,10 @@ def test_a_clone_write_that_fails_ends_in_its_handled_state(name, refused):
         assert ("run_cancelled", "o") in host.log and await first == "ended"
         kept = {} if refused else {"k": ("cloned", False)}  # the real result, written by the closing
         assert host.logged("close", "o") == [("close", "o", kept)]
-        if not refused:
-            assert host.status["c1"] == "background"
+        if not refused:  # the clone stands; the withdrawal of the request it was made for stops it
+            if not host.logged("reason", "c1"):
+                await asyncio.wait_for(host.next("reason", "c1"), GUARD)
+            assert host.logged("reason", "c1") == [("reason", "c1", CANCELLED)]
         await m.stop()
     run(go)
 
@@ -1615,12 +1618,15 @@ def test_the_withdrawal_record_holds_only_requests_still_held():
                 await answered(host=host, m=m, reply=again)
         reply = await say(m=m, text="go")
         await clone(m=m, pairs=[("c1", False)])
-        await withdraw(m=m, reply=reply)
+        host.hold, host.hold_tl = asyncio.get_running_loop().create_future(), "c1"  # c1 stops slowly
+        stopping, applied = host.next("run_cancelled", "c1"), host.next("apply", "c1")
+        await withdraw(m=m, reply=reply)  # c1, made for it, is stopped at once (it joins cancelled)
         assert await at_rest(m) == "ended"
+        await asyncio.wait_for(stopping, GUARD)
         kept = await say_as(m=m, text="kept", id=REQUESTS[reply])  # c1 was made for it and has not joined
         assert await asyncio.wait_for(kept, GUARD) == "ended" and not host.logged("request", "o", "kept")
-        host.end("c1")  # it was made before the withdrawal; its run ends now and it joins
-        await asyncio.wait_for(host.next("apply", "c1"), GUARD)
+        host.hold.set_result(None)  # its run ends now, and it joins
+        await asyncio.wait_for(applied, GUARD)
         assert await at_rest(m) == "ended"
         assert host.logged("note") == []  # its join wakes nothing: its request was withdrawn
         again = await say_as(m=m, text="after the join", id=REQUESTS[reply])

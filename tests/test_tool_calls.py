@@ -98,11 +98,13 @@ class Hanging(World):
     def __init__(self):
         super().__init__()
         self.started = asyncio.Event()
+        self.running = threading.Event()  # the same, for a scripted model call in a worker thread
         self.cancelled = False
 
     async def execute(self, name, args):
         if name == "site_write":
             self.started.set()
+            self.running.set()
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
@@ -350,3 +352,83 @@ def test_a_failed_focus_graft_whose_close_out_cannot_be_written_carries_it_with_
     assert tool_results(store=store, tl="c1") == [("site_write", "not executed: the turn was interrupted", True)]
     assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
 
+
+# ------------------------------------------------------------------ a withdrawal stops the background grafts made for it
+def test_a_withdrawal_stops_a_background_graft_whose_tool_awaits_at_once(tmp_path):
+    """The user's call is cancelled before it is answered (the original's run is still going):
+    the background graft made for it stops at the withdrawal, not at its next step."""
+    world, gate = Hanging(), threading.Event()
+
+    def original(last, messages):
+        if last["type"] == "tool_result":
+            assert gate.wait(WAIT_TIMEOUT)
+            return text("Started.")
+        if is_wake(last):
+            return text("Report.")
+        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
+
+    store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=world)
+
+    async def go():
+        await h.start()
+        call = asyncio.create_task(h.user_says(REQUEST))
+        await asyncio.wait_for(world.started.wait(), WAIT_TIMEOUT)
+        call.cancel()
+        gate.set()
+        try:
+            await call
+        except asyncio.CancelledError:
+            pass
+        await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)  # stopped without close
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert world.cancelled and store.timeline("c1")["join_reason"] == "cancelled"
+    assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_WHILE_RUNNING, True)]
+    assert h.tools_run("c1") == ["site_write (returned an error)"] and h.wakes == []
+    assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
+
+
+def test_a_withdrawal_after_the_answer_stops_a_background_graft_whose_tool_awaits_at_once(tmp_path, monkeypatch):
+    """The user's call is cancelled in the tick it is answered (its call not yet done): the cancel
+    wins, and the background graft made for it stops at once."""
+    import graft.machine as machine
+    world = Hanging()
+    late: dict = {}
+    real_rest = machine.come_to_rest
+
+    def come_to_rest(ctx, inst, event):
+        real_rest(ctx=ctx, inst=inst, event=event)
+        task = late.pop("task", None)
+        if task is not None and inst.timeline_id == "o":
+            task.cancel()
+    monkeypatch.setattr(machine, "come_to_rest", come_to_rest)
+
+    def original(last, messages):
+        if last["type"] == "tool_result":
+            assert world.running.wait(WAIT_TIMEOUT)  # the answer comes once the graft's tool waits
+            return text("Started.")
+        if is_wake(last):
+            return text("Report.")
+        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
+
+    store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=world)
+
+    async def go():
+        await h.start()
+        call = late["task"] = asyncio.create_task(h.user_says(REQUEST))
+        try:
+            await asyncio.wait_for(call, WAIT_TIMEOUT)
+        except asyncio.CancelledError:
+            pass
+        assert call.cancelled() and world.started.is_set()
+        await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)  # stopped without close
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert world.cancelled and store.timeline("c1")["join_reason"] == "cancelled"
+    assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_WHILE_RUNNING, True)]
+    assert h.tools_run("c1") == ["site_write (returned an error)"] and h.wakes == []
+    assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
