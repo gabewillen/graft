@@ -522,6 +522,32 @@ def test_a_request_handed_to_a_focus_graft_and_withdrawn_leaves_the_one_before_i
     run(go)
 
 
+def test_a_hand_back_whose_trigger_is_not_a_request_is_counted_under_the_request_it_was_made_for():
+    """The harness names a row for each hand-back that is none of the original's requests (as
+    when a compaction leaves an older row last, or a withdrawal mark failed): the hand-backs are
+    counted under the request the graft was made for, so the second one of the same part blocks
+    it for the current request."""
+    async def go():
+        host, m = await started()
+        real = host.apply_join
+
+        def apply_join(src, join, cloned_for, running):  # a trigger that is not a request
+            committed, _, ends = real(src=src, join=join, cloned_for=cloned_for, running=running)
+            return committed, 999, ends
+        host.apply_join = apply_join
+        await say(m=m, text="go")
+        for child in ("c1", "c2"):
+            focus_runs, waking = host.next("run", child), host.next("run", "o", "wake")
+            await clone(m=m, pairs=[(child, True)], parts=[{"web"}])
+            await asyncio.wait_for(focus_runs, GUARD)
+            host.end(tl=child, result=RunOutcome(kind="join", reason="out_of_scope"))
+            await asyncio.wait_for(waking, GUARD)  # the request came back: a wake answers it
+        _, _, text = await clone(m=m, pairs=[("c3", True)], parts=[{"web"}])
+        assert "handed it back twice" in text and "c3" not in host.status
+        await m.stop()
+    run(go)
+
+
 def test_a_focus_clone_hands_the_conversation_over_and_its_join_goes_last():
     async def go():
         host, m = await started()

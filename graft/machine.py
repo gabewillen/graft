@@ -2844,10 +2844,13 @@ def start_joining(ctx, inst, event) -> None:  # entry of `joining`: a commit poi
 
 def applied(ctx, inst, event) -> None:
     """One join applied: it leaves the queue, the graft is told, and a hand-back is counted under
-    the request the graft was working on (blocking that part if it failed or came back twice)."""
-    committed_, request, ends = event.data
+    the request the graft was working on (blocking that part if it failed or came back twice):
+    the row the harness names, if it is one of the original's requests, else the request the
+    graft was made for (a row that is none of them is a key no bound would ever read)."""
+    committed_, named, ends = event.data
     closed_out(inst)
     join = inst.queue.pop(HEAD)
+    request = named if any(r.row == named for r in inst.asked) else inst.cloned_for.get(join.child)
     inst.grafts.pop(join.child, None)
     inst.stopping.discard(join.child)
     news = (not inst.made.get(join.child) or join.reason != "done") and not _unwanted(inst=inst, child=join.child)
