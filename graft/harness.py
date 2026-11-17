@@ -1130,8 +1130,11 @@ class Harness:
             "clone is already doing it. ")
         cancelled = [c for c, r in joined if r == CANCELLED]
         if cancelled:
+            many = len(cancelled) > 1
             task = (f"You cancelled {', '.join(cancelled)}: tell the user it was stopped and what it had "
-                    "already done. ") + task
+                    f"already done. The part{'s' if many else ''} {', '.join(cancelled)} "
+                    f"{'were' if many else 'was'} doing cannot be cloned again until the user's next "
+                    "message. ") + task
         self.store.add_turn(tl=src, role="user", kind="text", harness=True, content=(
                             f"(harness note: {self._names(clones=[c for c, _ in joined], background=background, named=False)} "
                             f"{names} joined; {where} {self._running_note(running)} "

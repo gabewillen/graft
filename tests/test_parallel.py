@@ -3147,6 +3147,8 @@ def test_a_cancelled_join_wakes_a_full_run_that_clones_another_part(tmp_path):
     asyncio.run(go())
     assert clones(store) == ["c1", "c2", "c3"] and h.part_of("c3") == {"calendar"}
     assert h.wakes[0]["joined"] == [("c1", "cancelled")]
+    note = [r["content"] for r in store.view("o") if r["harness"] and "c1 (cancelled) joined" in r["content"]]
+    assert "The part c1 was doing cannot be cloned again until the user's next message." in note[0]
     refused = [r["content"] for r in store.view("o") if r["kind"] == "tool_result" and "clone refused" in r["content"]]
     assert len(refused) == 1 and "was cancelled" in refused[0]
 
