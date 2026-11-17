@@ -336,11 +336,14 @@ class ToolCall:
     `interrupted`: the result (the harness's own, marked as run) the call is closed with if the
     run is left while the tool runs: it may have acted, or may still act, so it is never closed
     as not run. `cancelled`: its result (also marked as run, an error) when the tool is cancelled
-    by something other than its graft (the host cancelled what it awaited): the run goes on."""
+    by something other than its graft (the host cancelled what it awaited): the run goes on.
+    `failed`: its result (marked as run, an error) when the call fails in a way the host's call did
+    not turn into a result itself (`calling`'s `hsm/error`): it was invoked, so it ran."""
     use: dict
     reply: asyncio.Future
     interrupted: str
     cancelled: str = "cancelled by the tool: it may have acted"  # the harness passes its own, marked run
+    failed: str = "failed after it was invoked: it may have acted"  # likewise
 
 
 class Host(Protocol):
@@ -1527,8 +1530,9 @@ async def tool_activity(ctx, inst: TimelineSM, event) -> None:
     that takes it keeps the result, and `storing` writes the row. Before the tool is invoked the
     call is kept as one that ran (`unstored`, with the run's `interrupted` result), in the step
     that enters this state (the activity starts at once, before its first await): leaving the state
-    cancels the tool where it waits, and the run's closing records it as run with an error. A tool
-    that raises is `hsm/error`."""
+    cancels the tool where it waits, and the run's closing records it as run with an error. The
+    host's call turns whatever the tool raises into a result; a failure it did not (its own) is
+    `hsm/error`, which keeps the call as run, with an error (`tool_raised`)."""
     host, tl, call = inst.host, inst.timeline_id, inst.tool
     # Kept here, in the activity, not by the step's effect: a step that fails holds its activity
     # back, and the call it would have made never runs, so it must close as not run. Only a call
@@ -2206,10 +2210,10 @@ def tool_row_failed_late(ctx, inst, event) -> None:
 
 
 def tool_raised(ctx, inst, event) -> None:
-    """The tool raised: the run ends with its error, and the call is closed as not run."""
-    call, inst.tool = inst.tool, None
-    inst.unstored.pop(call.use["id"], None)
-    _fail(reply=call.reply, error=event.data)
+    """The call failed in `calling` (its activity raised: the host's call itself, after the tool was
+    invoked, since nothing before the invocation raises): it ran, so it is kept as run, with an
+    error, and its row is written next (`storing`); the run goes on."""
+    inst.unstored[inst.tool.use["id"]] = (inst.tool.failed, True)
 
 
 def keep_unstored(ctx, inst, event) -> None:
@@ -3367,7 +3371,7 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
             # a host tool call (activity): leaving the run cancels it where it waits
             "calling", Activity(work=tool_activity, done="tool_returned"),
             T(On("tool_returned"), S("../storing"), Effect(tool_result_kept)),
-            T(On(E), S("../running"), Effect(tool_raised)),
+            T(On(E), S("../storing"), Effect(tool_raised)),
         ),
         hsm.State(
             # its row is written (activity); leaving the run first leaves the real result kept
@@ -3911,7 +3915,7 @@ BACKGROUND = hsm.Define(
                     # a host tool call (activity): leaving `background` cancels it where it waits
                     "calling", Activity(work=tool_activity, done="tool_returned"),
                     _T(_On("tool_returned"), _S("../storing"), Effect(tool_result_kept)),
-                    _T(_On(_E), _S("../stepping"), Effect(tool_raised)),
+                    _T(_On(_E), _S("../storing"), Effect(tool_raised)),
                 ),
                 hsm.State(
                     "storing", Activity(work=store_activity, done="tool_stored"),

@@ -113,6 +113,8 @@ CANCELLED_WHILE_RUNNING = Ran("cancelled while running: it may have acted, or ma
 # A host tool call whose tool was cancelled by something other than its graft (the host cancelled a
 # future or task the tool awaited, while the graft still ran): it ran, with an error.
 CANCELLED_BY_THE_TOOL = Ran("cancelled by the tool: it may have acted")
+# A host tool call that failed after the tool was invoked in a way that gave no result of its own.
+FAILED_AFTER_INVOKED = Ran("failed after it was invoked: it may have acted")
 _NONCE_TAG = re.compile(r"^\[conversation [^\]]*\]\s*")
 # Why a seed row is refused when the user withdrew the message it holds (spec: State machine).
 WITHDRAWN_SEED = "row {row} is a message the user withdrew; it is not a request and cannot be seeded"
@@ -205,6 +207,16 @@ def _echo(value: object) -> str:
     if not isinstance(value, str):
         return f"a {type(value).__name__}"
     return repr(value) if len(value) <= ECHO_CHARS else repr(value[:ECHO_CHARS]) + "..."
+
+
+def _shown(error: BaseException) -> str:
+    """A tool's own error, shown after its type: ': message' cut short, or nothing if its message
+    cannot be had (its __str__ raises)."""
+    try:
+        text = str(error)
+    except Exception:  # noqa: BLE001 - its message cannot be had: its type alone is shown
+        return ""
+    return f": {text[:ERROR_CHARS]}"
 
 
 def cancel_ids(args: object, limit: int) -> tuple[list[str], list[str]]:
@@ -598,12 +610,12 @@ class Harness:
             if inspect.isawaitable(outcome):
                 outcome = await outcome
         except Exception as error:  # noqa: BLE001 - it was invoked: it ran, with an error
-            return Ran(f"raised {type(error).__name__}: {str(error)[:ERROR_CHARS]}; it may have acted"), True
-        if not (isinstance(outcome, tuple) and len(outcome) == 2 and isinstance(outcome[0], str)
+            return Ran(f"raised {type(error).__name__}{_shown(error)}; it may have acted"), True
+        if not (type(outcome) is tuple and tuple.__len__(outcome) == 2 and isinstance(outcome[0], str)
                 and isinstance(outcome[1], bool)):
             return Ran(f"returned a {type(outcome).__name__}, not (text, is_error); it may have acted"), True
         content, err = outcome
-        return Ran(content), err
+        return Ran(str.__str__(content)), err
 
     def close_tool_uses(self, tl: str, known: dict[str, tuple[str, bool]]) -> None:
         self._close_tool_uses(tl=tl, known=known)
@@ -1002,7 +1014,8 @@ class Harness:
                     await self._store_ran(tl=tl, result=ToolResult(use=u, content=content, is_error=err))
                 else:  # the activity of the machine's `calling` state; it also writes the result row
                     await self.machines.ask(tl=tl, name="tool_request", build=lambda reply, u=u: ToolCall(
-                        use=u, reply=reply, interrupted=CANCELLED_WHILE_RUNNING, cancelled=CANCELLED_BY_THE_TOOL))
+                        use=u, reply=reply, interrupted=CANCELLED_WHILE_RUNNING, cancelled=CANCELLED_BY_THE_TOOL,
+                        failed=FAILED_AFTER_INVOKED))
             # The cancel calls run after every other call's result is stored: one request to the
             # machine, which stores each call's real result once the grafts have stopped.
             if cancels:

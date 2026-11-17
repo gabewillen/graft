@@ -784,3 +784,61 @@ def test_a_withdrawal_stops_several_background_grafts_whose_tools_await(tmp_path
     for c in ("c1", "c2", "c3"):
         assert store.timeline(c)["join_reason"] == "cancelled"
         assert [content for _, content, _ in tool_results(store=store, tl=c)] == [CANCELLED_WHILE_RUNNING]
+
+
+# ------------------------------------------------------------------ whatever a tool raises, once invoked it ran
+FAILED_AFTER_INVOKED = "failed after it was invoked: it may have acted"
+
+
+def drive_one(h, store):
+    """One background graft's run; whether it joined, settle returned and close returned."""
+    out = {}
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        for key, coro in (("joined", lambda: h.join_queued("c1")), ("settled", h.settle), ("closed", h.close)):
+            try:
+                await asyncio.wait_for(coro(), WAIT_TIMEOUT)
+                out[key] = True
+            except asyncio.TimeoutError:
+                out[key] = False
+            except Exception as error:  # noqa: BLE001 - a failure told meanwhile
+                out[key] = f"raised {type(error).__name__}"
+    asyncio.run(go())
+    return out
+
+
+def test_a_harness_tool_call_that_fails_after_the_tool_ran_keeps_the_call_as_run(tmp_path):
+    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    real = h.call_tool
+
+    async def broken(**kw):
+        await real(**kw)
+        raise RuntimeError("after the tool")
+    h.call_tool = broken
+    assert drive_one(h=h, store=store)["joined"] is True
+    assert tool_results(store=store, tl="c1") == [("site_write", FAILED_AFTER_INVOKED, True)]
+    assert h.world.site and h.tools_run("c1") == ["site_write (returned an error)"]
+    assert store.timeline("c1")["join_reason"] == "done"  # its run went on
+
+
+class BadStr(Exception):
+    def __str__(self):
+        raise RuntimeError("no str")
+
+
+class ActsThenBadStr(World):
+    async def execute(self, name, args):
+        if name == "site_write":
+            raise BadStr()
+        return super().execute(name=name, args=args)
+
+
+def test_a_tool_whose_error_cannot_be_shown_still_ends_as_run_with_an_error(tmp_path):
+    store, h, _ = one_background(ActsThenBadStr(), tmp_path=tmp_path)
+    assert drive_one(h=h, store=store)["joined"] is True
+    (name, content, is_error), = tool_results(store=store, tl="c1")
+    assert (name, is_error) == ("site_write", True) and content.startswith("raised BadStr")
+    assert h.tools_run("c1") == ["site_write (returned an error)"]
+
