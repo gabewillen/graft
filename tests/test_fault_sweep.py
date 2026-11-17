@@ -681,9 +681,6 @@ UNREACHED: dict[str, str] = {
     # the backstop: a graft that takes a step after its request was withdrawn, before the original
     # stood to stop it (the original stops it first in every scenario)
     "stop_graft": _TIMING,
-    # a stop given up: reached only once a graft's stop has failed MAX_STOP_ATTEMPTS times (the sweep
-    # raises twice at most)
-    "tell_given_up": _THIRD,
     # `calling`'s error: the activity turns every failure of the host's call into its outcome, so
     # only its own code raising (before or after the call) reaches it
     "tool_raised": "reached only if tool_activity's own code raises (it maps every failure of the host's call to its outcome)",
