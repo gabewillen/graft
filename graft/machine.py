@@ -84,9 +84,10 @@ marks that request's row, and then at rest):
           run         a run of the model loop: its activity
           driven      a turn its caller drives (tests, replay): no activity
             running
-            calling     a host tool call (activity: the tool, awaited if it returns an awaitable,
-                        then its result row); leaving the run cancels it where it waits, and the
-                        run's closing records it as run with an error (it may have acted)
+            calling     a host tool call (activity: the tool, awaited if it returns an awaitable);
+                        leaving the run cancels it where it waits, and the run's closing records
+                        it as run with an error (it may have acted)
+            storing     the result row of a tool that returned (activity)
             clone_gate  (choice) may the clone call be tried at all; decided before seeding
             preparing   the harness seeds and validates the call (activity; leaving the run ends it)
             prepared_gate, clone_choice, handed, cancels_done, resume   choices (cancels whose rows
@@ -139,7 +140,7 @@ marks that request's row, and then at rest):
                       not; queued passes a user message back to its source once; a fault that
                       ends a step in a final state other than joined or abandoned has closed)
 
-A background graft: `background` (its run, `running`, in `stepping` or `calling` a host tool
+A background graft: `background` (its run, `running`, in `stepping`, `calling` a host tool or `storing` its row
 (activity, as above); or `held` when a caller drives the turn that made it; never entered if the
 request it was made for was withdrawn before it was made)
 --finish (`ending`, a choice on how the run ended) | cancel | shutdown | join (forced) | error
@@ -1521,21 +1522,18 @@ async def background_activity(ctx, inst: TimelineSM, event) -> None:
 
 
 async def tool_activity(ctx, inst: TimelineSM, event) -> None:
-    """A host tool call of the run (the activity of `calling`): the tool runs, awaited if it
-    returns an awaitable, and its result row is written in the same activity, so no step comes
-    between a tool that returned and its row. Before the tool is called the call is kept as one
-    that ran (`unstored`, with the run's `interrupted` result): leaving the state cancels the
-    tool where it waits, and the run's closing records it as run with an error, since it may
-    have acted before it stopped. Once the tool returns, its real result replaces that one before
-    the row is written, so a run left after a row that could not be written (before the outcome is
-    taken) closes the call with what it returned. The outcome is `tool_ran`: the result and, if
-    its row could not be written, that error. A tool that raises is `hsm/error`. Its inputs are
-    taken before its first await (`known` is the record the run's closing reads)."""
-    host, tl, call, known = inst.host, inst.timeline_id, inst.tool, inst.unstored
-    # Kept here, in the activity, not by the step that entered `calling`: a step that fails holds
-    # its activity back, and the call it would have made never runs, so it must close as not run.
-    # Only a call this activity is about to invoke is kept as one that ran.
-    known[call.use["id"]] = (call.interrupted, True)
+    """A host tool call of the run (the activity of `calling`): it only invokes the tool, awaited
+    if it returns an awaitable, and reports the result as its outcome, `tool_returned`; the step
+    that takes it keeps the result, and `storing` writes the row. Before the tool is invoked the
+    call is kept as one that ran (`unstored`, with the run's `interrupted` result), in the step
+    that enters this state (the activity starts at once, before its first await): leaving the state
+    cancels the tool where it waits, and the run's closing records it as run with an error. A tool
+    that raises is `hsm/error`."""
+    host, tl, call = inst.host, inst.timeline_id, inst.tool
+    # Kept here, in the activity, not by the step's effect: a step that fails holds its activity
+    # back, and the call it would have made never runs, so it must close as not run. Only a call
+    # this activity is about to invoke is kept as one that ran.
+    inst.unstored[call.use["id"]] = (call.interrupted, True)
     try:
         content, is_error = await host.call_tool(tl=tl, use=call.use)
     except asyncio.CancelledError:
@@ -1546,13 +1544,21 @@ async def tool_activity(ctx, inst: TimelineSM, event) -> None:
         if ctx.is_done() or asyncio.current_task().cancelling():
             raise
         content, is_error = call.cancelled, True
-    known[call.use["id"]] = (content, is_error)
+    inst.dispatch(inst.context(), hsm.Event(name="tool_returned", data=(content, is_error)))
+
+
+async def store_activity(ctx, inst: TimelineSM, event) -> None:
+    """The row of a host tool call that returned (the activity of `storing`). Its outcome is
+    `tool_stored`, or `tool_unstored` with the write's error (a named outcome, not `hsm/error`: an
+    error that came after the run was left must not be taken for a later state's own)."""
+    host, tl, call = inst.host, inst.timeline_id, inst.tool
+    content, is_error = inst.unstored[call.use["id"]]
     try:
         host.store_result(tl=tl, use=call.use, content=content, is_error=is_error)
     except Exception as error:  # noqa: BLE001 - the outcome event carries it
-        inst.dispatch(inst.context(), hsm.Event(name="tool_ran", data=(content, is_error, error)))
+        inst.dispatch(inst.context(), hsm.Event(name="tool_unstored", data=error))
         return
-    inst.dispatch(inst.context(), hsm.Event(name="tool_ran", data=(content, is_error, None)))
+    inst.dispatch(inst.context(), hsm.Event(name="tool_stored"))
 
 
 async def prepare_activity(ctx, inst: TimelineSM, event) -> None:
@@ -2164,28 +2170,39 @@ def take_tool(ctx, inst, event) -> None:
     inst.tool = event.data
 
 
-def tool_returned(ctx, inst, event) -> None:
-    """The tool returned and its row was written: the run goes on. If the row could not be
-    written, the real result is kept for the run's closing (it ran) and the run ends with the
-    error. Its trace line goes through the scribe, so a trace that fails never touches the result."""
-    call, inst.tool = inst.tool, None
-    content, is_error, error = event.data
+def tool_result_kept(ctx, inst, event) -> None:
+    """The tool returned: its real result replaces the one it was kept with, before its row is
+    written (`storing`), so a run left before the row is written closes the call with it."""
+    inst.unstored[inst.tool.use["id"]] = event.data
+
+
+def _trace_tool(inst: TimelineSM, call: ToolCall, content: str) -> None:
+    """The call's trace line goes through the scribe, so a trace that fails never touches the result."""
     _note(inst=inst, method="trace_line", text=f"[{inst.timeline_id}] tool {call.use['name']}"
                                           f"({json.dumps(call.use['input'])[:120]}) -> {content[:80]}")
-    if error is None:
-        inst.unstored.pop(call.use["id"], None)
-        _resolve(reply=call.reply)
-    else:
-        inst.unstored[call.use["id"]] = (content, is_error)
-        _fail(reply=call.reply, error=error)
 
 
-def tool_ran_late(ctx, inst, event) -> None:
-    """A tool's outcome that came after its run was left (the run's closing already wrote what it
-    knew of the call): a row write that failed is still told, once; nothing else is done."""
-    _content, _is_error, error = event.data
-    if error is not None:
-        _report(inst=inst, kind="task", clones=[inst.timeline_id], error=error, src=inst.source_id)
+def tool_row_written(ctx, inst, event) -> None:
+    """Its row is written: the run goes on."""
+    call, inst.tool = inst.tool, None
+    content, _ = inst.unstored.pop(call.use["id"])
+    _trace_tool(inst=inst, call=call, content=content)
+    _resolve(reply=call.reply)
+
+
+def tool_row_failed(ctx, inst, event) -> None:
+    """Its row could not be written: the real result stays kept for the run's closing (it ran), and
+    the run ends with the error."""
+    call, inst.tool = inst.tool, None
+    content, _ = inst.unstored[call.use["id"]]
+    _trace_tool(inst=inst, call=call, content=content)
+    _fail(reply=call.reply, error=event.data)
+
+
+def tool_row_failed_late(ctx, inst, event) -> None:
+    """A row write's failure that came after its run was left (the run's closing already wrote what
+    it knew of the call): it is still told, once."""
+    _report(inst=inst, kind="task", clones=[inst.timeline_id], error=event.data, src=inst.source_id)
 
 
 def tool_raised(ctx, inst, event) -> None:
@@ -3348,9 +3365,15 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
         ),
         hsm.State(
             # a host tool call (activity): leaving the run cancels it where it waits
-            "calling", Activity(work=tool_activity, done="tool_ran"),
-            T(On("tool_ran"), S("../running"), Effect(tool_returned)),
+            "calling", Activity(work=tool_activity, done="tool_returned"),
+            T(On("tool_returned"), S("../storing"), Effect(tool_result_kept)),
             T(On(E), S("../running"), Effect(tool_raised)),
+        ),
+        hsm.State(
+            # its row is written (activity); leaving the run first leaves the real result kept
+            "storing", Activity(work=store_activity, done="tool_stored"),
+            T(On("tool_stored"), S("../running"), Effect(tool_row_written)),
+            T(On("tool_unstored", E), S("../running"), Effect(tool_row_failed)),
         ),
         hsm.Choice(
             "cancel_gate",  # a step that failed taking the cancels does not carry them out: the
@@ -3552,7 +3575,8 @@ def _timeline(name: str) -> hsm.Model:
         T(On("clone_request"), Call(refuse_clone_call)),
         T(On("cancel_request"), Call(refuse_cancel_call)),
         T(On("poke", "shutdown", "check"), Call(ignore)),
-        T(On("tool_ran"), Call(tool_ran_late)),  # its run was left before the tool's outcome was taken
+        T(On("tool_returned", "tool_stored"), Call(ignore)),  # its run was left: the closing wrote the call
+        T(On("tool_unstored"), Call(tool_row_failed_late)),  # its run was left before the write's failure was taken
         T(On("stop_next"), Call(stop_next)),  # a graft stopped for a withdrawal has the cancel
         # a run that raised during a step that then ended it (a hand-over, its request withdrawn)
         T(On("run_failed"), Call(run_failed_after_it_ended)),
@@ -3853,7 +3877,8 @@ BACKGROUND = hsm.Define(
     _T(_On("cancel_request"), Effect(refuse_cancel_call)),
     _T(_On("clone_request"), Effect(refuse_clone_call)),
     _T(_On("shutdown", "finish", "closing"), Effect(ignore)),
-    _T(_On("tool_ran"), Effect(tool_ran_late)),  # its run was left before the tool's outcome was taken
+    _T(_On("tool_returned", "tool_stored"), Effect(ignore)),  # its run was left: the closing wrote the call
+    _T(_On("tool_unstored"), Effect(tool_row_failed_late)),  # its run was left before the write's failure was taken
     _T(_On("cancel"), Effect(relay_stop)),  # it has stopped already: a stop for a withdrawal goes on
     _T(_On(FAULT), Effect(bg_fault_at_end)),  # joined, abandoned: the fault is told
     hsm.State(
@@ -3884,9 +3909,14 @@ BACKGROUND = hsm.Define(
                 hsm.State("stepping", _T(_On("tool_request"), _S("../calling"), Effect(take_tool))),
                 hsm.State(
                     # a host tool call (activity): leaving `background` cancels it where it waits
-                    "calling", Activity(work=tool_activity, done="tool_ran"),
-                    _T(_On("tool_ran"), _S("../stepping"), Effect(tool_returned)),
+                    "calling", Activity(work=tool_activity, done="tool_returned"),
+                    _T(_On("tool_returned"), _S("../storing"), Effect(tool_result_kept)),
                     _T(_On(_E), _S("../stepping"), Effect(tool_raised)),
+                ),
+                hsm.State(
+                    "storing", Activity(work=store_activity, done="tool_stored"),
+                    _T(_On("tool_stored"), _S("../stepping"), Effect(tool_row_written)),
+                    _T(_On("tool_unstored", _E), _S("../stepping"), Effect(tool_row_failed)),
                 ),
             ),
         ),

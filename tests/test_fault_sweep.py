@@ -602,7 +602,7 @@ UNREACHED: dict[str, str] = {
     **dict.fromkeys(["drop_message", "request_dropped", "request_held", "withdraws_waiting", "withdraw_and_forward",
                      "stash_and_engage", "take_handed_and_begin", "take_handed_and_engage", "return_to_source",
                      "s_withdraw", "one_of_pending", "refuse_cancel_call", "refuse_clone_call", "drop_clone",
-                     "keep_unstored", "bg_fault_noted", "close_and_release", "tool_ran_late"], _TIMING),
+                     "keep_unstored", "bg_fault_noted", "close_and_release", "tool_row_failed_late"], _TIMING),
     **dict.fromkeys(["fold_fault", "give_up_fault", "fault_releasing", "recovery_failed", "restating_again",
                      "restate_through_focus_again", "_closing_out", "close_out_failed"], _THIRD),
     **dict.fromkeys(["s_shut_late", "s_stop_crashed", "s_take_stop_errors", "s_tell_crashed", "s_keep_lost_line"],
@@ -692,7 +692,8 @@ def test_the_sweep_leaves_out_only_plumbing_builders_and_activities():
     activities = {n for n in every if inspect.iscoroutinefunction(getattr(machine, n))}
     assert every - set(functions()) == EXCLUDED | activities
     assert activities == {"busy_activity", "background_activity", "prepare_activity", "spawn_activity",
-                          "unspawn_activity", "s_stop_machines", "tool_activity"}
+                          "unspawn_activity", "s_stop_machines", "tool_activity",
+                          "store_activity"}
 
 
 # ---------------------------------------------------------------- regressions (run by default)

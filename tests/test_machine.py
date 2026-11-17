@@ -2245,6 +2245,25 @@ def test_no_activity_reads_its_machine_s_data_after_it_first_awaits():
             after = any((node.lineno, node.col_offset) > (a.end_lineno, a.end_col_offset) for a in awaits)
             if after or id(node) in looped:
                 late.append(f"{name}: inst.{node.attr} (line {node.lineno})")
+        # nor through a name bound to its data before the await: a container of the machine's
+        # data read or written by subscript after it is the machine's data all the same
+        aliases = {target.id for n in ast.walk(body) if isinstance(n, ast.Assign)
+                   for target in (t for t in n.targets for t in (t.elts if isinstance(t, ast.Tuple) else [t]))
+                   if isinstance(target, ast.Name)}
+        bound = set()
+        for n in ast.walk(body):
+            if isinstance(n, ast.Assign):
+                values = n.value.elts if isinstance(n.value, ast.Tuple) else [n.value]
+                targets = [t for t in n.targets for t in (t.elts if isinstance(t, ast.Tuple) else [t])]
+                for target, value in zip(targets, values):
+                    if (isinstance(target, ast.Name) and isinstance(value, ast.Attribute)
+                            and isinstance(value.value, ast.Name) and value.value.id == "inst"):
+                        bound.add(target.id)
+        for node in ast.walk(body):
+            if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in bound
+                    and node.value.id in aliases
+                    and any((node.lineno, node.col_offset) > (a.end_lineno, a.end_col_offset) for a in awaits)):
+                late.append(f"{name}: {node.value.id}[...] (line {node.lineno}), the machine's data")
     assert late == []
 
 

@@ -438,7 +438,7 @@ def test_a_withdrawal_after_the_answer_stops_a_background_graft_whose_tool_await
 
 def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_result(tmp_path):
     """The tool returns, its row cannot be written, and a withdrawal is taken before the
-    activity's outcome (`tool_ran`): the call is closed with what the tool returned, marked run,
+    row write's outcome is taken (`storing`): the call is closed with what the tool returned, marked run,
     not as cut short."""
     def original(last, messages):
         if last["type"] == "tool_result" or last.get("harness"):
