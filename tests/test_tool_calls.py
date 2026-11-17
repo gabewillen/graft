@@ -658,3 +658,34 @@ def test_a_trace_callback_that_raises_leaves_the_tool_s_result_alone(tmp_path):
     run_one(h)
     assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]
     assert h.tools_run("c1") == ["site_write"]
+
+
+def test_a_graft_whose_join_is_abandoned_still_writes_the_close_out_it_carried(tmp_path):
+    from graft.machine import MAX_JOIN_ATTEMPTS
+    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
+    fail_once(h=h, name="store_result")
+    fail_once(h=h, name="close_tool_uses")
+
+    def never(**kw):
+        raise OSError("bad row")
+    h.default_join = never
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)
+        for _ in range(MAX_JOIN_ATTEMPTS + 1):
+            if store.timeline("c1")["status"] == "abandoned":
+                break
+            await asyncio.wait_for(h.drain_and_wake("o"), WAIT_TIMEOUT)
+        try:
+            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        except Exception:  # noqa: BLE001 - the failures told meanwhile
+            pass
+        await h.close()
+
+    asyncio.run(go())
+    assert store.timeline("c1")["status"] == "abandoned"
+    assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]
+    assert violations(store=store, tl="c1") == []

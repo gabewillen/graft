@@ -2824,6 +2824,13 @@ def join_raised(ctx, inst, event) -> None:
     _send_join(inst)
 
 
+def close_abandoned(ctx, inst, event) -> None:
+    """Its join was given up, so the close-out it carried (`unclosed`) will not be written with it:
+    the scribe writes it into its own timeline (a write that fails is told and kept for settle)."""
+    if inst.unclosed is not None:
+        _note(inst=inst, method="close_tool_uses", tl=inst.timeline_id, known=dict(inst.unclosed))
+
+
 def relay_stop(ctx, inst, event) -> None:
     """A cancel its source sent because the request it was made for was withdrawn (`STOP_NEXT`):
     the source is told it has it, so it stops its next such graft."""
@@ -3805,7 +3812,7 @@ def _timeline(name: str) -> hsm.Model:
             mirrored("queued"),
             T(On(FAULT), S("../resending"), Effect(take_end_fault)),
             T(On("join_commit", "join_rollback"), S("../joined"), into("joined")),
-            T(On("join_abandon"), S("../abandoned"), into("abandoned")),
+            T(On("join_abandon"), S("../abandoned"), into("abandoned"), Effect(close_abandoned)),
             # a withdrawal reaches a focus graft only from its source: here it holds no request,
             # so the withdrawal changes nothing (top level) and is not sent back
             # a message that reached it after its join: passed back once, as one its source keeps
@@ -3917,7 +3924,7 @@ BACKGROUND = hsm.Define(
         "queued",
         mirrored("queued"),
         _T(_On("join_commit", "join_rollback"), _S("../joined"), into("joined")),
-        _T(_On("join_abandon"), _S("../abandoned"), into("abandoned")),
+        _T(_On("join_abandon"), _S("../abandoned"), into("abandoned"), Effect(close_abandoned)),
         _T(_On(FAULT), _S("../resending"), Effect(bg_take_end_fault)),
     ),
     hsm.Choice(
