@@ -468,6 +468,7 @@ class TimelineSM(hsm.Instance):
         self.stop_attempts: dict[str, int] = {}  # graft -> stops tried for it (given up at MAX_STOP_ATTEMPTS)
         # the try of a stop being made: (its event, the graft count_stop picked and counted for it)
         self.stop_try: tuple[hsm.Event, str] | None = None
+        self.stop_counted: hsm.Event | None = None  # the tick whose try was last counted
         self.stops_told: set[str] = set()  # grafts whose stop was given up and told
         # Cancel calls of a step a recovery ended after it had stopped grafts: each call with what
         # became of its ids, for the recovery to write its real result (it ran: never "not run").
@@ -2031,7 +2032,22 @@ def count_stop(ctx, inst, event) -> None:
     and `stop_one` stops that one: the count can take it off the targets before it is stopped."""
     child = _stop_target(inst)
     inst.stop_try = (event, child)
-    inst.stop_attempts[child] = inst.stop_attempts.get(child, 0) + 1
+    _count_try(inst=inst, child=child, tick=event)
+
+
+def _count_try(inst: TimelineSM, child: str | None, tick: hsm.Event | None) -> None:
+    """One try of a stop of `child`, for the tick it was made on (counted once per tick)."""
+    if child is not None:
+        inst.stop_attempts[child] = inst.stop_attempts.get(child, 0) + 1
+    inst.stop_counted = tick
+
+
+def _count_failed_stop(inst: TimelineSM, fault: "Fault") -> None:
+    """The fault path counts a stop's try whose step failed before it was counted (both the counting
+    and the stop raised): the bound on tries holds whatever of the step fails."""
+    tick = fault.event
+    if tick is not None and tick.name == "stop_tick" and inst.stop_counted is not tick:
+        _count_try(inst=inst, child=_stop_target(inst), tick=tick)
 
 
 def tell_given_up(ctx, inst, event) -> None:
@@ -2066,7 +2082,7 @@ def stop_one(ctx, inst, event) -> None:
         child = inst.stop_try[1]
     else:  # count_stop failed this try before it picked one: the stop picks and counts it itself
         child = _stop_target(inst)
-        inst.stop_attempts[child] = inst.stop_attempts.get(child, 0) + 1
+        _count_try(inst=inst, child=child, tick=event)
     _forward(target=inst.machines.timelines.get(child), name="cancel")
     inst.stopped_unwanted.add(child)
 
@@ -3204,6 +3220,7 @@ def begin_recovery(ctx, inst, event) -> None:
     joins are applied when they come. Safe to run again for the same fault (a handling of it that
     raised): what it keeps is kept once."""
     fault = _take_fault(inst=inst, event=event)
+    _count_failed_stop(inst=inst, fault=fault)
     inst.handling, inst.faulted = fault, fault.event
     inst.recoveries += 1
     inst.recovery = list(fault.errors) + [e for e in inst.recovery if all(e is not x for x in fault.errors)]
@@ -3231,6 +3248,7 @@ def give_up_fault(ctx, inst, event) -> None:
     closed), and the timeline goes on from rest without closing anything out (the waiting messages
     are still taken, one at a time)."""
     fault = _take_fault(inst=inst, event=event)
+    _count_failed_stop(inst=inst, fault=fault)
     inst.faulted = fault.event
     _salvage(inst=inst, event=fault.event)
     inst.stopping, inst.pending = inst.stopping | inst.pending, set()
@@ -3272,6 +3290,7 @@ def fault_suspended(ctx, inst, event) -> None:
     calls waiting on it): the messages it still holds (one its step did not forward, waiting
     messages not handed over) get the error, and the session its record."""
     fault = _take_fault(inst=inst, event=event)
+    _count_failed_stop(inst=inst, fault=fault)
     inst.faulted = fault.event
     held = list(inst.inbox)
     _salvage(inst=inst, event=fault.event)

@@ -1466,3 +1466,19 @@ def test_a_rest_step_that_always_fails_still_answers_the_waiting_call(tmp_path, 
                 out[key] = type(error).__name__
     asyncio.run(go())
     assert out["said"] == "RuntimeError" and out["settled"] != "TIMEOUT" and out["closed"] == "ok"
+
+
+def test_a_stop_whose_counting_and_stopping_both_always_fail_is_still_given_up(tmp_path, monkeypatch):
+    """A double fault: the try is counted on the fault path, so the bound holds and each stop is
+    given up after MAX_STOP_ATTEMPTS."""
+    import graft.machine as machine
+    from graft.machine import MAX_STOP_ATTEMPTS
+    counted = []
+
+    def count_always(ctx, inst, event):
+        counted.append(1)
+        raise RuntimeError("INJECTED count_stop")
+    monkeypatch.setattr(machine, "count_stop", count_always)
+    out, calls, world, said = withdraw_three(tmp_path=tmp_path, monkeypatch=monkeypatch, failing="all")
+    assert len(calls) == 3 * MAX_STOP_ATTEMPTS and len(counted) == 3 * MAX_STOP_ATTEMPTS
+    assert any("could not be stopped" in line for line in said)
