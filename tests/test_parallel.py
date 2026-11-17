@@ -3204,6 +3204,66 @@ def test_a_withdrawn_message_does_not_lift_the_block_on_a_cancelled_part(tmp_pat
     assert refused and all("was cancelled" in r for r in refused)
 
 
+@pytest.mark.parametrize("how", ["in_run", "dropped", "mixed"])
+def test_the_cap_survives_repeated_write_and_withdraw_cycles(tmp_path, monkeypatch, how):
+    """Cap 1: M1 commits its one clone call. Then 4 messages are each written and withdrawn
+    (during their run, or as their row is written). None of them is a request any more, so the
+    wake for M1's graft is still refused by the cap."""
+    import graft.machine as machine_module
+    monkeypatch.setattr(machine_module, "MAX_CLONE_CALLS_PER_MESSAGE", 1)
+    gate, entered, released = threading.Event(), threading.Event(), threading.Event()
+
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" not in names:
+            assert released.wait(GATE_TIMEOUT)
+            return text("site done")
+        if last["type"] == "tool_result":
+            return text("ok")
+        if is_wake(last):
+            return [clone_use(clone_entry(skills=["slides"], focus=False), id=f"w{len(messages)}") | {"type": "tool_use"}]
+        if last["type"] == "text" and last["text"].startswith("M"):
+            entered.set()
+            gate.wait(GATE_TIMEOUT)
+            return text("late")
+        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
+
+    store, h, _ = make(tmp_path, policy)
+    real = h.begin_request
+    task = {}
+
+    def begin_request(**kw):  # a dropped message is withdrawn as its row is written
+        result = real(**kw)
+        if task.get("drop") and not task["t"].done():
+            task["t"].cancel()
+        return result
+    h.begin_request = begin_request
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)  # c1, count 1 (cap reached)
+        for i in range(4):
+            drop = how == "dropped" or (how == "mixed" and i % 2)
+            gate.clear()
+            entered.clear()
+            task["drop"] = drop
+            task["t"] = asyncio.create_task(h.user_says(f"M{i}"))
+            if not drop:
+                await until(event=entered, what="M run")
+                task["t"].cancel()
+                gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task["t"]
+            await asyncio.wait_for(h.until_rest("o"), 5)
+        released.set()
+        await asyncio.wait_for(h.settle(), 10)
+        await h.close()
+
+    asyncio.run(go())
+    assert clones(store) == ["c1"]  # the wake's clone of the slides was refused by the cap
+
+
 class RecloneOnCompactingWake(RecloneOnWake):
     """RecloneOnWake, compacting: a summary compaction call (no tools) gets a summary."""
 
