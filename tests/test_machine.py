@@ -10,7 +10,7 @@ import asyncio
 import pytest
 
 from graft.machine import (CANCELLED, MAX_JOIN_ATTEMPTS, MAX_LIVE_BACKGROUND, Cancel, CancelCall, Clone, Prepared,
-                           Request, RunOutcome,
+                           Request, RunOutcome, ToolCall,
                            Machines, Mode, QueuedJoin, TransitionRefused)
 
 GUARD = 5  # seconds: a wait that should end at once fails the test instead of hanging it
@@ -30,6 +30,7 @@ class Host:
         self.fail_commit = False
         self.hold: asyncio.Future | None = None  # set: a cancelled background run waits for it to end
         self.hold_tl: str | None = None  # set: only that timeline's cancelled run waits for `hold`
+        self.tool_gate: asyncio.Future | None = None  # set: a host tool call waits for it
         self.watches: list[tuple[tuple, asyncio.Future]] = []
 
     def record(self, *entry):
@@ -105,6 +106,8 @@ class Host:
 
     async def call_tool(self, tl, use):
         self.record("tool", tl, use["id"])
+        if self.tool_gate is not None:
+            await self.tool_gate
         return "ran", False
 
     def close_tool_uses(self, tl, known):
@@ -2256,5 +2259,26 @@ def test_a_withdrawal_stops_every_graft_made_for_it_even_when_one_machine_is_gon
         await withdraw(m=m, reply=reply)
         await asyncio.wait_for(stopped, GUARD)
         assert host.logged("run_cancelled", "g1") and host.logged("run_cancelled", "g2")
+        await m.stop()
+    run(go)
+
+
+def test_a_background_run_that_fails_while_its_tool_waits_is_taken_as_the_run_s_failure():
+    """The run's failure is its own event: a `calling` state never takes it for its tool's."""
+    async def go():
+        host, m = await started()
+        await say(m=m, text="go")
+        await clone(m=m, pairs=[("g0", False)])
+        if "g0" not in host.runs:
+            await asyncio.wait_for(host.next("run", "g0"), GUARD)
+        host.tool_gate = asyncio.get_running_loop().create_future()
+        calling = host.next("tool", "g0")
+        m.post(tl="g0", name="tool_request", data=ToolCall(use={"id": "t1", "name": "x", "input": {}},
+                                                           reply=m.future(), interrupted="cut short"))
+        await asyncio.wait_for(calling, GUARD)
+        recorded = host.next("reason", "g0")
+        host.fail("g0", RuntimeError("run down"))
+        assert await asyncio.wait_for(recorded, GUARD) == ("reason", "g0", "failed")
+        assert host.logged("close", "g0") == [("close", "g0", {"t1": ("cut short", True)})]
         await m.stop()
     run(go)

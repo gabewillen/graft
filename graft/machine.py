@@ -1508,7 +1508,15 @@ async def busy_activity(ctx, inst: TimelineSM, event) -> None:
 
 
 async def background_activity(ctx, inst: TimelineSM, event) -> None:
-    outcome = await inst.host.run_background(tl=inst.timeline_id)
+    """A background graft's run. Like `busy_activity`, a run that raises ends with its own outcome,
+    `run_failed`, never `hsm/error`, so `calling` (whose tool's failure is `hsm/error`) never takes
+    the run's failure for its tool's; it is sent only while the run's state is still active."""
+    try:
+        outcome = await inst.host.run_background(tl=inst.timeline_id)
+    except Exception as error:  # noqa: BLE001 - the outcome event carries it
+        if not ctx.is_done():
+            inst.dispatch(inst.context(), hsm.Event(name="run_failed", data=error))
+        return
     await inst.dispatch(inst.context(), hsm.Event(name="finish", data=outcome))
 
 
@@ -3843,7 +3851,7 @@ BACKGROUND = hsm.Define(
             _T(_On("cancel"), _S("../recording"), Effect(ended_as(reason=CANCELLED, close_first=True), relay_stop)),
             _T(_On("shutdown"), _S("../recording"), Effect(ended_as(reason="failed", close_first=True))),
             _T(_On("join"), _S("../recording"), Effect(forced)),
-            _T(_On(_E), _S("../recording"), Effect(run_raised)),
+            _T(_On("run_failed", _E), _S("../recording"), Effect(run_raised)),
             hsm.State("held"),
             # its run goes on until the graft leaves `background` (finish, cancel, shutdown, join);
             # it asks before each step: it stops (joins cancelled) once the request it was made for
