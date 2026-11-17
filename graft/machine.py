@@ -202,10 +202,11 @@ CLONE_TRIES = 2
 HEAD = 0  # the first item of a list: queues and work lists are taken from their head
 NONE_YET = 0  # a count not started: no attempt, no hand-back, no arrival so far
 STATE_HEAD = 2  # a state path split at its first two separators: '', the model, and the rest
-# What an activity never takes for an outcome: the interpreter's own exits. CancelledError is told
-# apart by the activity's context (see tool_activity); every other exception, Exception or not, is
-# the activity's outcome, so no activity ends without one.
-EXITS = (KeyboardInterrupt, SystemExit, GeneratorExit)
+# What an activity never takes for an outcome: the interpreter's own exits, the only exceptions
+# asyncio lets out of the loop (any other, GeneratorExit included, is only stored on the task).
+# CancelledError is told apart by the activity's context (see tool_activity); every other
+# exception, Exception or not, is the activity's outcome, so no activity ends without one.
+EXITS = (KeyboardInterrupt, SystemExit)
 
 
 class TransitionRefused(Exception):

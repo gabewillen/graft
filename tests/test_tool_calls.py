@@ -946,3 +946,53 @@ def test_a_withdrawal_stops_every_waiting_graft_even_when_one_stop_fails_once(tm
 
     asyncio.run(go())
     assert fired == ["o"] and world.cancelled == {"site_write", "slides_create", "calendar_book"}
+
+
+class ActsThenGenExit(World):
+    async def execute(self, name, args):
+        if name == "site_write":
+            raise GeneratorExit()
+        return super().execute(name=name, args=args)
+
+
+def test_a_tool_that_raises_generator_exit_ends_as_run_with_an_error(tmp_path):
+    """asyncio lets only KeyboardInterrupt and SystemExit out of the loop: a GeneratorExit a tool
+    raises is the tool's outcome, like any other exception."""
+    store, h, _ = one_background(ActsThenGenExit(), tmp_path=tmp_path)
+    assert drive_one(h=h, store=store) == {"joined": True, "settled": True, "closed": True}
+    assert tool_results(store=store, tl="c1") == [("site_write", "raised GeneratorExit; it may have acted", True)]
+
+
+class ActsThenStop(World):
+    async def execute(self, name, args):
+        if name == "site_write":
+            raise StopAsyncIteration()
+        return super().execute(name=name, args=args)
+
+
+def test_a_tool_that_raises_stop_async_iteration_ends_as_run_with_an_error(tmp_path):
+    store, h, _ = one_background(ActsThenStop(), tmp_path=tmp_path)
+    assert drive_one(h=h, store=store) == {"joined": True, "settled": True, "closed": True}
+    (name, content, is_error), = tool_results(store=store, tl="c1")
+    assert (name, is_error) == ("site_write", True) and content.endswith("it may have acted")
+
+
+class Hostile(str):
+    def __getitem__(self, key):
+        raise RuntimeError("hostile slice")
+
+    def __len__(self):
+        raise RuntimeError("hostile len")
+
+
+class ReturnsHostile(World):
+    async def execute(self, name, args):
+        if name == "site_write":
+            return Hostile("ok"), False
+        return super().execute(name=name, args=args)
+
+
+def test_a_tool_that_returns_a_hostile_str_subclass_is_stored_as_plain_text(tmp_path):
+    store, h, _ = one_background(ReturnsHostile(), tmp_path=tmp_path)
+    assert drive_one(h=h, store=store) == {"joined": True, "settled": True, "closed": True}
+    assert tool_results(store=store, tl="c1") == [("site_write", "ok", False)]

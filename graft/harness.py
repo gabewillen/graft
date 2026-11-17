@@ -210,13 +210,13 @@ def _echo(value: object) -> str:
 
 
 def _shown(error: BaseException) -> str:
-    """A tool's own error, shown after its type: ': message' cut short, or nothing if its message
-    cannot be had (its __str__ raises)."""
+    """A tool's own error, shown after its type: ': message' cut short, or nothing if it has none or
+    its message cannot be had (its __str__ raises)."""
     try:
         text = str(error)
     except Exception:  # noqa: BLE001 - its message cannot be had: its type alone is shown
         return ""
-    return f": {text[:ERROR_CHARS]}"
+    return f": {text[:ERROR_CHARS]}" if text else ""
 
 
 def cancel_ids(args: object, limit: int) -> tuple[list[str], list[str]]:
@@ -609,7 +609,7 @@ class Harness:
             outcome = self.world.execute(use["name"], use["input"])
             if inspect.isawaitable(outcome):
                 outcome = await outcome
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise  # a cancel is the activity's to tell apart (it has the state's context)
         except BaseException as error:  # noqa: BLE001 - it was invoked: it ran, with an error
             return Ran(f"raised {type(error).__name__}{_shown(error)}; it may have acted"), True
