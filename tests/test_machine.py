@@ -2301,3 +2301,22 @@ def test_a_background_run_that_fails_while_its_tool_waits_is_taken_as_the_run_s_
         assert host.logged("close", "g0") == [("close", "g0", {"t1": ("cut short", True)})]
         await m.stop()
     run(go)
+
+
+def test_a_background_run_failure_that_comes_after_the_graft_stopped_is_told():
+    """A run's failure that lands once the graft has left `background` (it was stopped meanwhile)
+    is told, once, not dropped."""
+    async def go():
+        host, m = await started()
+        await say(m=m, text="go")
+        await clone(m=m, pairs=[("g0", False)])
+        if "g0" not in host.runs:
+            await asyncio.wait_for(host.next("run", "g0"), GUARD)
+        queued = m.ask(tl="g0", name="when_queued", build=lambda r: r)
+        await cancel(m=m, tl="o", ids=["g0"])
+        await asyncio.wait_for(queued, GUARD)
+        told = host.next("report")
+        m.post(tl="g0", name="run_failed", data=RuntimeError("late failure"))
+        assert (await asyncio.wait_for(told, GUARD))[3] == "late failure"
+        await m.stop()
+    run(go)

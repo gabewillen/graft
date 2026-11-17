@@ -3315,6 +3315,12 @@ def _bg_errors(inst: TimelineSM, event: hsm.Event) -> None:
                         if all(e is not k for k in kept)]
 
 
+def bg_run_failed_late(ctx, inst, event) -> None:
+    """Its run raised while the graft was being stopped (the failure came once `background` was
+    left): it is told, once, as the graft's."""
+    _report(inst=inst, kind="task", clones=[inst.timeline_id], error=event.data, src=inst.source_id)
+
+
 def bg_fault_stops(ctx, inst, event) -> None:
     """A step of a running (or held) background graft failed: it stops, and joins `failed`."""
     inst.reason, inst.close_first = "failed", True
@@ -3899,6 +3905,7 @@ BACKGROUND = hsm.Define(
     _T(_On("clone_request"), Effect(refuse_clone_call)),
     _T(_On("shutdown", "finish", "closing"), Effect(ignore)),
     _T(_On("tool_returned", "tool_stored"), Effect(ignore)),  # its run was left: the closing wrote the call
+    _T(_On("run_failed"), Effect(bg_run_failed_late)),  # its run raised as the graft was stopped: told
     _T(_On("tool_unstored"), Effect(tool_row_failed_late)),  # its run was left before the write's failure was taken
     _T(_On("cancel"), Effect(relay_stop)),  # it has stopped already: a stop for a withdrawal goes on
     _T(_On(FAULT), Effect(bg_fault_at_end)),  # joined, abandoned: the fault is told
