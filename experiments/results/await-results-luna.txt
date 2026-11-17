@@ -1,0 +1,9 @@
+await-results: model=gpt-6-luna live=True stuck=False
+model calls 22; input tokens 18661 (uncached 11094, cached 3423); output tokens 1657; wall 19.7s; follow-ups 0
+calls by tag: {'original': 1, 'original:clone_tx': 1, 'clone:c2': 8, 'clone:c1': 4, 'clone:c3': 4, 'clone:c4': 4}
+focus clone: replied (holds the conversation); site written True; site_write waits [{'waited_s': 0.0002839999506250024, 'pending': [], 'cancelled': False}]; filed {'slides': True, 'calendar': True, 'newsletter': True}
+  c1 ['website'] status=active join_reason=None replied=True tools_run=['site_write']
+  c2 ['slides'] status=queued join_reason=done replied=True tools_run=['slides_create', 'slides_add_slide', 'slides_add_slide', 'slides_add_slide', 'slides_add_slide']
+  c3 ['calendar'] status=queued join_reason=done replied=True tools_run=['calendar_book']
+  c4 ['newsletter'] status=queued join_reason=done replied=True tools_run=['newsletter_draft']
+original's view violations: []

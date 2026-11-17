@@ -1,0 +1,93 @@
+{
+  "live": true,
+  "model": "gpt-6-luna",
+  "stuck": false,
+  "model_calls": 22,
+  "input_tokens": 18661,
+  "uncached_input": 11094,
+  "cached_input": 3423,
+  "output_tokens": 1657,
+  "wall_s": 19.7,
+  "calls_by_tag": {
+    "original": 1,
+    "original:clone_tx": 1,
+    "clone:c2": 8,
+    "clone:c1": 4,
+    "clone:c3": 4,
+    "clone:c4": 4
+  },
+  "follow_ups": 0,
+  "clones": [
+    {
+      "clone": "c1",
+      "skills": [
+        "website"
+      ],
+      "status": "active",
+      "join_reason": null,
+      "replied": true,
+      "tools_run": [
+        "site_write"
+      ]
+    },
+    {
+      "clone": "c2",
+      "skills": [
+        "slides"
+      ],
+      "status": "queued",
+      "join_reason": "done",
+      "replied": true,
+      "tools_run": [
+        "slides_create",
+        "slides_add_slide",
+        "slides_add_slide",
+        "slides_add_slide",
+        "slides_add_slide"
+      ]
+    },
+    {
+      "clone": "c3",
+      "skills": [
+        "calendar"
+      ],
+      "status": "queued",
+      "join_reason": "done",
+      "replied": true,
+      "tools_run": [
+        "calendar_book"
+      ]
+    },
+    {
+      "clone": "c4",
+      "skills": [
+        "newsletter"
+      ],
+      "status": "queued",
+      "join_reason": "done",
+      "replied": true,
+      "tools_run": [
+        "newsletter_draft"
+      ]
+    }
+  ],
+  "focus_outcome": "replied (holds the conversation)",
+  "site_write_waits": [
+    {
+      "waited_s": 0.0002839999506250024,
+      "pending": [],
+      "cancelled": false
+    }
+  ],
+  "filed": {
+    "slides": true,
+    "calendar": true,
+    "newsletter": true
+  },
+  "site_written": true,
+  "view_violations": [],
+  "replies": [
+    "Your Okafor Dental home page is ready, featuring your services and open-house details, with links to the slide deck, calendar booking, and newsletter."
+  ],
+  "db": "/var/folders/tw/l56r2v8n43j0g44gwpl7t7bc0000gn/T/graft-await-w5m43axw/m.db"
+}
