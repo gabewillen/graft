@@ -2180,6 +2180,14 @@ def tool_returned(ctx, inst, event) -> None:
         _fail(reply=call.reply, error=error)
 
 
+def tool_ran_late(ctx, inst, event) -> None:
+    """A tool's outcome that came after its run was left (the run's closing already wrote what it
+    knew of the call): a row write that failed is still told, once; nothing else is done."""
+    _content, _is_error, error = event.data
+    if error is not None:
+        _report(inst=inst, kind="task", clones=[inst.timeline_id], error=error, src=inst.source_id)
+
+
 def tool_raised(ctx, inst, event) -> None:
     """The tool raised: the run ends with its error, and the call is closed as not run."""
     call, inst.tool = inst.tool, None
@@ -3536,7 +3544,8 @@ def _timeline(name: str) -> hsm.Model:
         *_join_arrivals(T=T, On=On, G=G),
         T(On("clone_request"), Call(refuse_clone_call)),
         T(On("cancel_request"), Call(refuse_cancel_call)),
-        T(On("poke", "shutdown", "check", "tool_ran"), Call(ignore)),  # tool_ran: its run was left
+        T(On("poke", "shutdown", "check"), Call(ignore)),
+        T(On("tool_ran"), Call(tool_ran_late)),  # its run was left before the tool's outcome was taken
         T(On("stop_next"), Call(stop_next)),  # a graft stopped for a withdrawal has the cancel
         # a run that raised during a step that then ended it (a hand-over, its request withdrawn)
         T(On("run_failed"), Call(run_failed_after_it_ended)),
@@ -3836,7 +3845,8 @@ BACKGROUND = hsm.Define(
     _T(_On("result_unstored"), Effect(keep_unstored)),
     _T(_On("cancel_request"), Effect(refuse_cancel_call)),
     _T(_On("clone_request"), Effect(refuse_clone_call)),
-    _T(_On("shutdown", "finish", "closing", "tool_ran"), Effect(ignore)),
+    _T(_On("shutdown", "finish", "closing"), Effect(ignore)),
+    _T(_On("tool_ran"), Effect(tool_ran_late)),  # its run was left before the tool's outcome was taken
     _T(_On("cancel"), Effect(relay_stop)),  # it has stopped already: a stop for a withdrawal goes on
     _T(_On(FAULT), Effect(bg_fault_at_end)),  # joined, abandoned: the fault is told
     hsm.State(

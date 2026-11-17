@@ -445,8 +445,8 @@ def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_r
             return text("Back.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
-    store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original))
-    real, call = h.store_result, {}
+    store, h, said = make(tmp_path=tmp_path, policy=graft_writes(original))
+    real, call, raised = h.store_result, {}, []
 
     def failing(**kw):
         if kw["tl"] == "c1" and not call.get("fired"):
@@ -468,12 +468,15 @@ def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_r
         await asyncio.wait_for(h.until_rest("c1"), WAIT_TIMEOUT)
         try:
             await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
-        except OSError:
-            pass
+        except OSError as error:
+            raised.append(error)
         await h.close()
 
     asyncio.run(go())
     assert call["fired"]
+    # the row write's failure reached the machine after its run was left: it is still told, once
+    told = [line for line in said if "INJECTED store_result" in line]
+    assert len(told) == 1 and [str(e) for e in raised] in ([], ["INJECTED store_result"])
     assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]
     assert h.tools_run("c1") == ["site_write"] and violations(store=store, tl="c1") == []
 
