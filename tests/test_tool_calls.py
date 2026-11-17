@@ -871,3 +871,22 @@ def test_a_run_whose_model_call_raises_a_base_exception_fails_and_does_not_wedge
     out = drive_one(h=h, store=store)
     assert out["joined"] is True and out["closed"] is True and out["settled"] in (True, "raised Abort")
     assert store.timeline("c1")["join_reason"] == "failed"
+
+
+class CancelsOwnTask(World):
+    """The host cancels the task its tool runs in (its own deadline), while the graft still runs."""
+
+    async def execute(self, name, args):
+        if name == "site_write":
+            me = asyncio.current_task()
+            asyncio.get_running_loop().call_soon(me.cancel)
+            await asyncio.sleep(1)
+        return super().execute(name=name, args=args)
+
+
+def test_a_tool_whose_own_task_the_host_cancels_ends_as_run_with_an_error(tmp_path):
+    store, h, _ = one_background(CancelsOwnTask(), tmp_path=tmp_path)
+    assert drive_one(h=h, store=store) == {"joined": True, "settled": True, "closed": True}
+    assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_BY_THE_TOOL, True)]
+    assert store.timeline("c1")["join_reason"] == "done"
+

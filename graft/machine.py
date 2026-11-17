@@ -1549,12 +1549,17 @@ async def tool_activity(ctx, inst: TimelineSM, event) -> None:
     try:
         content, is_error = await host.call_tool(tl=tl, use=call.use)
     except asyncio.CancelledError:
-        # Leaving the state cancels this activity (its context is done first) and that cancel is
-        # never swallowed. A cancel the tool met while the state is still active (the host
-        # cancelled a future or task the tool awaited) is the tool's outcome: it ran, with an
-        # error, and the run goes on, so the graft is never left in `calling` with no outcome.
-        if ctx.is_done() or asyncio.current_task().cancelling():
+        # Leaving the state cancels this activity, and hsm marks its context done before it cancels
+        # the task (activities are cancelled only by hsm's _terminate, which does both, in that
+        # order), so a done context is the one sign the state was left: that cancel is never
+        # swallowed. Any other cancel (the host cancelled a future the tool awaited, or this task
+        # itself) is the tool's outcome: the task's cancel request is withdrawn, the call ran,
+        # with an error, and the run goes on, so the graft is never left in `calling`.
+        if ctx.is_done():
             raise
+        task = asyncio.current_task()
+        while task is not None and task.cancelling():
+            task.uncancel()
         content, is_error = call.cancelled, True
     except EXITS:
         raise
