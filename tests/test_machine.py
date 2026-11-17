@@ -347,9 +347,9 @@ def test_a_queued_graft_counts_toward_the_live_cap_until_its_join_is_applied():
         assert host.status["g0"] == "queued" and not host.logged("apply")  # finished, not joined
         _, _, text = await clone(m=m, pairs=[("n1", False)])
         assert f"at most {MAX_LIVE_BACKGROUND} background clones" in text  # g0 still counts
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         await end_driven_turn(m=m)
-        await reporting  # g0's join is applied
+        await waking  # g0's join is applied
         host.end(tl="o")
         assert await at_rest(m=m) == "ended" and host.status["g0"] == "joined"
         await driven_turn(m=m)
@@ -416,9 +416,9 @@ def test_a_focus_clone_hands_the_conversation_over_and_its_join_goes_last():
         assert not host.logged("apply")
         host.end("c2")  # the focus graft answers the user: the user's call is answered by it
         assert await reply == "ended" and await at_rest(m=m, tl="c2") == "ended"
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         await m.send(tl="c2", name="join", data=(QueuedJoin(child="c2", reason="done", trigger=None), None))
-        await reporting  # c1's work is reported
+        await waking  # c1's work is reported
         assert [e[1] for e in host.logged("apply")] == ["c1", "c2"]  # the focus join last
         assert (host.status["o"], host.status["c1"], host.status["c2"]) == ("active", "joined", "joined")
         assert holders(host) == ["o"]
@@ -466,9 +466,9 @@ def test_joins_wait_while_the_original_runs_and_are_applied_when_it_is_at_rest()
             host.end(child)
             await queued
         assert "o" in host.runs and not host.logged("apply")
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         host.end("o")
-        await reporting
+        await waking
         assert [e[1] for e in host.logged("apply")] == ["c2", "c1"]  # finish order
         assert ("note", ("c2", "c1"), False) in host.log  # one wake for both
         host.end("o")
@@ -485,9 +485,9 @@ def test_a_graft_that_finishes_while_the_original_is_idle_is_applied_and_wakes_i
         await clone(m=m, pairs=[("c1", False)])
         host.end("o")
         assert await first == "ended"
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         host.end("c1")
-        await reporting
+        await waking
         assert ("apply", "c1", "done") in host.log
         reported = host.next("report", "wake")
         host.fail(tl="o", error=ValueError("wake exploded"))
@@ -513,9 +513,9 @@ def test_a_join_that_cannot_be_applied_is_kept_retried_and_then_given_up():
         assert host.reports == [("commit", ["c1", "c2"], "cannot apply c1")]
         for _ in range(MAX_JOIN_ATTEMPTS - 2):  # a commit point that fails again
             assert await m.ask(tl="o", name="drain_request", build=lambda r: r) == "ended"
-        reporting = host.next("run", "o", "wake")  # the last attempt: c1 is given up, c2 applied
+        waking = host.next("run", "o", "wake")  # the last attempt: c1 is given up, c2 applied
         draining = asyncio.ensure_future(m.ask(tl="o", name="drain_request", build=lambda r: r))
-        await reporting
+        await waking
         host.end("o")
         assert await draining == "ended"
         assert host.status["c1"] == "abandoned" and host.status["c2"] == "joined"
@@ -544,9 +544,9 @@ def test_the_original_cancels_a_running_background_graft_and_waits_for_its_join(
         assert "was cancelled" in text  # its part is blocked for this request
         _, _, text = await clone(m=m, pairs=[(f"n{i}", False) for i in range(MAX_LIVE_BACKGROUND)])
         assert text == "cloned"  # its place under the cap was free at once
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         host.end("o")
-        await reporting
+        await waking
         assert ("apply", "c1", CANCELLED) in host.log and ("note", ("c1",), False) in host.log
         host.end("o")
         assert await reply == "ended" and host.status["c1"] == "joined"
@@ -568,9 +568,9 @@ def test_cancel_is_refused_for_anything_but_a_running_background_graft_of_the_or
                             "c2": "it has already finished or was already cancelled; nothing to cancel"}
         assert results[0][1] and host.status["c1"] == "background"  # nothing was touched
         assert "only the original cancels" in await cancel(m=m, tl="c1", ids=["c2"])  # a graft never cancels
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         host.end("o")
-        await reporting  # the wake that reports c2
+        await waking  # the wake that reports c2
         host.end("o")
         assert await first == "ended"
         answer = await cancel(m=m, tl="o", ids=["c1"])  # at rest: not while it runs
@@ -620,7 +620,7 @@ def test_a_run_that_fails_during_a_cancel_step_waits_for_the_step(withdrawn):
         host.fail(tl="o", error=RuntimeError("run failed"))
         if withdrawn:
             await withdraw(m=m, reply=reply)
-        reporting = host.next("run", "o", "wake")  # c1's join is applied and reported at rest
+        waking = host.next("run", "o", "wake")  # c1's join is applied and reported at rest
         host.hold.set_result(None)
         assert await asyncio.wait_for(asking, GUARD) == [(repr([("c1", CANCELLED)]), False)]
         if withdrawn:
@@ -628,7 +628,7 @@ def test_a_run_that_fails_during_a_cancel_step_waits_for_the_step(withdrawn):
             await at_rest(m)
             assert [r for r in host.reports if r[2] == "run failed"] == [("task", [], "run failed")]
         else:
-            await asyncio.wait_for(reporting, GUARD)
+            await asyncio.wait_for(waking, GUARD)
             host.end("o")
             with pytest.raises(RuntimeError, match="run failed"):
                 await asyncio.wait_for(reply, GUARD)
@@ -649,9 +649,9 @@ def test_settle_waits_until_nothing_is_in_flight_and_raises_what_failed_once():
         settling = m.future()
         await m.send(tl="session", name="settle_request", data=settling)
         assert not settling.done()  # c1 is still running
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         host.end("c1")
-        await reporting
+        await waking
         assert not settling.done()  # the wake run is in flight
         host.fail(tl="o", error=ValueError("wake exploded"))
         with pytest.raises(ValueError, match="wake exploded"):
@@ -698,10 +698,10 @@ def test_a_failing_write_in_an_activity_is_handled_by_its_state_and_kept_for_set
         with pytest.raises(RuntimeError, match="host bug"):
             await cancel(m=m, tl="o", ids=["c1"])
         assert ("machine", [], "host bug") in host.reports and host.status["c1"] == "queued"
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         # the turn goes on: its caller ends it (it would wait in `writing`)
         assert await asyncio.wait_for(m.ask(tl="o", name="driven_done", build=lambda r: r), timeout=GUARD) == "ended"
-        await reporting
+        await waking
         host.end("o")  # the wake that reports c1
         with pytest.raises(RuntimeError, match="host bug"):
             await m.ask(tl="session", name="settle_request", build=lambda r: r)
@@ -1043,9 +1043,9 @@ def test_a_cancel_that_loses_the_race_to_a_finish_blocks_nothing(order):
         answer = await asyncio.wait_for(cancel(m=m, tl="o", ids=["c1"]), timeout=GUARD)
         cancelled = answer[0][1] is False
         assert cancelled == (order == "cancel_first")
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         await m.ask(tl="o", name="driven_done", build=lambda r: r)
-        await reporting  # c1's join is applied and reported
+        await waking  # c1's join is applied and reported
         host.end("o")
         assert await at_rest(m) == "ended"
         await m.ask(tl="o", name="turn_request", build=lambda r: (Mode(name="external"), r))  # the same request
@@ -1063,9 +1063,9 @@ def test_a_failed_graft_blocks_its_part_for_the_request_it_was_cloned_for_only(r
         await m.ask(tl="o", name="turn_request", build=lambda r: (Mode(name="external"), r))
         await clone(m=m, pairs=[("c1", False)], parts=[{"web"}], request=1)  # cloned for request 1
         await m.ask(tl="c1", name="join", build=lambda r: (QueuedJoin(child="c1", reason=reason, trigger=None), r))
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         await m.ask(tl="o", name="driven_done", build=lambda r: r)
-        await reporting  # c1's join is applied and reported
+        await waking  # c1's join is applied and reported
         host.end(tl="o")
         assert await at_rest(m=m) == "ended"
         await m.ask(tl="o", name="turn_request", build=lambda r: (Mode(name="external"), r))
@@ -1089,9 +1089,9 @@ def test_a_cancel_is_not_counted_as_a_hand_back_of_the_request_its_graft_was_clo
         await clone(m=m, pairs=[("c1", False)], parts=[{"web"}], request=1)
         answer = await cancel(m=m, tl="o", ids=["c1"], request=1)
         assert answer[0][1] is False  # cancelled
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         await end_driven_turn(m=m)
-        await reporting  # its join (cancelled) is applied under request 1, the one it was cloned for
+        await waking  # its join (cancelled) is applied under request 1, the one it was cloned for
         host.end(tl="o")
         assert await at_rest(m=m) == "ended"
         await driven_turn(m=m)
@@ -1422,9 +1422,9 @@ def test_a_background_graft_stops_when_the_request_it_was_made_for_is_withdrawn_
         assert await second == "ended"
         await asyncio.wait_for(ran, GUARD)
         assert host.status["c2"] == "background"  # still running
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         host.end("c2")
-        await asyncio.wait_for(reporting, GUARD)
+        await asyncio.wait_for(waking, GUARD)
         host.end("o")
         assert await at_rest(m) == "ended" and ("note", ("c2",), False) in host.log
         await m.stop()
@@ -1588,9 +1588,9 @@ def test_a_waiting_message_withdrawn_while_a_hand_over_is_made_is_answered_and_s
         assert await first == "ended"
         settling = m.future()
         await m.send(tl="session", name="settle_request", data=settling)
-        reporting = host.next("run", "o", "wake")
+        waking = host.next("run", "o", "wake")
         host.end("c2")
-        await asyncio.wait_for(reporting, GUARD)
+        await asyncio.wait_for(waking, GUARD)
         host.fail(tl="o", error=ValueError("wake exploded"))
         with pytest.raises(ValueError, match="wake exploded"):
             await asyncio.wait_for(settling, GUARD)

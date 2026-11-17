@@ -1325,7 +1325,7 @@ def test_a_failed_graft_blocks_only_its_own_part(tmp_path):
         await h.begin_turn("o")  # both join while the source is mid-turn
         await h.do_join(c1, "failed")
         await h.do_join(c2, "out_of_scope")
-        await drain(h)  # one wake for both: a routing turn; its refusal below says which part is blocked
+        await drain(h)  # one wake for both: a full run; its refusal below says which part is blocked
         assert await h.settle() == ["Trying the deck again.", "The deck is done; the site could not be built."]
         await h.machines.stop()
 
@@ -3207,14 +3207,14 @@ def test_a_withdrawn_message_does_not_lift_the_block_on_a_cancelled_part(tmp_pat
 
 
 def test_the_original_may_cancel_in_a_wake_and_the_cancel_gets_its_own_wake(tmp_path):
-    class InReport(CancelScript):
+    class InWake(CancelScript):
         def __call__(self, system, messages, tools):
             last = messages[-1]["content"][-1]
             if "clone" in {t["name"] for t in tools} and is_wake(last) and "c1 (done)" in last["text"]:
                 return [{"type": "text", "text": "The website is done."}, cancel_use(ids=["c2"], id="x9")]
             return super().__call__(system=system, messages=messages, tools=tools)
 
-    script = InReport(entries=TWO, ids=[])
+    script = InWake(entries=TWO, ids=[])
     script.open("website")
     store, h, _ = make(tmp_path=tmp_path, policy=script)
 
@@ -3558,14 +3558,14 @@ def test_results_the_harness_gives_calls_it_did_not_run_are_marked_in_the_store_
 
 
 def test_a_failed_cancel_result_write_in_a_wake_run_is_reported_once_and_raised_once(tmp_path, monkeypatch):
-    class InReport(CancelScript):
+    class InWake(CancelScript):
         def __call__(self, system, messages, tools):
             last = messages[-1]["content"][-1]
             if "clone" in {t["name"] for t in tools} and is_wake(last) and "c1 (done)" in last["text"]:
                 return [{"type": "text", "text": "The website is done."}, cancel_use(ids=["c2"], id="x9")]
             return super().__call__(system=system, messages=messages, tools=tools)
 
-    script = InReport(entries=TWO, ids=[])
+    script = InWake(entries=TWO, ids=[])
     store, h, said = make(tmp_path=tmp_path, policy=script)
     real = h._store_results
     failures = []
@@ -4576,7 +4576,7 @@ WITHDRAWN_ROWS = ["its row is written", "its row is written behind a run", "its 
 def test_a_withdrawn_request_whose_row_was_written_never_reaches_a_later_turn_as_a_request(tmp_path, point):
     """B's call is cancelled after its row was written: while it is written, while the run that
     answers it runs, and when a focus graft hands it back (as its join is applied, and as the
-    wake note that would route it is written). The next message's model call sees B
+    wake note that would have it answered is written). The next message's model call sees B
     only as a withdrawn message (marked, not the user's text), its view stays valid, and B is
     never the request a later turn or a hand-back answers."""
     gate, entered, task, seen = threading.Event(), threading.Event(), {}, {}
