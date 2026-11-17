@@ -548,7 +548,10 @@ def _resolve(reply: asyncio.Future | None, value: Any = None) -> None:
 
 def _fail(reply: asyncio.Future | None, error: BaseException) -> None:
     if reply is not None and not reply.done():
-        reply.set_exception(error)
+        try:
+            reply.set_exception(error)
+        except TypeError:  # an error a future cannot carry (StopIteration): carried as one it can
+            reply.set_exception(RuntimeError(described(error)))
 
 
 # The sends of the behavior being run (`_step`), made when it returns (none if it raises). Each
@@ -746,7 +749,9 @@ def _guard(expression: Callable) -> Callable:
             return False
         try:
             return bool(_rule(expression)(ctx=ctx, inst=inst, event=event))
-        except Exception:  # noqa: BLE001 - fails closed; the unguarded branch reports it
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:  # noqa: BLE001 - fails closed, Exception or not; the unguarded branch reports it
             return False
     return guard
 
@@ -779,7 +784,9 @@ def _step(behavior: Callable, call: bool = False, handles: bool = False) -> Call
         try:
             result = _rule(behavior)(ctx=ctx, inst=inst, event=event)
             sends, dropped = made, []
-        except Exception as error:  # noqa: BLE001 - the machine's fault, recovered from in the graph
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as error:  # noqa: BLE001 - the machine's fault, Exception or not: recovered in the graph
             result, sends, dropped, failure = False, None, made, error
         finally:
             _SENDS.reset(token)
@@ -795,7 +802,9 @@ def _step(behavior: Callable, call: bool = False, handles: bool = False) -> Call
             target, sent = sends[HEAD]
             try:
                 hsm.Dispatch(None, target, sent)
-            except Exception as error:  # noqa: BLE001 - its one send failed: that is its fault
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as error:  # noqa: BLE001 - its one send failed: that is its fault
                 failure = error
         if failure is not None:
             if handles or event.name in FAULTS:
@@ -2410,7 +2419,7 @@ def clone_refusal_not_written(ctx, inst, event) -> None:
     The user is told, and the call's caller, the run, gets that error, so it ends (its closing
     writes the row) instead of calling the model on a view without it."""
     clone, inst.clone = inst.clone, None
-    text = f"clone refused; no clone was created ({event.data})"
+    text = f"clone refused; no clone was created ({described(event.data)})"
     if clone.store:
         inst.unstored[clone.use["id"]] = (text, True)
     inst.close_out = [*inst.close_out, _close_out_of(inst)]  # its audit, left open, is rolled back first

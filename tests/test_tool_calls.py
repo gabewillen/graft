@@ -1132,3 +1132,77 @@ def test_a_row_write_failure_whose_message_raises_still_has_an_outcome(tmp_path)
     h.store_result = broken
     out = drive_one(h=h, store=store)
     assert out["joined"] is True and out["closed"] is True
+
+
+# ------------------------------------------------------------------ no step escapes the graph
+class BadExc(Exception):
+    """An Exception whose message raises a non-Exception."""
+
+    def __str__(self):
+        raise Abort2("no message")
+
+
+def test_a_refusal_row_whose_write_error_has_a_bad_message_still_ends_the_run(tmp_path):
+    def policy(system, messages, tools):
+        last = messages[-1]["content"][-1]
+        if last["type"] == "tool_result":
+            return text("Refused.")
+        return [clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=True),
+                          id="k1") | {"type": "tool_use"}]  # two focus entries: refused in its preparation
+
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
+    real = h.store_result
+
+    def broken(**kw):
+        if kw["use"]["id"] == "k1":
+            raise BadExc()
+        return real(**kw)
+    h.store_result = broken
+    out = {}
+
+    async def go():
+        await h.start()
+        try:
+            out["said"] = await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            out["said"] = "TIMEOUT"
+        except BaseException as error:  # noqa: BLE001 - the write's error reaches the caller
+            out["said"] = type(error).__name__
+        await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+        out["closed"] = True
+
+    asyncio.run(go())
+    assert out["said"] != "TIMEOUT" and out["closed"] is True
+
+
+def test_an_effect_that_raises_a_base_exception_is_a_fault_the_machine_recovers_from(tmp_path, monkeypatch):
+    import graft.machine as machine
+    real, fired = machine.take_message, []
+
+    def raising(ctx, inst, event):
+        if not fired:
+            fired.append(1)
+            raise Abort("an effect's abort")
+        return real(ctx=ctx, inst=inst, event=event)
+    monkeypatch.setattr(machine, "take_message", raising)
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("ok"))
+    out = {}
+
+    async def go():
+        await h.start()
+        try:
+            out["first"] = await asyncio.wait_for(h.user_says("hello"), WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            out["first"] = "TIMEOUT"
+        except BaseException as error:  # noqa: BLE001 - the failed step's caller gets its error
+            out["first"] = type(error).__name__
+        out["second"] = await asyncio.wait_for(h.user_says("again"), WAIT_TIMEOUT)
+        try:
+            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        except BaseException:  # noqa: BLE001 - told once
+            pass
+        await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+        out["closed"] = True
+
+    asyncio.run(go())
+    assert fired and out["first"] != "TIMEOUT" and out["second"] == ["ok"] and out["closed"] is True
