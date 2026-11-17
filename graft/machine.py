@@ -476,6 +476,9 @@ class TimelineSM(hsm.Instance):
         # live, and each a focus graft handed back. Its current request is the last of them not
         # withdrawn (`_request_key`); the bounds below are keyed by it (None: no request yet).
         self.asked: list[Request] = []
+        # the request whose call was done (`call_done`) last, still live then: it can never be
+        # withdrawn, so no request before it, and not None, can be current again (`_settle`)
+        self.settled: Request | None = None
         self.blocks: set[tuple[int | None, frozenset[str]]] = set()  # re-clone blocks (per part)
         self.arrivals: dict[tuple[int | None, frozenset[str]], int] = {}
         self.handbacks: dict[int | None, int] = {}
@@ -1123,17 +1126,23 @@ def _request_key(inst: TimelineSM) -> int | None:
     return next((r.row for r in reversed(inst.asked) if not _withdrawn(inst=inst, request=r)), None)
 
 
+def _settle(inst: TimelineSM, rid: int) -> None:
+    """A user's call is done: if it is one of its requests and was live then, it can never be
+    withdrawn, so it and those after it are the only requests that can be current again. Only
+    this positive signal settles a request: one it handed to a focus graft is not its own to
+    hold meanwhile, but may still be withdrawn."""
+    done = [i for i, r in enumerate(inst.asked) if r.id == rid and not _withdrawn(inst=inst, request=r)]
+    inst.settled = inst.asked[done[HEAD]] if done else inst.settled
+    inst.asked = inst.asked[done[HEAD]:] if done else inst.asked
+
+
 def _prune_requests(inst: TimelineSM) -> None:
     """Requests that can never be current again, and the bounds kept for them, are dropped. A
-    withdrawn request leaves `asked` (read before the withdrawal record is pruned). A request
-    that is no longer known (answered, its call done) and not withdrawn never can be: it and the
-    requests after it are the only ones that can be current, so those before it go, and with
-    them every bound not keyed by one of the requests left (None's too: there is a request now)."""
+    withdrawn request leaves `asked` (read before the withdrawal record is pruned); the requests
+    before the settled one went when it settled (`_settle`); every bound not keyed by one of the
+    requests left goes with them (None's too, once a request has settled)."""
     inst.asked = [r for r in inst.asked if not _withdrawn(inst=inst, request=r)]
-    known = _known(inst)
-    settled = [i for i, r in enumerate(inst.asked) if all(r is not k for k in known)]
-    inst.asked = inst.asked[settled[-1]:] if settled else inst.asked
-    keys = {r.row for r in inst.asked} | (set() if settled else {None})
+    keys = {r.row for r in inst.asked} | (set() if inst.settled is not None else {None})
     inst.clone_calls = {k: n for k, n in inst.clone_calls.items() if k in keys}
     inst.handbacks = {k: n for k, n in inst.handbacks.items() if k in keys}
     inst.arrivals = {k: n for k, n in inst.arrivals.items() if k[HEAD] in keys}
@@ -2113,6 +2122,7 @@ def stop_one(ctx, inst, event) -> None:
 def call_finished(ctx, inst, event) -> None:
     """A user's call is done (its request id): a request it answered can no longer be withdrawn."""
     inst.returned = [r for r in inst.returned if r.id != event.data]
+    _settle(inst=inst, rid=event.data)
     _prune(inst)
 
 

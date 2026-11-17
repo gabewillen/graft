@@ -485,6 +485,43 @@ def test_a_withdrawn_hand_back_counts_nothing_for_the_request_before_it(monkeypa
     run(go)
 
 
+def test_a_request_handed_to_a_focus_graft_and_withdrawn_leaves_the_one_before_it_current(monkeypatch):
+    """With a cap of one: "go" commits its call (c1, background); A clones c2 as focus, so A is
+    the focus graft's to answer while the original is suspended; A is withdrawn as c2 hands it
+    back. A was never done, so "go" is the request again, with its count: the wake for c1's join
+    is refused by the cap."""
+    import graft.machine as machine_module
+    monkeypatch.setattr(machine_module, "MAX_CLONE_CALLS_PER_MESSAGE", 1)
+
+    async def go():
+        host, m = await started()
+        await say(m=m, text="go")
+        await clone(m=m, pairs=[("c1", False)])
+        host.end("o")
+        assert await at_rest(m) == "ended"
+        running = host.next("run", "o", "turn")
+        reply = await say(m=m, text="A")
+        await asyncio.wait_for(running, GUARD)
+        real = host.join_of
+
+        def join_of(tl, reason):  # the caller goes away as c2 hands A back
+            reply.cancel()
+            m.post(tl="o", name="withdraw", data=REQUESTS[reply])
+            return real(tl=tl, reason=reason)
+        host.join_of = join_of
+        await clone(m=m, pairs=[("c2", True)])
+        host.end(tl="c2", result=RunOutcome(kind="join", reason="out_of_scope"))
+        await asyncio.wait_for(host.next("apply", "c2"), GUARD)
+        assert await at_rest(m) == "ended"
+        waking = host.next("run", "o", "wake")
+        host.end("c1")
+        await asyncio.wait_for(waking, GUARD)
+        _, _, text = await clone(m=m, pairs=[("c3", False)])
+        assert "clone calls for this user message are used up" in text and "c3" not in host.status
+        await m.stop()
+    run(go)
+
+
 def test_a_focus_clone_hands_the_conversation_over_and_its_join_goes_last():
     async def go():
         host, m = await started()
