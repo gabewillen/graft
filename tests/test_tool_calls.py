@@ -1482,3 +1482,30 @@ def test_a_stop_whose_counting_and_stopping_both_always_fail_is_still_given_up(t
     out, calls, world, said = withdraw_three(tmp_path=tmp_path, monkeypatch=monkeypatch, failing="all")
     assert len(calls) == 3 * MAX_STOP_ATTEMPTS and len(counted) == 3 * MAX_STOP_ATTEMPTS
     assert any("could not be stopped" in line for line in said)
+
+
+def test_a_provider_cancel_reaches_the_caller_as_a_runtime_error_and_withdraws_nothing(tmp_path):
+    calls = []
+
+    def policy(system, messages, tools):
+        calls.append(1)
+        if len(calls) == 1:
+            raise asyncio.CancelledError()  # the provider's own cancel, not the caller's
+        return text("Hello again.")
+
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
+    out = {}
+
+    async def go():
+        await h.start()
+        try:
+            await asyncio.wait_for(h.user_says("hello"), WAIT_TIMEOUT)
+            out["first"] = "ok"
+        except BaseException as error:  # noqa: BLE001 - what the caller got
+            out["first"] = type(error).__name__
+        out["second"] = await asyncio.wait_for(h.user_says("hello again"), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert out == {"first": "RuntimeError", "second": ["Hello again."]}
+    assert store.con.execute("SELECT count(*) FROM withdrawals").fetchone()[0] == 0  # nothing withdrawn

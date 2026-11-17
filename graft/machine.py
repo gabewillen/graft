@@ -871,7 +871,8 @@ def _failure(ctx, error: BaseException) -> BaseException:
     when the activity's context is done (the library marks it before it cancels an activity, which it
     does only when the state is left), and is then raised on, never swallowed; any other cancel (the
     host's own, or one an awaited call raised) is the activity's failure: the task's cancel requests
-    are withdrawn, and it is returned like any other error."""
+    are withdrawn, and it is returned as a RuntimeError, so no caller that gets it as its reply
+    takes it for its own cancel (and withdraws its request)."""
     if isinstance(error, EXITS):
         raise error
     if isinstance(error, asyncio.CancelledError):
@@ -880,6 +881,9 @@ def _failure(ctx, error: BaseException) -> BaseException:
         task = asyncio.current_task()
         while task is not None and task.cancelling():
             task.uncancel()
+        failure = RuntimeError(f"cancelled, not by its graft: {described(error)}")
+        failure.__cause__ = error
+        return failure
     return error
 
 
@@ -900,9 +904,10 @@ def Activity(work: Callable, done: str) -> hsm.RedefinableBehaviors:
         try:
             await work(ctx=ctx, inst=inst, event=event)
         except BaseException as error:  # noqa: BLE001 - told as an Exception, so it has an outcome
-            if isinstance(_failure(ctx, error), Exception):
+            failure = _failure(ctx, error)
+            if failure is error and isinstance(error, Exception):
                 raise
-            raise Aborted(described(error)) from error
+            raise Aborted(described(failure)) from error
     activity.__name__ = work.__name__
     return hsm.Activity(activity)
 
@@ -968,9 +973,10 @@ def io(done: str, work: Callable) -> hsm.RedefinableBehaviors:
         try:
             result = _rule(work)(inst=inst, event=event)
         except BaseException as error:  # noqa: BLE001 - told as an Exception, so it has an outcome
-            if isinstance(_failure(ctx, error), Exception):
+            failure = _failure(ctx, error)
+            if failure is error and isinstance(error, Exception):
                 raise
-            raise Aborted(described(error)) from error
+            raise Aborted(described(failure)) from error
         inst.dispatch(inst.context(), hsm.Event(name=done, data=result))
     activity.__name__ = f"io_{done}"
     return hsm.Activity(activity)
@@ -1622,7 +1628,8 @@ async def tool_activity(ctx, inst: TimelineSM, event) -> None:
     except BaseException as error:  # noqa: BLE001 - invoked, so it ran: whatever it raised is its outcome
         # leaving the state is raised on (`_failure`); any other cancel the tool met is its outcome
         # (it ran, with an error), and so is anything else the host's call did not turn into one
-        cancelled = isinstance(_failure(ctx, error), asyncio.CancelledError)
+        _failure(ctx, error)  # leaving the state is raised on
+        cancelled = isinstance(error, asyncio.CancelledError)
         content, is_error = (call.cancelled if cancelled else call.failed), True
     inst.dispatch(inst.context(), hsm.Event(name="tool_returned", data=(content, is_error)))
 
@@ -1709,9 +1716,10 @@ def _aborting(work: Callable) -> Callable:
         try:
             await work(ctx=ctx, inst=inst, event=event)
         except BaseException as error:  # noqa: BLE001 - told as an Exception, so it has an outcome
-            if isinstance(_failure(ctx, error), Exception):
+            failure = _failure(ctx, error)
+            if failure is error and isinstance(error, Exception):
                 raise
-            raise Aborted(described(error)) from error
+            raise Aborted(described(failure)) from error
     return activity
 
 
