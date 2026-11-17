@@ -19,7 +19,7 @@ from graft.db import Store, render, validate
 from graft.harness import (NOT_RUN_BESIDE_CLONE, NOT_RUN_INTERRUPTED, NOT_RUN_JOINING, Harness,
                            NotRun, _reason, cancel_ids, clone_entries)
 from graft.providers import FakeProvider
-from graft.machine import MAX_LIVE_BACKGROUND, DecisionFault, TransitionRefused
+from graft.machine import MAX_CLONE_CALLS_PER_MESSAGE, MAX_LIVE_BACKGROUND, DecisionFault, TransitionRefused
 from graft.skills import CANCEL_TOOL, CATALOG, JOIN_TOOL, MAX_CANCEL_IDS, World, install
 
 REQUEST = "Build a website and a slide deck for the dental practice."
@@ -325,7 +325,7 @@ def test_focus_done_with_queued_background_joins_wakes_the_source_once(tmp_path)
         await h.do_join(c2, "done")
         store.add_turn(c1, "assistant", "text", "Site built.")
         await h.do_join(c1, "done")
-        assert h.wakes == [{"source": "o", "joined": [(c2, "done")], "report": True}]  # to report, not to clone
+        assert h.wakes == [{"source": "o", "joined": [(c2, "done")]}]
         assert h.out == ["Both are finished."] and await h.until_rest("o") == "ended"
         await h.machines.stop()
 
@@ -405,9 +405,10 @@ def test_background_silent_done_is_refused_until_it_writes_its_result(tmp_path):
     assert "Site built with defaults." in [r["content"] for r in store.view("o")]
 
 
-def test_one_clone_call_per_message_and_no_clone_in_a_wake(tmp_path):
-    """An original that always wants to clone: the second call in a turn and a call in the wake
-    run are refused, so background work cannot loop."""
+def test_an_original_that_always_clones_stops_at_the_per_message_cap(tmp_path):
+    """An original that always wants to clone: the second call in a run is refused, and each
+    graft's `done` wake is a full run that clones again, until the per-message cap refuses the
+    call, so background work cannot loop."""
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
@@ -427,10 +428,14 @@ def test_one_clone_call_per_message_and_no_clone_in_a_wake(tmp_path):
         await h.machines.stop()
 
     asyncio.run(go())
-    assert clones(store) == ["c1"]
+    # each run commits one clone call (CLONE_TRIES: its retry is refused), and the wakes commit
+    # more until MAX_CLONE_CALLS_PER_MESSAGE are used: the last wake's call is refused by that cap
+    assert clones(store) == [f"c{i}" for i in range(1, MAX_CLONE_CALLS_PER_MESSAGE + 1)]
     refusals = [r["content"] for r in store.view("o") if r["kind"] == "tool_result"
                 and ("not executed" in r["content"] or "clone refused" in r["content"])]
-    assert len(refusals) == 2 and "no clone calls left" in refusals[0] and "woken to report" in refusals[1]
+    assert len(refusals) == MAX_CLONE_CALLS_PER_MESSAGE + 1
+    assert all("no clone calls left" in r for r in refusals[:-1]) and "are used up" in refusals[-1]
+    assert len(h.wakes) == MAX_CLONE_CALLS_PER_MESSAGE  # one per graft's join; the last clones nothing
 
 
 def test_a_clone_batch_is_one_store_transaction(tmp_path):
@@ -506,25 +511,38 @@ def test_a_failed_wake_is_visible_when_it_happens_and_still_raises_at_settle(tmp
     asyncio.run(go())
 
 
-def test_a_wake_reports_or_routes_according_to_its_own_batch(tmp_path):
-    store, h, _ = make(tmp_path, lambda *a: text("Reporting."))
+def test_a_done_join_wakes_a_full_run_that_clones_the_next_task(tmp_path):
+    """The user asked for a website and a deck; the original clones the website first. Its graft
+    joins `done`, and the wake is a full run: the original clones the deck now, without waiting
+    for another user message."""
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" not in names:
+            return text("Deck built." if "slides_create" in names else "Site built.")
+        if last["type"] == "tool_result":
+            return text("Refused: " + last["content"] if last.get("is_error") else "Started.")
+        if is_wake(last) and "c1 (done)" in last["text"]:
+            return [{"type": "text", "text": "The website is done; starting the deck."},
+                    clone_use(clone_entry(skills=["slides"], focus=False), id="k2") | {"type": "tool_use"}]
+        if is_wake(last):
+            return text("The deck is done too.")
+        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
+
+    store, h, said = make(tmp_path, policy)
 
     async def go():
         await h.start()
-        store.add_turn("o", "user", "text", REQUEST)
-        store.add_turn("o", "assistant", "text", "Started.")
-        (c1, c2), _ = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["website"], focus=False), clone_entry(skills=["slides"], focus=False)))
-        store.add_turn(c1, "assistant", "text", "Site built.")
-        await h.do_join(c1, "done")
-        await h.drain_and_wake("o")
-        assert h.wakes[0]["report"] is True  # woken to report finished work: no clone in that run
-        await h.do_join(c2, "out_of_scope")  # no user message in between
-        await h.drain_and_wake("o")
-        assert len(h.wakes) == 2 and h.wakes[1]["joined"] == [(c2, "out_of_scope")]
-        assert h.wakes[1]["report"] is False and not await blocked(h=h, skills=["slides"])  # this one is routable
+        out = await h.user_says(REQUEST)
+        out += await h.settle()
+        assert out == ["Started.", "The website is done; starting the deck.", "Started.", "The deck is done too."]
+        assert [w["joined"] for w in h.wakes] == [[("c1", "done")], [("c2", "done")]]
         await h.machines.stop()
 
     asyncio.run(go())
+    assert clones(store) == ["c1", "c2"] and h.part_of("c2") == {"slides"}
+    assert store.timeline("c2")["join_reason"] == "done"
+    assert validate(store.view("o"), "o", require_user_end=False) == []
 
 
 def test_a_background_failure_does_not_block_its_part_for_an_unrelated_handed_back_request(tmp_path):
@@ -558,8 +576,7 @@ def test_a_failed_background_request_is_not_recloned_until_a_new_message(tmp_pat
         await h.begin_turn("o")  # both join while the source is mid-turn
         await h.do_join(c1, "failed")
         await h.do_join(c2, "out_of_scope")
-        await drain(h)  # one wake for both; the out_of_scope join makes it a routing turn
-        assert h.wakes[-1]["report"] is False
+        await drain(h)  # one wake for both
         assert h.current_request("o") == req
         assert await blocked(h=h, skills=["website"]) and await blocked(h=h, skills=["website", "slides"])  # the failed part
         assert not await blocked(h=h, skills=["slides"])  # the sibling's handed-back part can be routed
@@ -739,8 +756,12 @@ def test_out_of_scope_background_joins_cannot_loop_without_a_user_message(tmp_pa
 
     asyncio.run(go())
     made = clones(store)
-    assert len(made) == 2, made  # the first clone, and the one re-route its routing wake made
-    assert [w["report"] for w in h.wakes] == [False, True]  # one routing wake, then reports only
+    assert len(made) == 2, made  # the first clone, and the one re-route its first wake made
+    # each graft's join wakes a full run; the second wake's clone is refused, since the website
+    # part came back out of scope twice (the re-clone block), so no third graft joins
+    assert [w["joined"] for w in h.wakes] == [[("c1", "out_of_scope")], [("c2", "out_of_scope")]]
+    refused = [r["content"] for r in store.view("o") if r["kind"] == "tool_result" and "clone refused" in r["content"]]
+    assert refused and "handed it back twice" in refused[-1]
 
 
 def test_an_exception_inside_clone_handling_ends_as_a_refused_tool_result(tmp_path):
@@ -1240,7 +1261,7 @@ def test_a_failed_graft_blocks_only_its_own_part(tmp_path):
     refusal = [r["content"] for r in store.view("o") if r["kind"] == "tool_result" and "clone refused" in r["content"]]
     assert len(refusal) == 1 and "clone[0]:" in refusal[0] and "already failed" in refusal[0]
     assert "clone[1]:" not in refusal[0]  # the slides entry was fine
-    assert [w["report"] for w in h.wakes] == [False, True]
+    assert [w["joined"] for w in h.wakes] == [[("c1", "failed"), ("c2", "out_of_scope")], [("c3", "done")]]
     assert validate(store.view("o"), "o", require_user_end=False) == []
 
 
@@ -1666,7 +1687,7 @@ def test_a_request_handed_back_too_often_is_not_cloned_for_again(tmp_path, monke
         await h.begin_turn("o")  # both join while the source is mid-turn
         await h.do_join(c1, "out_of_scope")
         await h.do_join(c2, "out_of_scope")
-        await drain(h)  # a routing wake; the source asks for a third part
+        await drain(h)  # a wake; the source asks for a third part
         assert clones(store) == [c1, c2]  # the call was not executed
         refused = [r["content"] for r in store.view("o") if r["kind"] == "tool_result"]
         # by the bound on hand-backs, not by a part block (none applies to calendar)
@@ -2246,10 +2267,10 @@ def test_the_original_cancels_a_graft_during_its_model_call_and_its_work_so_far_
         script.open("cancel")
         out = await turn
         assert out[0] == "Stopped." and len(out) == 2 and out[1].startswith("Report:")
-        assert "You cancelled c1" in out[1] and "do not clone for that part again" in out[1]
+        assert "You cancelled c1" in out[1]
         assert "Still running: c2 (skills: slides)." in out[1]  # c1 is not running any more
         assert status(store=store, tl="c1") == "joined" and status(store=store, tl="c2") == "background"
-        assert h.wakes == [{"source": "o", "joined": [("c1", "cancelled")], "report": True}]
+        assert h.wakes == [{"source": "o", "joined": [("c1", "cancelled")]}]
         result, is_error = script.results[0]
         assert not is_error and result.startswith("cancelled -> c1 (stopped; its work so far joins when this turn ends")
         script.open()
@@ -3017,7 +3038,7 @@ def test_close_waits_for_a_cancel_in_flight_and_contains_a_store_error_there(tmp
     assert violations(store=store, tl="o") == []
 
 
-def test_the_original_may_cancel_in_a_report_and_the_cancel_gets_its_own_wake(tmp_path):
+def test_the_original_may_cancel_in_a_wake_and_the_cancel_gets_its_own_wake(tmp_path):
     class InReport(CancelScript):
         def __call__(self, system, messages, tools):
             last = messages[-1]["content"][-1]
@@ -3035,7 +3056,6 @@ def test_the_original_may_cancel_in_a_report_and_the_cancel_gets_its_own_wake(tm
         assert out[:3] == ["Started.", "The website is done.", "Stopped."]
         assert "You cancelled c2" in out[3] and len(out) == 4
         assert [w["joined"] for w in h.wakes] == [[("c1", "done")], [("c2", "cancelled")]]
-        assert all(w["report"] for w in h.wakes)  # both runs were reports: no clone was possible
         assert [status(store=store, tl=c) for c in ("c1", "c2")] == ["joined", "joined"]
         await h.close()
 
@@ -3245,7 +3265,7 @@ def test_a_cancel_beside_a_focus_clone_joins_before_the_focus_graft_does(tmp_pat
         # when the focus graft joined, the cancelled graft's join was still waiting on its source, unapplied
         assert (seen["queue"], seen["records"]) == (("queued", "cancelled"), [])
         assert out[0] == "Booked." and out[1].startswith("Report:") and "You cancelled c1" in out[1]
-        assert h.wakes == [{"source": "o", "joined": [("c1", "cancelled")], "report": True}]
+        assert h.wakes == [{"source": "o", "joined": [("c1", "cancelled")]}]
         assert [status(store=store, tl=c) for c in ("c1", "c2", "c3")] == ["joined", "background", "joined"]
         assert holder(store) == "o"
         records = [r for r in join_records(store) if " joined, reason=" in r]

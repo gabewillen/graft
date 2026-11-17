@@ -34,8 +34,8 @@ machine, applied only when the original holds the conversation and is at rest: b
 message (which waits on the machine meanwhile), at the end of a run, when a graft finishes while
 the original is idle, and, when a focus graft joins back, behind the background joins that were
 waiting. After joins that bring news and leave no user message to answer, the original is woken
-once with a closing harness note: to report (clone refused), or, if a request was handed back, to
-route it.
+once with a closing harness note, for a full run: it tells the user the outcome and may go on
+(clone, cancel, answer a request that was handed back) under the same bounds as any turn.
 
 Cancel is the original's alone: `cancel(cancel=[graft ids])`, while it runs. The cancel calls of
 one response are one request to its machine, which cancels each graft the graph allows (leaving
@@ -347,7 +347,7 @@ class Harness:
         self.out: list[str] = []  # user-facing texts: only the conversation holder's
         self.emit = emit or (lambda s: None)  # called with each user-facing text as it is said
         self._mark = 0  # self.out[:_mark] was already returned by user_says / settle
-        # per wake run: {source, joined: [(clone, reason)], report: True if clone was not allowed}
+        # per wake run: {source, joined: [(clone, reason)]}
         self.wakes: list[dict] = []
         self.join_dropped: set[str] = set()  # clones none of whose rows fit in the source (size backstop)
         # Records of what failed, for the experiments and tests (the session machine keeps the
@@ -567,7 +567,7 @@ class Harness:
 
     # ------------------------------------------------------------ host: I/O for the machines
     async def run_busy(self, tl: str, mode: Mode, kind: str) -> RunOutcome:
-        return await self._loop(tl=tl, kind=kind, wake=mode.wake, report=mode.report)
+        return await self._loop(tl=tl, kind=kind)
 
     async def run_background(self, tl: str) -> RunOutcome:
         return await self._loop(tl=tl, kind="background")
@@ -914,14 +914,13 @@ class Harness:
         the machine leaves the run's state, which ends this run where it waits."""
         await self.machines.ask(tl=tl, name="may_continue", build=lambda reply: reply)
 
-    async def _loop(self, tl: str, kind: str, wake: bool = False, report: bool = False) -> RunOutcome:
+    async def _loop(self, tl: str, kind: str) -> RunOutcome:
         """The model loop for tl: the activity of its machine's `busy` (or `background`) state.
         Returns how it ended, and nothing more: a reply with no tool call, an empty response, a
         join (with its reason), or a spent step budget. What follows is the machine's to decide
         (a background graft joins with a reason, a focus graft that joins hands back, the
         original rests). A clone that hands the conversation to a focus graft ends the run from
-        the machine (the state is left). `wake`: the run was started for joins; `report`: it may
-        only report (no clone). `kind`: tl's kind, as its machine says; it decides only whether
+        the machine (the state is left). `kind`: tl's kind, as its machine says; it decides only whether
         tl's text reaches the user.
 
         Whether the run may go on is its machine's decision, asked (`may_continue`) before every
@@ -1111,12 +1110,13 @@ class Harness:
                 else "No other clone of yours is still running.")
 
 
-    def wake_note(self, src: str, joined: list[tuple[str, str]], routing: bool, running: list[str],
+    def wake_note(self, src: str, joined: list[tuple[str, str]], handed_back: bool, running: list[str],
                   background: bool) -> None:
         """Close src's view with one harness note (a user row, so src can continue) for the joins
-        its machine is waking it for (the activity of its `noting` state). Whether the run may
-        route a handed-back request or only report is the machine's choice: `routing`. `running`:
-        src's grafts still running; `background`: the joined grafts are all background grafts."""
+        its machine is waking it for (the activity of its `noting` state). The note is factual and
+        forbids nothing: the wake is a full run. `handed_back`: a focus graft failed or handed its
+        request back, so that request is src's to answer (the machine says so). `running`: src's
+        grafts still running; `background`: the joined grafts are all background grafts."""
         names = ", ".join(f"{c} ({r})" for c, r in joined)
         dropped = [c for c, _ in joined if c in self.join_dropped]
         kept = [c for c, _ in joined if c not in self.join_dropped]
@@ -1125,20 +1125,21 @@ class Harness:
             where = (where + " " if where else "") + (
                 f"The result of {', '.join(dropped)} did not fit in your context and stays in the frozen "
                 f"timeline of {'that clone' if len(dropped) == 1 else 'those clones'}; say so if asked.")
-        task = ("A request came back: answer the user, and route what is still to do unless a "
-                "still-running clone is already doing it. " if routing else "Do not clone now. ")
+        task = ("A request came back: answer it. " if handed_back else "") + (
+            "Then go on with what the user asked for that is still to do, unless a still-running "
+            "clone is already doing it. ")
         cancelled = [c for c, r in joined if r == CANCELLED]
         if cancelled:
-            task += (f"You cancelled {', '.join(cancelled)}: tell the user it was stopped and what it had "
-                     "already done, and do not clone for that part again. ")
+            task = (f"You cancelled {', '.join(cancelled)}: tell the user it was stopped and what it had "
+                    "already done. ") + task
         self.store.add_turn(tl=src, role="user", kind="text", harness=True, content=(
                             f"(harness note: {self._names(clones=[c for c, _ in joined], background=background, named=False)} "
                             f"{names} joined; {where} {self._running_note(running)} "
                             "You hold the conversation: tell the user, "
                             f"in your own words, only the outcome of the clones that have joined. {task}"
                             "Do not describe still-running work as finished.)"))
-        self.wakes.append({"source": src, "joined": joined, "report": not routing})
-        self.trace(f"[{src}] WAKE ({'route' if routing else 'report'}) for joins: {names}")
+        self.wakes.append({"source": src, "joined": joined})
+        self.trace(f"[{src}] WAKE for joins: {names}")
 
     # ------------------------------------------------------------ join event
     def replied(self, tl: str) -> bool:

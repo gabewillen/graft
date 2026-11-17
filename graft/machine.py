@@ -51,7 +51,7 @@ Three rules hold everywhere in this module.
   the step sends anyway), forwarded to a focus graft (also one made in `cloning`, once its machine is started), and a
   run whose request is withdrawn ends (`_run_withdrawn`, the one rule). Every point that would
   start a run or let a graft act is guarded on its request being live (not withdrawn, reply not
-  done): `requesting` -> busy, the next inbox message, the wake / hand-back / routing runs,
+  done): `requesting` -> busy, the next inbox message, the wake and hand-back runs,
   `noting` -> busy, the clone gate, a focus graft's start (one whose request was withdrawn before
   it could act marks its row in `withdrawing` and rests), and a background graft's start and
   each of its steps (a background graft made for a request withdrawn never runs, or is stopped by
@@ -78,7 +78,7 @@ marks that request's row, and then at rest):
       engaged
         requesting    writing a user message's row (activity); then busy if it is still live, else
                       `dropping` (activity: the row gets the withdrawal mark), then rest
-        busy          running, in one of four modes (turn, route, report, external); `may_continue`
+        busy          running, in one of three modes (turn, wake, external); `may_continue`
                       is answered while the request the run answers, if any, is live, else busy is
                       left for `closing_calls`
           run         a run of the model loop: its activity
@@ -160,7 +160,7 @@ settles waiting and asks the original to (`restate`): suspended, the original pa
 on to its focus graft with its own record, and the graft re-states both in one event. At the end of `close` it stops every machine (`stopping`); one that cannot be
 stopped is reported (`telling`) and raised by `close`, and the rest are still stopped.
 
-Rules the graph enforces. Only the original clones, only in a turn or routing wake, never while
+Rules the graph enforces. Only the original clones, only in a turn or wake (every wake is a full run), never while
 closing, at most CLONE_TRIES clone calls per run (one, and one retry; a committed call is the
 run's last; a call past them is not prepared), never more than one focus graft per call, never beyond the harness's cap of live background grafts (MAX_LIVE_BACKGROUND by default), never
 more than MAX_CLONE_CALLS_PER_MESSAGE committed clone calls per user message, never for a request
@@ -188,8 +188,6 @@ MAX_LIVE_BACKGROUND = 4
 CANCELLED = "cancelled"  # the join reason of a cancelled graft: set by the harness only
 # Times a join's commit is tried, at successive commit points, before it is given up.
 MAX_JOIN_ATTEMPTS = 3
-# Clone calls a source may commit in wake runs between two user messages.
-MAX_WAKE_CLONE_CALLS = 1
 # Joins that may hand one request back to a timeline before it stops cloning for that request.
 MAX_REQUEST_HANDBACKS = 8
 # Clone calls committed for one user message, across every hand-back and wake it sets off.
@@ -234,12 +232,11 @@ class QueuedJoin(NamedTuple):
 
 
 class Mode(NamedTuple):
-    """How a run of the model loop goes. `wake`: started for joins (counts against the wake clone
-    calls); `report`: it may only report; `user`: a user's call waits on it, so its error is that
-    call's error; `about`: the grafts whose joins a wake run is for."""
+    """How a run of the model loop goes. `user`: a user's call waits on it, so its error is that
+    call's error; `answers`: a wake for a focus graft that failed or handed its request back, so
+    the run answers that request; `about`: the grafts whose joins a wake run is for."""
     name: str
-    wake: bool = False
-    report: bool = False
+    answers: bool = False
     user: bool = False
     about: tuple[str, ...] = ()
 
@@ -376,7 +373,7 @@ class Host(Protocol):
     def record_join(self, child: str, reason: str) -> None: ...
     def apply_join(self, src: str, join: QueuedJoin, cloned_for: int | None, running: list[str]
                    ) -> tuple[bool, int | None, bool]: ...
-    def wake_note(self, src: str, joined: list[tuple[str, str]], routing: bool, running: list[str],
+    def wake_note(self, src: str, joined: list[tuple[str, str]], handed_back: bool, running: list[str],
                   background: bool) -> None: ...
     def cancel_text(self, call: CancelCall, outcomes: dict[str, str]) -> tuple[str, bool]: ...
     def join_of(self, tl: str, reason: str) -> QueuedJoin: ...
@@ -478,7 +475,6 @@ class TimelineSM(hsm.Instance):
         self.arrivals: dict[tuple[int | None, frozenset[str]], int] = {}
         self.handbacks: dict[int | None, int] = {}
         self.clone_calls = 0  # committed since the last user message
-        self.wake_clones = 0  # clone calls committed in wake runs since the last user message
         self.reason = ""  # background: its join reason, while it is recorded
         self.close_first = False  # background: its run ended early (its open calls need results)
         self.forced: asyncio.Future | None = None
@@ -1015,8 +1011,6 @@ def decline_why(inst: TimelineSM, clone: Clone) -> str | None:
         return "only the original clones (grafts are one level deep)"
     if inst.clone_tries >= CLONE_TRIES:
         return "no clone calls left for this message; answer the user instead"
-    if inst.mode.report:
-        return "you were woken to report background clones that just finished; do not clone now"
     if inst.clone_calls >= MAX_CLONE_CALLS_PER_MESSAGE:
         return (f"the {MAX_CLONE_CALLS_PER_MESSAGE} clone calls for this user message are used up. Do not "
                 "clone again: answer the user yourself, briefly saying what could not be done")
@@ -1200,9 +1194,9 @@ def _withdrawn_rows(inst: TimelineSM) -> list[int]:
 
 def _answers_requests(inst: TimelineSM) -> bool:
     """Its current run is the one that answers its request: a turn on it (a focus graft's run
-    included), or a routing run on a request a focus graft handed back. A report or a wake for
-    background grafts follows a turn that already answered it."""
-    return inst.mode.user or (inst.mode.name == "route" and not inst.mode.wake)
+    included), or a wake on a request a focus graft handed back. A wake for background grafts
+    follows a turn that already answered it."""
+    return inst.mode.user or inst.mode.answers
 
 
 def _handed_back(inst: TimelineSM) -> bool:
@@ -1234,7 +1228,7 @@ def withdrawn_after(ctx, inst, event) -> bool:
 
 def noted_withdrawn(ctx, inst, event) -> bool:
     """The wake note is written, but the request the wake would answer was withdrawn meanwhile;
-    a routing wake for a request a focus graft handed back leaves it unanswered."""
+    a wake for a request a focus graft handed back leaves it unanswered."""
     return _marks_after(inst)
 
 
@@ -1518,7 +1512,7 @@ def final_waits(ctx, inst, event) -> bool:
 
 # The `after` choice's guards are disjoint: each outcome is one case of the one before it left
 # open (not shut down; no handed-back withdrawn row to mark; no live message waiting; something
-# to answer), and the report wake is the remainder, its one unguarded default.
+# to answer), and the wake is the remainder, its one unguarded default.
 def _after_open(inst: TimelineSM) -> bool:
     """Not shut down, and no handed-back withdrawn row to mark first."""
     return not inst.final and not _marks_after(inst)
@@ -1546,19 +1540,10 @@ def answers_handback(ctx, inst, event) -> bool:
     return _wakes(inst) and inst.ends_on_request
 
 
-def _routing(inst: TimelineSM) -> bool:
-    focus_back = any(r != "done" and inst.made.get(c) for c, r in inst.news)
-    return focus_back or (any(r == "out_of_scope" for _, r in inst.news)
-                          and inst.wake_clones < MAX_WAKE_CLONE_CALLS)
-
-
-def wakes_to_route(ctx, inst, event) -> bool:
-    return _wakes(inst) and not inst.ends_on_request and _routing(inst)
-
-
-def wakes_to_report(ctx, inst, event) -> bool:
-    """The rest of the wakes: a report run (coming to rest is the unguarded default)."""
-    return _wakes(inst) and not inst.ends_on_request and not _routing(inst)
+def wakes_to_run(ctx, inst, event) -> bool:
+    """The rest of the wakes: a full run, after a wake note (coming to rest is the unguarded
+    default)."""
+    return _wakes(inst) and not inst.ends_on_request
 
 
 def is_driven(ctx, inst, event) -> bool:
@@ -1863,7 +1848,7 @@ def _apply(inst, event):
 
 def _wake_note(inst, event):
     _close_out(inst)
-    inst.host.wake_note(src=inst.timeline_id, joined=list(inst.news), routing=inst.mode.name == "route",
+    inst.host.wake_note(src=inst.timeline_id, joined=list(inst.news), handed_back=inst.mode.answers,
                         running=_still_running(inst),
                         background=_background(inst=inst, clones=[c for c, _ in inst.news]))
 
@@ -1939,7 +1924,7 @@ def request_written(ctx, inst, event) -> None:
     request.row = event.data
     inst.answering, inst.answered = request, False
     inst.mode, inst.clone_tries = TURN, 0
-    inst.blocks, inst.clone_calls, inst.wake_clones = set(), 0, 0
+    inst.blocks, inst.clone_calls = set(), 0
     inst.waiters.append(Waiter(reply=request.reply, user=True, request=request))
 
 
@@ -1950,7 +1935,7 @@ def request_dropped(ctx, inst, event) -> None:
     are cleared."""
     closed_out(inst)
     request, inst.request = inst.request, None
-    inst.blocks, inst.clone_calls, inst.wake_clones = set(), 0, 0
+    inst.blocks, inst.clone_calls = set(), 0
     inst.unmarked.append(event.data)
     _prune(inst)
     _answer_dead([request])
@@ -2583,7 +2568,6 @@ def _register_grafts(inst: TimelineSM, clone: Clone) -> None:
             inst.graft_requests[child] = inst.answering
     inst.clone_calls += 1
     inst.clone_tries = CLONE_TRIES  # one committed clone call per run
-    inst.wake_clones += int(inst.mode.wake)
     inst.focus = next((g for g, f in clone.pairs if f), None)
     inst.spawn_plan = []
 
@@ -2859,15 +2843,11 @@ def answer_handback(ctx, inst, event) -> None:
     inst.mode = Mode(name="turn", user=True, about=tuple(c for c, _ in inst.news))
 
 
-def wake_route(ctx, inst, event) -> None:
-    focus_back = any(r != "done" and inst.made.get(c) for c, r in inst.news)
+def wake_run(ctx, inst, event) -> None:
+    """Every wake is a full run: it may reply, clone, cancel and go on, under the bounds of any
+    turn. A focus graft that failed or handed back makes it answer that graft's request."""
     inst.clone_tries = 0
-    inst.mode = Mode(name="route", wake=not focus_back, about=tuple(c for c, _ in inst.news))
-
-
-def wake_report(ctx, inst, event) -> None:
-    inst.clone_tries = 0
-    inst.mode = Mode(name="report", report=True, about=tuple(c for c, _ in inst.news))
+    inst.mode = Mode(name="wake", answers=_handed_back(inst), about=tuple(c for c, _ in inst.news))
 
 
 def note_written(ctx, inst, event) -> None:
@@ -3965,12 +3945,11 @@ def _timeline(name: str) -> hsm.Model:
                     T(S("requesting"), G(inbox_after), Effect(take_inbox)),
                     T(S("../idle"), G(quiet_after), Effect(come_to_rest)),
                     T(S("busy/run"), G(answers_handback), Effect(answer_handback)),
-                    T(S("noting"), G(wakes_to_route), Effect(wake_route)),
-                    T(S("noting"), G(wakes_to_report), Effect(wake_report)),
+                    T(S("noting"), G(wakes_to_run), Effect(wake_run)),
                     # the guards above cover every case: this is a step that failed (at rest, its
                     # callers wait for its recovery) or a guard that raised (reported)
                     T(S("../idle"), Effect(checked(final_clean, final_out_first, final_waits, withdrawn_after, inbox_after,
-                                                   quiet_after, answers_handback, wakes_to_route, wakes_to_report))),
+                                                   quiet_after, answers_handback, wakes_to_run))),
                 ),
                 hsm.State(
                     # a step failed: the clone call's open audit is rolled back, the run's open calls
