@@ -325,7 +325,9 @@ class World:
     withdrawn, shutdown) is cancelled where it waits and recorded as run with an error. No timeout
     is applied: a tool that never returns keeps its graft live. Cancellation is cooperative: a
     tool that swallows CancelledError blocks its graft's cancel and close(), and work it handed
-    to a thread or shielded may still act after the cancel (its result says so)."""
+    to a thread or shielded may still act after the cancel (its result says so). An async
+    `execute` is supported by the Harness only: SubagentRunner and experiments/isolation.py call
+    it synchronously."""
     site: dict[str, str] = field(default_factory=dict)
     decks: list[dict] = field(default_factory=list)
     calendar: list[dict] = field(default_factory=list)

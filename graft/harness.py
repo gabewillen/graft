@@ -3,7 +3,8 @@
 1. Read a timeline's context view (validated).
 2. Resolve its tools through timeline_skills -> skill_tools.
 3. Call the model (in a daemon worker thread, so background grafts run concurrently).
-4. Insert the new turns once and append their pointers; execute tools.
+4. Insert the new turns once and append their pointers; each host tool call is made by the
+   timeline's machine, as the activity of its `calling` state (awaited if `execute` is async).
 
 Who decides what. The state machines decide everything that is coordination: what may happen,
 who waits, and in what order. A run of the model loop (`_loop`) is the activity of a machine
