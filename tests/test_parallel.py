@@ -545,6 +545,81 @@ def test_a_done_join_wakes_a_full_run_that_clones_the_next_task(tmp_path):
     assert validate(store.view("o"), "o", require_user_end=False) == []
 
 
+def test_a_failed_join_wakes_a_full_run_that_clones_another_part(tmp_path):
+    """The website graft joins `failed`; its wake is a full run, and the original clones the deck."""
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" not in names:
+            if "slides_create" in names:
+                return text("Deck built.")
+            return [{"type": "tool_use", "id": "j1", "name": "join", "input": {"reason": "failed"}}]
+        if last["type"] == "tool_result":
+            return text("Refused: " + last["content"] if last.get("is_error") else "Started.")
+        if is_wake(last) and "c1 (failed)" in last["text"]:
+            return [{"type": "text", "text": "The website failed; starting the deck."},
+                    clone_use(clone_entry(skills=["slides"], focus=False), id="k2") | {"type": "tool_use"}]
+        if is_wake(last):
+            return text("The deck is done.")
+        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
+
+    store, h, _ = make(tmp_path, policy)
+
+    async def go():
+        await h.start()
+        out = await h.user_says(REQUEST) + await h.settle()
+        assert out == ["Started.", "The website failed; starting the deck.", "Started.", "The deck is done."]
+        assert [w["joined"] for w in h.wakes] == [[("c1", "failed")], [("c2", "done")]]
+        await h.machines.stop()
+
+    asyncio.run(go())
+    assert clones(store) == ["c1", "c2"] and h.part_of("c2") == {"slides"}
+    assert validate(store.view("o"), "o", require_user_end=False) == []
+
+
+def test_a_focus_hand_back_wakes_a_full_run_that_clones_another_part(tmp_path):
+    """The focus website graft hands the request back (`out_of_scope`) with no new message: the
+    wake note says a request came back, and the wake is a full run that clones the deck."""
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" not in names:
+            if "slides_create" in names:
+                return text("Deck built.")
+            return [{"type": "tool_use", "id": "j1", "name": "join", "input": {"reason": "out_of_scope"}}]
+        if last["type"] == "tool_result":
+            return text("Refused: " + last["content"] if last.get("is_error") else "Started.")
+        if is_wake(last) or (last["type"] == "text" and "c1 (out_of_scope) joined" in last["text"]):
+            if "c1 (out_of_scope)" in last["text"]:
+                return [{"type": "text", "text": "Starting the deck."},
+                        clone_use(clone_entry(skills=["slides"], focus=False), id="k2") | {"type": "tool_use"}]
+            return text("The deck is done.")
+        return [clone_use(clone_entry(skills=["website"], focus=True), id="k1") | {"type": "tool_use"}]
+
+    store, h, _ = make(tmp_path, policy)
+    notes = []
+    real = h.wake_note
+
+    def wake_note(**kw):
+        notes.append(kw["handed_back"])
+        return real(**kw)
+    h.wake_note = wake_note
+
+    async def go():
+        await h.start()
+        out = await h.user_says(REQUEST) + await h.settle()
+        assert out == ["Starting the deck.", "Started.", "The deck is done."]
+        assert [w["joined"] for w in h.wakes] == [[("c1", "out_of_scope")], [("c2", "done")]]
+        await h.machines.stop()
+
+    asyncio.run(go())
+    assert notes == [True, False]  # the first wake answers the handed-back request
+    wake_notes = [r["content"] for r in store.view("o") if r["harness"] and " joined; " in r["content"]]
+    assert "A request came back: answer it." in wake_notes[0] and "A request came back" not in wake_notes[1]
+    assert clones(store) == ["c1", "c2"] and h.part_of("c2") == {"slides"}
+    assert validate(store.view("o"), "o", require_user_end=False) == []
+
+
 def test_a_background_failure_does_not_block_its_part_for_an_unrelated_handed_back_request(tmp_path):
     store, h, _ = make(tmp_path, lambda *a: text("Routing that."))
 
@@ -3036,6 +3111,44 @@ def test_close_waits_for_a_cancel_in_flight_and_contains_a_store_error_there(tmp
 
     asyncio.run(go())
     assert violations(store=store, tl="o") == []
+
+
+class CloneOnCancelWake(CancelScript):
+    """On the wake for c1's cancelled join: clones the cancelled website part again (refused),
+    then the calendar, a part nobody asked to stop."""
+
+    def __call__(self, system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "clone" in names and is_wake(last) and "c1 (cancelled)" in last["text"]:
+            return [clone_use(clone_entry(skills=["website"], focus=False), id="w1") | {"type": "tool_use"}]
+        if "clone" in names and last["type"] == "tool_result" and last["tool_use_id"] == "w1":
+            return [clone_use(clone_entry(skills=["calendar"], focus=False), id="w2") | {"type": "tool_use"}]
+        if "clone" in names and last["type"] == "tool_result" and last["tool_use_id"] == "w2":
+            return text("Booking started.")
+        return super().__call__(system=system, messages=messages, tools=tools)
+
+
+def test_a_cancelled_join_wakes_a_full_run_that_clones_another_part(tmp_path):
+    """The original cancels the website graft; the wake for its join is a full run: the website
+    part is still refused, and a different part (the calendar) is cloned."""
+    script = CloneOnCancelWake(entries=TWO, ids=["c1"])
+    store, h, _ = make(tmp_path=tmp_path, policy=script)
+
+    async def go():
+        await h.start()
+        await h.user_says(REQUEST)
+        out = await h.user_says(STOP)
+        assert "Booking started." in out
+        script.open()
+        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await h.close()
+
+    asyncio.run(go())
+    assert clones(store) == ["c1", "c2", "c3"] and h.part_of("c3") == {"calendar"}
+    assert h.wakes[0]["joined"] == [("c1", "cancelled")]
+    refused = [r["content"] for r in store.view("o") if r["kind"] == "tool_result" and "clone refused" in r["content"]]
+    assert len(refused) == 1 and "was cancelled" in refused[0]
 
 
 class RecloneOnWake(CancelScript):
