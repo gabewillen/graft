@@ -1095,3 +1095,40 @@ def test_a_graft_whose_stop_always_fails_does_not_keep_the_others_from_stopping(
     assert calls[:MAX_STOP_ATTEMPTS] == ["c1"] * MAX_STOP_ATTEMPTS and calls.count("c1") == MAX_STOP_ATTEMPTS
     assert None not in calls
     assert {"slides_create", "calendar_book"} <= world.cancelled  # c2 and c3 were stopped at the withdrawal
+
+
+class Abort2(BaseException):
+    pass
+
+
+class BadMessage(BaseException):
+    """A non-Exception whose own message raises another non-Exception."""
+
+    def __str__(self):
+        raise Abort2("no message")
+
+
+def test_an_io_write_failure_whose_message_raises_still_has_an_outcome(tmp_path):
+    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    real = h.record_join
+
+    def broken(**kw):
+        if kw.get("child") == "c1":
+            raise BadMessage()
+        return real(**kw)
+    h.record_join = broken
+    out = drive_one(h=h, store=store)
+    assert out["joined"] is True and out["closed"] is True
+
+
+def test_a_row_write_failure_whose_message_raises_still_has_an_outcome(tmp_path):
+    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    real = h.store_result
+
+    def broken(**kw):
+        if kw["use"]["name"] == "site_write":
+            raise BadMessage()
+        return real(**kw)
+    h.store_result = broken
+    out = drive_one(h=h, store=store)
+    assert out["joined"] is True and out["closed"] is True

@@ -834,6 +834,19 @@ def Guard(expression: Callable) -> hsm.RedefinableConstraint:
     return hsm.Guard(_guard(expression))
 
 
+def described(error: BaseException) -> str:
+    """An error as one line tells it, '<type>: <message>', or its type alone when it has no message
+    or its message cannot be had (its __str__ raises, whatever it raises but an interpreter exit):
+    a fault path that tells an error never fails on the telling."""
+    try:
+        text = str(error)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:  # noqa: BLE001 - its message cannot be had: its type alone is shown
+        return type(error).__name__
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
 class Aborted(Exception):
     """An activity raised something that is not an Exception (and not a cancel or an interpreter
     exit): the library tells only an Exception (`hsm/error`), so it is raised as this one, and the
@@ -853,7 +866,7 @@ def Activity(work: Callable, done: str) -> hsm.RedefinableBehaviors:
         except (asyncio.CancelledError, *EXITS, Exception):
             raise
         except BaseException as error:  # noqa: BLE001 - told as an Exception, so it has an outcome
-            raise Aborted(f"{type(error).__name__}: {error}") from error
+            raise Aborted(described(error)) from error
     activity.__name__ = work.__name__
     return hsm.Activity(activity)
 
@@ -921,7 +934,7 @@ def io(done: str, work: Callable) -> hsm.RedefinableBehaviors:
         except (asyncio.CancelledError, *EXITS, Exception):
             raise
         except BaseException as error:  # noqa: BLE001 - told as an Exception, so it has an outcome
-            raise Aborted(f"{type(error).__name__}: {error}") from error
+            raise Aborted(described(error)) from error
         inst.dispatch(inst.context(), hsm.Event(name=done, data=result))
     activity.__name__ = f"io_{done}"
     return hsm.Activity(activity)
@@ -1604,7 +1617,7 @@ async def store_activity(ctx, inst: TimelineSM, event) -> None:
         raise
     except BaseException as error:  # noqa: BLE001 - the outcome event carries it, Exception or not
         inst.dispatch(inst.context(), hsm.Event(name="tool_unstored", data=error if isinstance(error, Exception)
-                                                else Aborted(f"{type(error).__name__}: {error}")))
+                                                else Aborted(described(error))))
         return
     inst.dispatch(inst.context(), hsm.Event(name="tool_stored"))
 
@@ -1678,7 +1691,7 @@ def _aborting(work: Callable) -> Callable:
         except (asyncio.CancelledError, *EXITS, Exception):
             raise
         except BaseException as error:  # noqa: BLE001 - told as an Exception, so it has an outcome
-            raise Aborted(f"{type(error).__name__}: {error}") from error
+            raise Aborted(described(error)) from error
     return activity
 
 
@@ -2437,7 +2450,7 @@ def decline_failed_step(ctx, inst, event) -> None:
     """The step that brought the call failed: the call is not tried, and its result names the error
     (its rules were not worked out on what the step left)."""
     error = _pending(inst)
-    inst.rejection = f"clone not executed: internal error ({type(error).__name__}: {error})"
+    inst.rejection = f"clone not executed: internal error ({described(error)})"
 
 
 def refuse_prepared(ctx, inst, event) -> None:
@@ -2459,7 +2472,7 @@ def take_prepared(ctx, inst, event) -> None:
 
 def preparation_crashed(ctx, inst, event) -> None:
     error = event.data
-    inst.rejection = f"clone refused; no clone was created: internal error ({type(error).__name__}: {error})"
+    inst.rejection = f"clone refused; no clone was created: internal error ({described(error)})"
 
 
 def committed(ctx, inst, event) -> None:

@@ -63,8 +63,8 @@ from typing import Callable, NamedTuple, Sequence
 from . import callsites, compaction
 from . import seeder as seeder_mod
 from .db import Graft, Store, render, validate
-from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, MAX_LIVE_BACKGROUND, Cancel, CancelCall, Clone, Machines, Mode, Prepared,
-                      QueuedJoin, RunOutcome, ToolCall, TransitionRefused, Unwritten)
+from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, MAX_LIVE_BACKGROUND, Cancel, CancelCall, Clone, Machines, Mode,
+                      Prepared, QueuedJoin, RunOutcome, ToolCall, TransitionRefused, Unwritten, described)
 from .providers import Provider, prefix_nonce, window_tokens_for
 from .skills import (BASE_SYSTEM, BUILTIN, MAX_CLONE_ENTRIES, World, cancel_limit, load_skill,
                      says_live_cap, skill_listing)
@@ -214,7 +214,9 @@ def _shown(error: BaseException) -> str:
     its message cannot be had (its __str__ raises)."""
     try:
         text = str(error)
-    except Exception:  # noqa: BLE001 - its message cannot be had: its type alone is shown
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:  # noqa: BLE001 - its message cannot be had: its type alone is shown
         return ""
     return f": {text[:ERROR_CHARS]}" if text else ""
 
@@ -299,7 +301,7 @@ def _described(error: BaseException) -> str:
     """An error as one line tells it: its type and text, and each error of a group, in order."""
     if isinstance(error, BaseExceptionGroup):
         return f"{type(error).__name__}: {error.message}: " + "; ".join(_described(e) for e in error.exceptions)
-    return f"{type(error).__name__}: {error}"
+    return described(error)  # guarded: a message that raises shows the type alone
 
 
 class Harness:
@@ -642,8 +644,8 @@ class Harness:
         self._report_failure(kind=kind, src=src, clones=clones, error=error, quiet=quiet, background=background)
 
     def graft_failed(self, tl: str, error: BaseException) -> None:
-        self.graft_errors.append((tl, f"{type(error).__name__}: {error}"))
-        self.trace(f"[{tl}] run failed -> join failed: {type(error).__name__}: {error}")
+        self.graft_errors.append((tl, _described(error)))
+        self.trace(f"[{tl}] run failed -> join failed: {_described(error)}")
 
     def abandon_clone(self, src: str, grafts: list[str]) -> None:
         """A committed clone call whose machines could not all start: its grafts are marked
@@ -1297,7 +1299,7 @@ class Harness:
                                    closing=closes)
         except Exception as e:  # nothing of the join was written; the audit record says so
             self.store.end_tx(tx, status="failed", committed_sql=None,
-                              scratch={"default": True, "error": f"{type(e).__name__}: {e}"})
+                              scratch={"default": True, "error": _described(e)})
             raise
         self.trace(f"[{src}] {sql}")
         return True
@@ -1440,7 +1442,7 @@ class Harness:
         try:
             prepared = await self._prepare_clone(src=src, use=clone.use, retry_left=retry_left, txs=txs)
         except Exception as e:  # noqa: BLE001 - an error is a refusal of the call
-            err = f"{type(e).__name__}: {e}"
+            err = _described(e)
             self._roll_back(src=src, txs=txs, scratch={"args": clone.use.get("input"), "error": err})
             self.trace(f"[{src}] clone refused: internal error: {err}")
             tail = "Call clone once more." if retry_left \
@@ -1470,7 +1472,7 @@ class Harness:
         """The machine refused a prepared clone call (or its commit failed): every transaction is
         rolled back. Returns the result text."""
         batch: CloneBatch = clone.data
-        detail = f"internal error ({type(error).__name__}: {error})" if error is not None else why
+        detail = f"internal error ({_described(error)})" if error is not None else why
         self._roll_back(src=src, txs=batch.txs, scratch={"refused": detail})
         self.trace(f"[{src}] clone refused: {detail}")
         tail = "Call clone once more." if batch.retry_left \
