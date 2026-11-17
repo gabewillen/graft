@@ -55,10 +55,10 @@ Three rules hold everywhere in this module.
   `noting` -> busy, the clone gate, a focus graft's start (one whose request was withdrawn before
   it could act marks its row in `withdrawing` and rests), and a background graft's start and
   each of its steps (a background graft made for a request withdrawn never runs, or is stopped by
-  the original when it records the withdrawal, before or after the answer (`stop_unwanted`: one
-  `cancel` per step, each stopped graft answering `stop_next`), so a tool it awaits is cancelled
-  where it waits; as a backstop it stops at its next step, asking its own machine and then its
-  source, `graft_step`; it joins `cancelled`, and that join wakes nothing). Whether a run
+  the original once it stands at rest after recording the withdrawal, before or after the answer
+  (`idle`, `cloned` or `rest` tick through those grafts, one `cancel` per step: `stop_one`), so a
+  tool it awaits is cancelled where it waits; as a backstop it stops at its next step, asking its
+  own machine and then its source, `graft_step`; it joins `cancelled`, and that join wakes nothing). Whether a run
   may go on is decided here too: the run asks (`may_continue`, a reply in the event) before every
   step that could act, and is answered while the request it answers, if any, is live; once it is
   withdrawn, `busy` is left the way a withdrawal leaves it, which ends the run where it waits. A
@@ -200,9 +200,6 @@ CLONE_TRIES = 2
 
 
 HEAD = 0  # the first item of a list: queues and work lists are taken from their head
-# The data of a `cancel` a source sends a background graft whose request was withdrawn: the graft
-# answers it with `stop_next`, so the source stops the next such graft (one send per step).
-STOP_NEXT = "stop_next"
 NONE_YET = 0  # a count not started: no attempt, no hand-back, no arrival so far
 STATE_HEAD = 2  # a state path split at its first two separators: '', the model, and the rest
 # What an activity never takes for an outcome: the interpreter's own exits. CancelledError is told
@@ -461,7 +458,7 @@ class TimelineSM(hsm.Instance):
         # with its join for its source to write (`QueuedJoin.closing`).
         self.unclosed: dict[str, tuple[str, bool]] | None = None
         # Its background grafts it stopped because the request each was made for was withdrawn
-        # (`stop_unwanted`): each is stopped once.
+        # (`stop_one`): each is stopped once.
         self.stopped_unwanted: set[str] = set()
         # Cancel calls of a step a recovery ended after it had stopped grafts: each call with what
         # became of its ids, for the recovery to write its real result (it ran: never "not run").
@@ -1929,8 +1926,8 @@ def _reply_error(reply: asyncio.Future) -> BaseException | None:
 
 def note_late_withdrawal(ctx, inst, event) -> None:
     """A request it answered is withdrawn: its caller was cancelled before it took the answer, and
-    the cancel wins. Recorded, so the background grafts made for it are stopped (`stop_unwanted`,
-    the next behavior of the same step) and join `cancelled`, and their joins wake nothing. Its row
+    the cancel wins. Recorded, so the background grafts made for it are stopped once it stands at
+    rest (`stop_one`) and join `cancelled`, and their joins wake nothing. Its row
     gets the withdrawal mark (a write of the scribe's) in the views it was asked in; an error it
     was answered with, which its caller never took, is told after that write (one line, which the
     next call's output shows, or else `settle` raises)."""
@@ -1940,29 +1937,30 @@ def note_late_withdrawal(ctx, inst, event) -> None:
           rows=[request.row] if request.row is not None else [])
 
 
-def _stop_next_unwanted(inst: TimelineSM) -> None:
-    """The next of its running background grafts made for a withdrawn request is stopped (`cancel`,
-    asking it to say when it has the cancel, `stop_next`, so the next one is stopped then): one
-    send per step."""
-    for child in [g for g in _still_running(inst) if _unwanted(inst=inst, child=g) and g not in inst.stopped_unwanted]:
-        inst.stopped_unwanted.add(child)
-        target = inst.machines.timelines.get(child)
-        if target is not None:  # a graft whose machine is gone is skipped: the chain goes on to the next
-            _forward(target=target, name="cancel", data=STOP_NEXT)
-            return
+def _stop_target(inst: TimelineSM) -> str | None:
+    """The next of its running background grafts made for a withdrawn request that it has not
+    stopped yet, if any."""
+    return next((g for g in _still_running(inst) if _unwanted(inst=inst, child=g)
+                 and g not in inst.stopped_unwanted), None)
 
 
-def stop_unwanted(ctx, inst, event) -> None:
-    """After a withdrawal is recorded: the background grafts made for that request stop at once,
-    not at their next step (a tool one of them awaits is cancelled where it waits). They join
-    `cancelled` and wake nothing (`_unwanted`). The first is stopped here; each stopped graft asks
-    for the next (`stop_next`)."""
-    _stop_next_unwanted(inst)
+def stops_due(ctx, inst, event) -> bool:
+    """A background graft made for a withdrawn request is still to be stopped."""
+    return _stop_target(inst) is not None
 
 
-def stop_next(ctx, inst, event) -> None:
-    """A graft it stopped for a withdrawal has the cancel: the next one is stopped."""
-    _stop_next_unwanted(inst)
+def tick_stop(ctx, inst, event) -> None:  # entry of a stopping state: the next stop, as its own step
+    _self(inst=inst, name="stop_tick")
+
+
+def stop_one(ctx, inst, event) -> None:
+    """One background graft made for a withdrawn request is stopped (`cancel`: it joins `cancelled`,
+    and a tool it awaits is cancelled where it waits). It is sent first and recorded as stopped
+    last, so a step that fails sends nothing, records nothing, and the stop is made again. A graft
+    whose machine is gone is recorded and skipped."""
+    child = _stop_target(inst)
+    _forward(target=inst.machines.timelines.get(child), name="cancel")
+    inst.stopped_unwanted.add(child)
 
 
 def call_finished(ctx, inst, event) -> None:
@@ -2869,13 +2867,6 @@ def close_abandoned(ctx, inst, event) -> None:
         _note(inst=inst, method="close_tool_uses", tl=inst.timeline_id, known=dict(inst.unclosed))
 
 
-def relay_stop(ctx, inst, event) -> None:
-    """A cancel its source sent because the request it was made for was withdrawn (`STOP_NEXT`):
-    the source is told it has it, so it stops its next such graft."""
-    if event.data == STOP_NEXT:
-        _forward(target=inst.machines.timelines.get(inst.source_id), name="stop_next")
-
-
 def _send_join(inst: TimelineSM) -> None:
     """A background graft's join event goes to its source (recorded once sent: a fault in the step
     that sends it, before the send, leaves it unsent, and the recovery sends it)."""
@@ -3368,6 +3359,20 @@ def bg_fault_at_end(ctx, inst, event) -> None:  # in a final state: one event, t
 # ------------------------------------------------------------------ the graphs
 
 
+def _stopping(T, S, On, G) -> list:
+    """The substates of a state the original stands in (`idle`, `cloned`) that stop, one per step,
+    the background grafts made for a withdrawn request: `gate` decides, `stopping` ticks once on
+    entry, and `stop_next` sends the next stop and ticks again, until none is due (`still`)."""
+    return [
+        hsm.Initial(S("gate")),
+        hsm.Choice("gate", T(S("stopping"), G(stops_due)), T(S("still"), Effect(checked(stops_due)))),
+        hsm.State("still"),
+        hsm.State("stopping", Entry(tick_stop), T(On("stop_tick"), S("../stop_next"))),
+        hsm.Choice("stop_next", T(S("stopping"), G(stops_due), Effect(stop_one)),
+                   T(S("still"), Effect(checked(stops_due)))),
+    ]
+
+
 def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableState:
     """What a running timeline does: run its model loop (`run`, an activity) or wait for the
     caller that drives the turn (`driven`). Both clone and cancel, step by step. A clone call is
@@ -3423,11 +3428,11 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
             # ended): the call it was preparing is rolled back in a state of its own before the
             # run's closing. A run that raised is told the way `busy` tells it (only the original
             # prepares a clone call, so the focus graft's branch does not arise here)
-            T(On("withdraw"), S("../../../unpreparing"), G(ends_run), Effect(note_withdrawn, stop_unwanted)),
-            T(On("withdraw"), G(withdraws_late), Call(note_late_withdrawal, stop_unwanted)),
+            T(On("withdraw"), S("../../../unpreparing"), G(ends_run), Effect(note_withdrawn)),
+            T(On("withdraw"), G(withdraws_late), Call(note_late_withdrawal)),
             # its own safe branch: recorded; a guard that raised is a fault of the timeline (not of
             # the call alone), so its recovery ends the run and rolls the call back
-            T(On("withdraw"), Effect(checked(ends_run, withdraws_late, effects=(note_withdrawn,), first=True), stop_unwanted)),
+            T(On("withdraw"), Effect(checked(ends_run, withdraws_late, effects=(note_withdrawn,), first=True))),
             T(On("run_failed"), S("../../../unpreparing"), G(error_to_user), Effect(error_for_user)),
             T(On("run_failed"), S("../../../unpreparing"), G(error_already_shown), Effect(error_shown)),
             T(On("run_failed"), S("../../../unpreparing"),
@@ -3454,9 +3459,9 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
                 # a withdrawal of a waiting message drops it here; any other is recorded and reaches
                 # the focus graft once it is made; the run ends once the step is done (`resume`), and
                 # no graft made for it acts on it
-                T(On("withdraw"), G(withdraws_waiting), Call(note_withdrawn, stop_unwanted)),
-                T(On("withdraw"), G(withdraws_late), Call(note_late_withdrawal, stop_unwanted)),
-                T(On("withdraw"), Call(checked(withdraws_waiting, withdraws_late, effects=(withdraw_and_forward,)), stop_unwanted)),
+                T(On("withdraw"), G(withdraws_waiting), Call(note_withdrawn)),
+                T(On("withdraw"), G(withdraws_late), Call(note_late_withdrawal)),
+                T(On("withdraw"), Call(checked(withdraws_waiting, withdraws_late, effects=(withdraw_and_forward,)))),
                 hsm.State(
                     "rejecting", io(done="rejected", work=_reject),  # refused before or in its preparation
                     T(On("rejected"), S("../../../resume"), Effect(clone_refused_written)),
@@ -3508,8 +3513,8 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
                 "cancels",  # the cancel calls of one response, id by id; a clone call carried with them waits
                 Entry(checks_from),
                 hsm.Defer("clone_request"),
-                T(On("withdraw"), G(withdraws_late), Call(note_late_withdrawal, stop_unwanted)),
-                T(On("withdraw"), Call(checked(withdraws_late, effects=(note_withdrawn,)), stop_unwanted)),  # the run ends once the cancels are done
+                T(On("withdraw"), G(withdraws_late), Call(note_late_withdrawal)),
+                T(On("withdraw"), Call(checked(withdraws_late, effects=(note_withdrawn,)))),  # the run ends once the cancels are done
                 T(On("graft_queued"), G(one_of_pending), Effect(cancel_landed)),
                 *_join_arrivals(T=T, On=On, G=G, besides=(one_of_pending,)),
                 hsm.Initial(S("checking")),
@@ -3588,8 +3593,8 @@ def _timeline(name: str) -> hsm.Model:
         ),
         T(On(*REQUESTS, RETURNED, "when_queued", "may_continue", "tool_request"), Call(refuse_request)),
         # in every state: recorded, never ignored (one of a request it answered: the cancel wins)
-        T(On("withdraw"), G(withdraws_late), Call(note_late_withdrawal, stop_unwanted)),
-        T(On("withdraw"), Call(checked(withdraws_late, effects=(note_withdrawn,)), stop_unwanted)),
+        T(On("withdraw"), G(withdraws_late), Call(note_late_withdrawal)),
+        T(On("withdraw"), Call(checked(withdraws_late, effects=(note_withdrawn,)))),
         T(On("call_done"), Call(call_finished)),
         # a background graft of its own asks before each step
         T(On("graft_step"), G(graft_wanted), Call(let_graft_go)),
@@ -3604,7 +3609,7 @@ def _timeline(name: str) -> hsm.Model:
         T(On("poke", "shutdown", "check"), Call(ignore)),
         T(On("tool_returned", "tool_stored"), Call(ignore)),  # its run was left: the closing wrote the call
         T(On("tool_unstored"), Call(tool_row_failed_late)),  # its run was left before the write's failure was taken
-        T(On("stop_next"), Call(stop_next)),  # a graft stopped for a withdrawal has the cancel
+        T(On("stop_tick"), Call(ignore)),  # a stopping state was left before its tick
         # a run that raised during a step that then ended it (a hand-over, its request withdrawn)
         T(On("run_failed"), Call(run_failed_after_it_ended)),
         T(On("closing"), Call(set_closing)),
@@ -3655,6 +3660,10 @@ def _timeline(name: str) -> hsm.Model:
                   Effect(take_handed_and_begin)),
                 T(On("inbox_handed"), Call(checked(handed_live_with_queue, handed_live_to_answer,
                                                    effects=(take_handed,)))),
+                # a withdrawal at rest: recorded, then the grafts made for it are stopped from here
+                T(On("withdraw"), S("gate"), G(withdraws_late), Effect(note_late_withdrawal)),
+                T(On("withdraw"), S("gate"), Effect(checked(withdraws_late, effects=(note_withdrawn,)))),
+                *_stopping(T=T, S=S, On=On, G=G),
             ),
             hsm.State(
                 "engaged",
@@ -3685,10 +3694,10 @@ def _timeline(name: str) -> hsm.Model:
                     T(On("run_failed", E), S("../closing_calls"), G(error_already_shown), Effect(error_shown)),
                     T(On("run_failed", E), S("../closing_calls"),
                       Effect(checked(is_focus, error_to_user, error_already_shown, effects=(error_reported,)))),
-                    T(On("withdraw"), S("../closing_calls"), G(ends_run), Effect(note_withdrawn, stop_unwanted)),
-                    T(On("withdraw"), S("../closing_calls"), G(ends_wake), Effect(note_late_withdrawal, stop_unwanted)),
-                    T(On("withdraw"), G(withdraws_late_only), Call(note_late_withdrawal, stop_unwanted)),
-                    T(On("withdraw"), Call(checked(ends_run, ends_wake, withdraws_late_only, effects=(note_withdrawn,)), stop_unwanted)),
+                    T(On("withdraw"), S("../closing_calls"), G(ends_run), Effect(note_withdrawn)),
+                    T(On("withdraw"), S("../closing_calls"), G(ends_wake), Effect(note_late_withdrawal)),
+                    T(On("withdraw"), G(withdraws_late_only), Call(note_late_withdrawal)),
+                    T(On("withdraw"), Call(checked(ends_run, ends_wake, withdraws_late_only, effects=(note_withdrawn,)))),
                     # the run asks before each step that could act: it goes on while the request it
                     # answers, if any, is live; once it is withdrawn the run is ended the way a
                     # withdrawal ends it (leaving `busy` ends the run that asked: nothing is left to answer)
@@ -3776,7 +3785,19 @@ def _timeline(name: str) -> hsm.Model:
                     T(S("../idle"), Effect(checked(step_intact))),  # a step that failed: its callers wait for its recovery
                 ),
                 hsm.Choice(
+                    # after a run: grafts made for a request withdrawn meanwhile are stopped first
                     "rest",
+                    T(S("stops"), G(stops_due)),
+                    T(S("resting"), Effect(checked(stops_due))),
+                ),
+                hsm.State("stops", Entry(tick_stop), T(On("stop_tick"), S("../stops_next"))),
+                hsm.Choice(
+                    "stops_next",
+                    T(S("stops"), G(stops_due), Effect(stop_one)),
+                    T(S("resting"), Effect(checked(stops_due))),
+                ),
+                hsm.Choice(
+                    "resting",
                     T(S("joining"), G(drains_now)),
                     T(S("../shutting"), G(closes_clean), into("active")),
                     T(S("closing_out"), G(closes_out_first)),
@@ -3843,8 +3864,11 @@ def _timeline(name: str) -> hsm.Model:
                                                  effects=(recover_call,), first=True))),
                 # a message its focus graft passed back (it had joined): kept here, never sent on again
                 T(On(RETURNED), Call(stash_message)),
-                T(On("withdraw"), G(withdraws_late), Call(note_late_withdrawal, stop_unwanted)),
-                T(On("withdraw"), Call(checked(withdraws_late, effects=(withdraw_and_forward,)), stop_unwanted)),
+                # recorded (and forwarded to its focus graft), then its own background grafts made
+                # for the request are stopped from here
+                T(On("withdraw"), S("gate"), G(withdraws_late), Effect(note_late_withdrawal)),
+                T(On("withdraw"), S("gate"), Effect(checked(withdraws_late, effects=(withdraw_and_forward,)))),
+                *_stopping(T=T, S=S, On=On, G=G),
                 T(On("call_done"), Call(call_finished_and_forward)),
                 T(On("focus_joined"), S("../engaged/joining"), Effect(focus_back)),
                 T(On("rest_request"), Call(answer_handed_off)),
@@ -3907,7 +3931,7 @@ BACKGROUND = hsm.Define(
     _T(_On("tool_returned", "tool_stored"), Effect(ignore)),  # its run was left: the closing wrote the call
     _T(_On("run_failed"), Effect(bg_run_failed_late)),  # its run raised as the graft was stopped: told
     _T(_On("tool_unstored"), Effect(tool_row_failed_late)),  # its run was left before the write's failure was taken
-    _T(_On("cancel"), Effect(relay_stop)),  # it has stopped already: a stop for a withdrawal goes on
+    _T(_On("cancel"), Effect(ignore)),
     _T(_On(FAULT), Effect(bg_fault_at_end)),  # joined, abandoned: the fault is told
     hsm.State(
         "live",  # until its join event is raised: callers waiting for it are kept
@@ -3918,7 +3942,7 @@ BACKGROUND = hsm.Define(
             mirrored("background"),
             _T(_On(FAULT), _S("../recording"), Effect(bg_fault_stops)),  # a step failed: it stops, joins failed
             _T(_On("finish"), _S("../ending")),
-            _T(_On("cancel"), _S("../recording"), Effect(ended_as(reason=CANCELLED, close_first=True), relay_stop)),
+            _T(_On("cancel"), _S("../recording"), Effect(ended_as(reason=CANCELLED, close_first=True))),
             _T(_On("shutdown"), _S("../recording"), Effect(ended_as(reason="failed", close_first=True))),
             _T(_On("join"), _S("../recording"), Effect(forced)),
             _T(_On("run_failed", _E), _S("../recording"), Effect(run_raised)),

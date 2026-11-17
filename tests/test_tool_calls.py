@@ -890,3 +890,59 @@ def test_a_tool_whose_own_task_the_host_cancels_ends_as_run_with_an_error(tmp_pa
     assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_BY_THE_TOOL, True)]
     assert store.timeline("c1")["join_reason"] == "done"
 
+
+
+def test_a_withdrawal_stops_every_waiting_graft_even_when_one_stop_fails_once(tmp_path, monkeypatch):
+    """The stops are the original's own steps (it ticks through them where it stands): one that
+    fails is made again, and no graft's answer is needed for the next stop."""
+    import graft.machine as machine
+    real, fired = machine.stop_one, []
+
+    def stop_once_failing(ctx, inst, event):
+        if not fired:
+            fired.append(inst.timeline_id)
+            raise RuntimeError("INJECTED stop_one")
+        return real(ctx=ctx, inst=inst, event=event)
+    monkeypatch.setattr(machine, "stop_one", stop_once_failing)
+    world, gate = SeveralWaiting(), threading.Event()
+    tools = {"website": use("w1", "site_write", page="i", content="x"),
+             "slides": use("s1", "slides_create", title="D"),
+             "calendar": use("k1", "calendar_book", what="x", date="2026-12-05", time="10:00")}
+
+    def policy(system, messages, tool_list):
+        names = {t["name"] for t in tool_list}
+        last = messages[-1]["content"][-1]
+        if "clone" in names:
+            if last["type"] == "tool_result":
+                assert gate.wait(WAIT_TIMEOUT)
+                return text("Started.")
+            if is_wake(last):
+                return text("Report.")
+            return [clone_use(*[clone_entry(skills=[k], focus=False) for k in tools], id="k1") | {"type": "tool_use"}]
+        skill = "website" if "site_write" in names else "slides" if "slides_create" in names else "calendar"
+        return [tools[skill]]
+
+    store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
+
+    async def go():
+        await h.start()
+        call = asyncio.create_task(h.user_says(REQUEST))
+        for name in ("site_write", "slides_create", "calendar_book"):
+            while name not in world.started:
+                await asyncio.sleep(0.01)
+        call.cancel()
+        gate.set()
+        try:
+            await call
+        except asyncio.CancelledError:
+            pass
+        for c in ("c1", "c2", "c3"):
+            await asyncio.wait_for(h.join_queued(c), WAIT_TIMEOUT)
+        try:
+            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        except RuntimeError:
+            pass  # the injected failure, told once
+        await h.close()
+
+    asyncio.run(go())
+    assert fired == ["o"] and world.cancelled == {"site_write", "slides_create", "calendar_book"}
