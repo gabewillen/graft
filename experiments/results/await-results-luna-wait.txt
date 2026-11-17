@@ -1,0 +1,25 @@
+await-results: model=gpt-6-luna live=True gate=True stuck=False
+model calls 30; input tokens 29050 (uncached 13171, cached 12416); output tokens 2263; wall 43.5s; follow-ups 1
+calls by tag: {'original': 2, 'original:clone_tx': 3, 'clone:c2': 9, 'clone:c4': 4, 'clone:c1': 2, 'clone:c3': 4, 'clone:c5': 2, 'clone:c6': 4}
+focus clone: joined out_of_scope; site written True; site_write waits [{'waited_s': 0.016, 'pending': ['slides', 'calendar', 'newsletter'], 'cancelled': False, 'model_calls_while_waiting': 0, 'model_calls_while_waiting_by_tag': {}}]; filed {'slides': True, 'calendar': True, 'newsletter': True}
+  c1 ['website'] status=joined join_reason=out_of_scope replied=False tools_run=[]
+  c2 ['slides'] status=queued join_reason=done replied=True tools_run=['slides_create', 'slides_add_slide', 'slides_add_slide', 'slides_add_slide', 'slides_add_slide']
+  c3 ['calendar'] status=queued join_reason=done replied=True tools_run=['calendar_book']
+  c4 ['newsletter'] status=queued join_reason=done replied=True tools_run=['newsletter_draft']
+  c5 ['website'] status=joined join_reason=out_of_scope replied=False tools_run=[]
+  c6 ['website'] status=active join_reason=None replied=True tools_run=['site_write']
+timeline (s since the run began):
+     9.476  slides_create ran
+    10.955  calendar_book waits until site_write is waiting
+    11.656  slides_add_slide waits until site_write is waiting
+    12.454  newsletter_draft waits until site_write is waiting
+    34.162  site_write starts waiting for ['slides', 'calendar', 'newsletter']
+    34.163  calendar_book ran
+    34.163  slides_add_slide ran
+    34.164  newsletter_draft ran
+    34.179  site_write stops waiting
+    34.179  site_write ran
+    36.759  slides_add_slide ran
+    38.960  slides_add_slide ran
+    40.698  slides_add_slide ran
+original's view violations: []

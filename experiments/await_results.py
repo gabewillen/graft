@@ -13,6 +13,7 @@ its tool waited, and each background clone's join reason.
 
     uv run python experiments/await_results.py --live          # needs OPENAI_API_KEY (and a model)
     uv run python experiments/await_results.py                 # offline: the scripted fake (mechanics only)
+    uv run python experiments/await_results.py --live --gate   # the filings wait until site_write waits
 """
 
 from __future__ import annotations
@@ -37,20 +38,34 @@ REQUEST = ("We are Okafor Dental in Columbus, Ohio. Our services: cleaning, impl
            "it must link to the open-house slide deck, the calendar booking and the newsletter. "
            "Meanwhile, in the background: make a slide deck for the open house, book the open house "
            "on my calendar, and draft a newsletter announcing it.")
-FOLLOW_UP = "No other details; use what I gave you and finish."
+FOLLOW_UP = "No other details: use placeholder links where you need them, and finish."
 MAX_FOLLOW_UPS = 3
 FILED = ("slides", "calendar", "newsletter")
 WAIT_LIMIT = 900.0  # seconds the whole conversation may take before the run is reported as stuck
 
 
+FILING = {"slides_add_slide": "slides", "calendar_book": "calendar", "newsletter_draft": "newsletter"}
+
+
 class Awaiting(World):
     """site_write awaits until the slides, the booking and the newsletter are filed, then writes.
-    Each filing sets its event when its tool runs; the wait is an asyncio wait, not a poll."""
+    Each filing sets its event when its tool runs; the wait is an asyncio wait, not a poll.
+    `gate`: each filing tool first awaits `focus_waiting`, which site_write sets when it starts
+    waiting, so the focus clone's tool is always reached before anything is filed and the wait
+    is exercised. `events`: (seconds since the run began, what happened), for the timeline."""
 
-    def __init__(self):
+    def __init__(self, gate: bool = False):
         super().__init__()
         self.filed = {name: asyncio.Event() for name in FILED}
+        self.focus_waiting = asyncio.Event()
+        self.gate = gate
         self.waits: list[dict] = []
+        self.events: list[tuple[float, str]] = []
+        self.t0 = time.perf_counter()
+        self.provider = None  # set by the run: model calls made while site_write waits are counted
+
+    def note(self, what: str) -> None:
+        self.events.append((round(time.perf_counter() - self.t0, 3), what))
 
     def _file(self, name: str) -> None:
         if not self.filed[name].is_set():
@@ -60,22 +75,32 @@ class Awaiting(World):
     async def execute(self, name, args):
         if name == "site_write":
             began = time.perf_counter()
+            calls_before = len(self.provider.call_log) if self.provider else 0
             pending = [n for n, e in self.filed.items() if not e.is_set()]
             print(f"  [world] site_write waits for: {pending or 'nothing'}")
+            self.note(f"site_write starts waiting for {pending}")
+            self.focus_waiting.set()
+            cancelled = False
             try:
                 await asyncio.gather(*(e.wait() for e in self.filed.values()))
             except asyncio.CancelledError:
-                self.waits.append({"waited_s": time.perf_counter() - began, "pending": pending, "cancelled": True})
+                cancelled = True
                 raise
-            self.waits.append({"waited_s": time.perf_counter() - began, "pending": pending, "cancelled": False})
+            finally:
+                during = self.provider.call_log[calls_before:] if self.provider else []
+                self.waits.append({"waited_s": round(time.perf_counter() - began, 3), "pending": pending,
+                                   "cancelled": cancelled, "model_calls_while_waiting": len(during),
+                                   "model_calls_while_waiting_by_tag": {
+                                       t: sum(1 for c in during if c.get("tag") == t)
+                                       for t in sorted({c.get("tag") for c in during})}})
+                self.note("site_write stops waiting" + (" (cancelled)" if cancelled else ""))
+        if name in FILING and self.gate and not self.focus_waiting.is_set():
+            self.note(f"{name} waits until site_write is waiting")
+            await self.focus_waiting.wait()
         result = World.execute(self, name, args)
-        if not result[1]:
-            if name == "slides_add_slide":
-                self._file("slides")
-            elif name == "calendar_book":
-                self._file("calendar")
-            elif name == "newsletter_draft":
-                self._file("newsletter")
+        self.note(f"{name} ran" + (" (error)" if result[1] else ""))
+        if not result[1] and name in FILING:
+            self._file(FILING[name])
         return result
 
 
@@ -104,33 +129,41 @@ def scripted(system, messages, tools):
     return [use("n", "newsletter_draft", subject="Open house", body="Join us on 2026-12-05.")]
 
 
-async def run(live: bool, trace: bool) -> dict:
+async def run(live: bool, trace: bool, gate: bool = False) -> dict:
     provider = make_provider() if live else FakeProvider(scripted)
     path = os.path.join(tempfile.mkdtemp(prefix="graft-await-"), "m.db")
     store = Store(path)
     install(store)
-    world = Awaiting()
+    world = Awaiting(gate=gate)
+    world.provider = provider
     h = Harness(store, provider, world=world, trace=(lambda m: print("  · " + m)) if trace else None,
                 **({} if live else {"seeder": None}))
     await h.start()
     transcript, follow_ups, stuck = [], 0, False
     t0 = time.perf_counter()
 
-    async def say(text):
-        print(f"\nUSER: {text}")
-        transcript.append(("user", text))
-        replies = await h.user_says(text) + await h.settle()
+    def heard(replies):
         for reply in replies:
             print(f"ASSISTANT: {reply}")
             transcript.append(("assistant", reply))
         return replies
 
+    async def say(text):
+        print(f"\nUSER: {text}")
+        transcript.append(("user", text))
+        return heard(await h.user_says(text))
+
     async def converse():
+        # settle only at the end: with the gate, a background clone waits for the focus clone's
+        # tool, so settling before the focus clone has reached it would wait for ever
         nonlocal follow_ups
         replies = await say(REQUEST)
-        while follow_ups < MAX_FOLLOW_UPS and replies and "?" in replies[-1] and not world.site:
+        # the focus clone holds the conversation until it writes the page: while it has not (it asked
+        # something, however it put it), it gets the one fixed follow-up, at most MAX_FOLLOW_UPS times
+        while follow_ups < MAX_FOLLOW_UPS and not world.site:
             follow_ups += 1
             replies = await say(FOLLOW_UP)
+        heard(await h.settle())
 
     try:
         await asyncio.wait_for(converse(), WAIT_LIMIT)
@@ -163,7 +196,8 @@ async def run(live: bool, trace: bool) -> dict:
                           "failed" if focus[0]["join_reason"] == "failed" else
                           "joined " + focus[0]["join_reason"] if focus[0]["join_reason"] else
                           "replied (holds the conversation)" if focus[0]["replied"] else "no reply"),
-        "site_write_waits": world.waits, "filed": {n: e.is_set() for n, e in world.filed.items()},
+        "gate": gate, "site_write_waits": world.waits, "timeline": world.events,
+        "filed": {n: e.is_set() for n, e in world.filed.items()},
         "site_written": bool(world.site), "view_violations": validate(store.view("o"), "o", require_user_end=False),
         "replies": [t for who, t in transcript if who == "assistant"], "db": path,
     }
@@ -172,7 +206,7 @@ async def run(live: bool, trace: bool) -> dict:
 
 
 def summary(r: dict) -> str:
-    lines = [f"await-results: model={r['model']} live={r['live']} stuck={r['stuck']}",
+    lines = [f"await-results: model={r['model']} live={r['live']} gate={r['gate']} stuck={r['stuck']}",
              f"model calls {r['model_calls']}; input tokens {r['input_tokens']} "
              f"(uncached {r['uncached_input']}, cached {r['cached_input']}); output tokens {r['output_tokens']}; "
              f"wall {r['wall_s']}s; follow-ups {r['follow_ups']}",
@@ -182,6 +216,8 @@ def summary(r: dict) -> str:
     for c in r["clones"]:
         lines.append(f"  {c['clone']} {c['skills']} status={c['status']} join_reason={c['join_reason']} "
                      f"replied={c['replied']} tools_run={c['tools_run']}")
+    lines.append("timeline (s since the run began):")
+    lines += [f"  {t:8.3f}  {what}" for t, what in r["timeline"]]
     lines.append(f"original's view violations: {r['view_violations']}")
     return "\n".join(lines)
 
@@ -190,9 +226,11 @@ async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--live", action="store_true")
     ap.add_argument("--trace", action="store_true")
+    ap.add_argument("--gate", action="store_true",
+                    help="each filing tool waits until site_write is waiting, so the wait is exercised")
     ap.add_argument("--out", help="write <out>.json and <out>.txt")
     a = ap.parse_args()
-    r = await run(live=a.live, trace=a.trace)
+    r = await run(live=a.live, trace=a.trace, gate=a.gate)
     text = summary(r)
     print("\n" + text)
     if a.out:

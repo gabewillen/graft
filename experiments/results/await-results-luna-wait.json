@@ -1,0 +1,177 @@
+{
+  "live": true,
+  "model": "gpt-6-luna",
+  "stuck": false,
+  "model_calls": 30,
+  "input_tokens": 29050,
+  "uncached_input": 13171,
+  "cached_input": 12416,
+  "output_tokens": 2263,
+  "wall_s": 43.5,
+  "calls_by_tag": {
+    "original": 2,
+    "original:clone_tx": 3,
+    "clone:c2": 9,
+    "clone:c4": 4,
+    "clone:c1": 2,
+    "clone:c3": 4,
+    "clone:c5": 2,
+    "clone:c6": 4
+  },
+  "follow_ups": 1,
+  "clones": [
+    {
+      "clone": "c1",
+      "skills": [
+        "website"
+      ],
+      "status": "joined",
+      "join_reason": "out_of_scope",
+      "replied": false,
+      "tools_run": []
+    },
+    {
+      "clone": "c2",
+      "skills": [
+        "slides"
+      ],
+      "status": "queued",
+      "join_reason": "done",
+      "replied": true,
+      "tools_run": [
+        "slides_create",
+        "slides_add_slide",
+        "slides_add_slide",
+        "slides_add_slide",
+        "slides_add_slide"
+      ]
+    },
+    {
+      "clone": "c3",
+      "skills": [
+        "calendar"
+      ],
+      "status": "queued",
+      "join_reason": "done",
+      "replied": true,
+      "tools_run": [
+        "calendar_book"
+      ]
+    },
+    {
+      "clone": "c4",
+      "skills": [
+        "newsletter"
+      ],
+      "status": "queued",
+      "join_reason": "done",
+      "replied": true,
+      "tools_run": [
+        "newsletter_draft"
+      ]
+    },
+    {
+      "clone": "c5",
+      "skills": [
+        "website"
+      ],
+      "status": "joined",
+      "join_reason": "out_of_scope",
+      "replied": false,
+      "tools_run": []
+    },
+    {
+      "clone": "c6",
+      "skills": [
+        "website"
+      ],
+      "status": "active",
+      "join_reason": null,
+      "replied": true,
+      "tools_run": [
+        "site_write"
+      ]
+    }
+  ],
+  "focus_outcome": "joined out_of_scope",
+  "gate": true,
+  "site_write_waits": [
+    {
+      "waited_s": 0.016,
+      "pending": [
+        "slides",
+        "calendar",
+        "newsletter"
+      ],
+      "cancelled": false,
+      "model_calls_while_waiting": 0,
+      "model_calls_while_waiting_by_tag": {}
+    }
+  ],
+  "timeline": [
+    [
+      9.476,
+      "slides_create ran"
+    ],
+    [
+      10.955,
+      "calendar_book waits until site_write is waiting"
+    ],
+    [
+      11.656,
+      "slides_add_slide waits until site_write is waiting"
+    ],
+    [
+      12.454,
+      "newsletter_draft waits until site_write is waiting"
+    ],
+    [
+      34.162,
+      "site_write starts waiting for ['slides', 'calendar', 'newsletter']"
+    ],
+    [
+      34.163,
+      "calendar_book ran"
+    ],
+    [
+      34.163,
+      "slides_add_slide ran"
+    ],
+    [
+      34.164,
+      "newsletter_draft ran"
+    ],
+    [
+      34.179,
+      "site_write stops waiting"
+    ],
+    [
+      34.179,
+      "site_write ran"
+    ],
+    [
+      36.759,
+      "slides_add_slide ran"
+    ],
+    [
+      38.96,
+      "slides_add_slide ran"
+    ],
+    [
+      40.698,
+      "slides_add_slide ran"
+    ]
+  ],
+  "filed": {
+    "slides": true,
+    "calendar": true,
+    "newsletter": true
+  },
+  "site_written": true,
+  "view_violations": [],
+  "replies": [
+    "The homepage hasn\u2019t been built yet; that task returned without a result. The open-house slide deck, calendar booking, and newsletter draft are still in progress.",
+    "Done \u2014 I created the Okafor Dental homepage with your services and open-house details. The slide deck, calendar booking, and newsletter links use placeholders until their destinations are available."
+  ],
+  "db": "/var/folders/tw/l56r2v8n43j0g44gwpl7t7bc0000gn/T/graft-await-d9daxhk5/m.db"
+}
