@@ -1226,3 +1226,40 @@ def test_a_model_call_raising_a_stop_iteration_with_a_bad_message_fails_its_run_
     out = drive_one(h=h, store=store)
     assert out["joined"] is True and out["closed"] is True
     assert store.timeline("c1")["join_reason"] == "failed"
+
+
+def test_a_seeder_that_raises_a_base_exception_refuses_the_clone_call_and_leaves_no_audit_open(tmp_path):
+    from graft.db import Store
+    from graft.providers import FakeProvider
+    from graft.harness import Harness
+    from graft.skills import install
+
+    class AbortingSeeder:
+        name = "aborting"
+
+        async def score(self, purpose, cands, trigger):
+            raise Abort("seeder abort")
+
+    def policy(system, messages, tools):
+        last = messages[-1]["content"][-1]
+        if last["type"] == "tool_result":
+            return text("Could not start it.")
+        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
+
+    store = Store(str(tmp_path / "p.db"))
+    install(store)
+    h = Harness(store, FakeProvider(policy), seeder=AbortingSeeder())
+    out = {}
+
+    async def go():
+        await h.start()
+        try:
+            out["said"] = await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            out["said"] = "TIMEOUT"
+        await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
+
+    asyncio.run(go())
+    assert out["said"] != "TIMEOUT"
+    assert store.con.execute("SELECT count(*) FROM transactions WHERE status='open'").fetchone()[0] == 0
+    assert store.con.execute("SELECT count(*) FROM timelines WHERE source_id IS NOT NULL").fetchone()[0] == 0

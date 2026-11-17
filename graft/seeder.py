@@ -27,6 +27,8 @@ import os
 import time
 from dataclasses import dataclass, field
 
+from .machine import described
+
 JEV_MODEL = "jev-1.13.0"
 DEFAULT_BUDGET = 24000  # estimated tokens per request; documented hard limits are 32k / 64k
 NEIGHBOR_CHARS = 300
@@ -184,7 +186,7 @@ class JevSeeder:
                                 None, len(batches), truncated)
         except Exception as e:  # any provider failure -> caller falls back
             return SeedDecision({}, time.perf_counter() - t0, None, self.model,
-                                f"{type(e).__name__}: {str(e)[:300]}")
+                                described(e)[:300])
 
 
 def make_seeder():

@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field, replace
 
 from .db import Skill, Store
-from .machine import MAX_LIVE_BACKGROUND
+from .machine import MAX_LIVE_BACKGROUND, described
 
 
 def obj(props: dict, required: list[str]) -> dict:
@@ -341,7 +341,7 @@ class World:
         try:
             return self._execute(name, args)
         except (KeyError, TypeError, AttributeError) as e:
-            return f"invalid arguments for {name}: {type(e).__name__}: {e}", True
+            return f"invalid arguments for {name}: {described(e)}", True
 
     def _execute(self, name: str, args: dict) -> tuple[str, bool]:
         self.log.append((name, args))
