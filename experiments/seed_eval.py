@@ -94,7 +94,9 @@ def load_event(path: str) -> Event | None:
     purpose = ""
     if tx and tx[0]:
         try:
-            purpose = str(json.loads(tx[0]).get("args", {}).get("purpose", ""))
+            args = json.loads(tx[0]).get("args", {})
+            # a store from before entries named no purpose: the task the harness says by the skills
+            purpose = str(args.get("purpose") or "the part covered by: " + ", ".join(map(str, args.get("skills", []))))
         except (ValueError, AttributeError):
             purpose = ""
     users = [c for c in cands if c["role"] == "user" and not c["harness"]]

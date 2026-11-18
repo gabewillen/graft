@@ -177,7 +177,7 @@ class Policy(FaultScript):
         if request == WAITING and names != {"compact"}:
             if "fork" in names:
                 if last["type"] == "text" and last["text"] == request:
-                    entries = [clone_entry(skills=[k], focus=False, quotes=[request]) for k in WAITING_TOOLS]
+                    entries = [clone_entry(skills=[k], focus=False) for k in WAITING_TOOLS]
                     return [clone_use(*entries, id=f"k{len(messages)}") | {"type": "tool_use"}]
                 if last["type"] == "tool_result":
                     self.answer_gate.wait(WAIT + HANG)  # the call is withdrawn before it is answered
@@ -190,7 +190,7 @@ class Policy(FaultScript):
         if request in (TOOL, TOOL_FOCUS) and names != {"compact"}:
             if "fork" in names:
                 if last["type"] == "text" and last["text"] == request:
-                    entry = clone_entry(skills=["website"], focus=request == TOOL_FOCUS, quotes=[request])
+                    entry = clone_entry(skills=["website"], focus=request == TOOL_FOCUS)
                     return [clone_use(entry, id=f"k{len(messages)}") | {"type": "tool_use"}]
                 return text("Reported." if is_wake(last) else "Started.")
             if last["type"] == "tool_result" and request == TOOL_FOCUS:

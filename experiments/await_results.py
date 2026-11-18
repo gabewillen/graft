@@ -113,11 +113,8 @@ def scripted(system, messages, tools):
     if "fork" in names:
         if last["type"] == "tool_result" or last.get("harness"):
             return [{"type": "text", "text": "On it."}]
-        entry = lambda skill, focus: {"purpose": skill, "skills": [skill], "focus": focus,  # noqa: E731
-                                      "seed_quotes": [REQUEST[:40]]}
-        return [use(prefix="k", tool="fork", branch=[
-            entry(skill="website", focus=True), entry(skill="slides", focus=False),
-            entry(skill="calendar", focus=False), entry(skill="newsletter", focus=False)])]
+        return [use(prefix="k", tool="fork", current={"skills": ["website"]},
+                    detached=[{"skills": [skill]} for skill in ("slides", "calendar", "newsletter")])]
     results = sum(1 for m in messages for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_result")
     if "slides_create" in names and results < 2:
         if results == 1:

@@ -254,11 +254,13 @@ class RunOutcome(NamedTuple):
 
 
 class Prepared(NamedTuple):
-    """A clone call the harness has seeded and validated: [(graft id, focus)], each entry's (index
-    in the model's list, catalog skills), and the harness's record of the batch."""
+    """A clone call the harness has seeded and validated: [(graft id, focus)], each entry's (label
+    in the model's call, catalog skills), the harness's record of the batch, and each graft's name
+    (the id the model knows it by, which the clone rules' words use)."""
     pairs: list[tuple[str, bool]]
-    parts: list[tuple[int, frozenset[str]]]
+    parts: list[tuple[str, frozenset[str]]]
     data: Any
+    names: Any = None
 
 
 @dataclass(eq=False)
@@ -315,8 +317,9 @@ class Clone:
     request: int | None = None
     cancels: "Cancel | None" = None  # cancel calls of the same response: the machine runs them first
     pairs: list[tuple[str, bool]] = field(default_factory=list)
-    parts: list[tuple[int, frozenset[str]]] = field(default_factory=list)
+    parts: list[tuple[str, frozenset[str]]] = field(default_factory=list)
     data: Any = None
+    names: dict[str, str] = field(default_factory=dict)  # graft id -> the id the model knows it by
 
 
 @dataclass
@@ -399,6 +402,7 @@ class TimelineSM(hsm.Instance):
         self.queue: list[QueuedJoin] = []  # joins waiting on this timeline, in finish order
         self.grafts: dict[str, bool] = {}  # its grafts whose join has not been applied: id -> focus
         self.parts: dict[str, frozenset[str]] = {}  # graft -> its catalog skills (its part)
+        self.names: dict[str, str] = {}  # graft -> the id the model knows it by (its words use it)
         self.made: dict[str, bool] = {}  # every graft it made -> focus (kept after its join)
         self.cloned_for: dict[str, int | None] = {}  # graft -> the request it was made for
         self.mode = TURN  # the mode of its current or next run
@@ -995,7 +999,7 @@ def clone_refusal(inst: TimelineSM, grafts: list[tuple[str, bool]]) -> str | Non
     focus = [g for g, f in grafts if f]
     if len(focus) > 1:
         return f"at most one branch may carry the conversation, got {focus}"
-    live = [g for g, is_focus in inst.grafts.items() if not is_focus]
+    live = [inst.names.get(g, g) for g, is_focus in inst.grafts.items() if not is_focus]
     cap = inst.max_live_background
     if len(live) + sum(1 for _, f in grafts if not f) > cap:
         return (f"at most {cap} detached branches may be live at once "
@@ -1004,7 +1008,7 @@ def clone_refusal(inst: TimelineSM, grafts: list[tuple[str, bool]]) -> str | Non
     return None
 
 
-def blocked_parts(inst: TimelineSM, clone: Clone) -> list[tuple[int, frozenset[str]]]:
+def blocked_parts(inst: TimelineSM, clone: Clone) -> list[tuple[str, frozenset[str]]]:
     return [(i, part) for i, part in clone.parts
             if any(r == clone.request and blocked & part for r, blocked in inst.blocks)]
 
@@ -1031,14 +1035,14 @@ def decline_why(inst: TimelineSM, clone: Clone) -> str | None:
 def clone_why(inst: TimelineSM, clone: Clone) -> str | None:
     """Why the graph refuses this prepared clone call, or None."""
     if any(g in inst.made for g, _ in clone.pairs):
-        return f"branch ids must be new: {[g for g, _ in clone.pairs]}"
+        return f"branch ids must be new: {[clone.names.get(g, g) for g, _ in clone.pairs]}"
     rule = clone_refusal(inst=inst, grafts=clone.pairs)
     if rule is not None:
         return f"forking is not possible now: {rule}"
     blocked = blocked_parts(inst=inst, clone=clone)
     if blocked:
         return "\n- ".join(
-            f"branch[{i}]: a branch with skills {sorted(part)} for this message already failed, was stopped, "
+            f"{i}: a branch with skills {sorted(part)} for this message already failed, was stopped, "
             "or handed it back twice. Do not fork for that part again: leave this entry out and tell "
             "the user, briefly, what could not be done" for i, part in blocked)
     return None
@@ -2544,7 +2548,8 @@ def take_prepared(ctx, inst, event) -> None:
     if isinstance(event.data, str):
         inst.rejection = event.data
     else:
-        inst.clone.pairs, inst.clone.parts, inst.clone.data = event.data
+        inst.clone.pairs, inst.clone.parts, inst.clone.data, names = event.data
+        inst.clone.names = dict(names or {})
         inst.refused = _outcome(rule=clone_why, inst=inst)  # read by the prepared gate
 
 
@@ -2604,9 +2609,10 @@ def spawned(ctx, inst, event) -> None:
 def _register_grafts(inst: TimelineSM, clone: Clone) -> None:
     """The grafts of a clone call whose machines started become the original's (also done by a
     recovery, for a step that failed after they started: grafts already started stay its own)."""
-    for (child, focus), (_, part) in zip(clone.pairs, clone.parts or [(0, frozenset())] * len(clone.pairs)):
+    for (child, focus), (_, part) in zip(clone.pairs, clone.parts or [("", frozenset())] * len(clone.pairs)):
         inst.grafts[child] = focus
         inst.parts[child] = part
+        inst.names[child] = clone.names.get(child, child)
         inst.cloned_for[child] = clone.request
         inst.made[child] = focus
         if not focus and inst.answering is not None:

@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS skill_tools(
 CREATE TABLE IF NOT EXISTS timelines(
   timeline_id TEXT PRIMARY KEY, source_id TEXT REFERENCES timelines,
   status TEXT NOT NULL, created_at REAL NOT NULL,
+  -- the id the model knows a graft by (`fork`'s `id`, or one drawn): unique, never reused
+  name TEXT UNIQUE,
   join_reason TEXT, join_trigger INTEGER);
 CREATE TABLE IF NOT EXISTS timeline_skills(
   timeline_id TEXT NOT NULL REFERENCES timelines, skill_id INTEGER NOT NULL REFERENCES skills,
@@ -117,6 +119,7 @@ class Graft:
     seed: list[int]
     skills: list[str]
     focus: bool = True
+    name: str | None = None  # the id the model knows it by
 
 
 class Store:
@@ -174,10 +177,10 @@ class Store:
 
     # ---------- timelines ----------
     def create_timeline(self, tl: str, source: str | None, skills: Iterable[str],
-                        status: str = "active") -> None:
+                        status: str = "active", name: str | None = None) -> None:
         self.con.execute(
-            "INSERT INTO timelines(timeline_id, source_id, status, created_at) VALUES (?,?,?,?)",
-            (tl, source, status, time.time()),
+            "INSERT INTO timelines(timeline_id, source_id, status, created_at, name) VALUES (?,?,?,?,?)",
+            (tl, source, status, time.time(), name),
         )
         self._link(tl, skills)
 
@@ -190,6 +193,18 @@ class Store:
 
     def timeline(self, tl: str) -> sqlite3.Row:
         return self.con.execute("SELECT * FROM timelines WHERE timeline_id=?", (tl,)).fetchone()
+
+    def name_of(self, tl: str) -> str | None:
+        row = self.con.execute("SELECT name FROM timelines WHERE timeline_id=?", (tl,)).fetchone()
+        return row[0] if row else None
+
+    def timeline_named(self, name: str) -> str | None:
+        row = self.con.execute("SELECT timeline_id FROM timelines WHERE name=?", (name,)).fetchone()
+        return row[0] if row else None
+
+    def names(self) -> set[str]:
+        """Every graft name ever given in this store: an id is never reused."""
+        return {r[0] for r in self.con.execute("SELECT name FROM timelines WHERE name IS NOT NULL")}
 
     def set_status(self, tl: str, status: str) -> None:
         self.con.execute("UPDATE timelines SET status=? WHERE timeline_id=?", (status, tl))
@@ -338,7 +353,7 @@ class Store:
         try:
             for g in grafts:
                 self.create_timeline(g.child, source, g.skills,
-                                     status="active" if g.focus else "background")
+                                     status="active" if g.focus else "background", name=g.name)
                 for rid in g.seed:
                     self.append(g.child, rid)
             for tx, sql, scratch in audits:

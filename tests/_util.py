@@ -38,3 +38,18 @@ def holder(store):
     """The timeline holding the conversation, or None if the store says it is not exactly one."""
     run = holders(store)
     return run[0] if len(run) == 1 else None
+
+
+def branch_input(*entries):
+    """A branch call's input from test entries: each {"skills", "focus", "id"?}; the one with
+    focus=True is `current`, the others are `detached`, in order. A dict without `focus` is
+    passed through as a detached entry (a malformed one, for refusal tests)."""
+    current = [e for e in entries if isinstance(e, dict) and e.get("focus") is True]
+    detached = [e for e in entries if not (isinstance(e, dict) and e.get("focus") is True)]
+    strip = lambda e: {k: v for k, v in e.items() if k != "focus"} if isinstance(e, dict) else e
+    out = {}
+    if current:
+        out["current"] = strip(current[0])
+    if detached or not current:
+        out["detached"] = [strip(e) for e in detached]
+    return out

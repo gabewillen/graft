@@ -315,7 +315,7 @@ def test_arm_g_clones_runs_and_joins_offline(tmp_path, monkeypatch):
         name = "fake"
 
         async def score(self, purpose, cands, trigger):
-            assert "Audit parser" in purpose
+            assert purpose.startswith("the part of the latest user request covered by")  # said by its skills
             return sd.SeedDecision(scores={c["row_id"]: 0.9 for c in cands}, model="fake-1", requests=1,
                                    input_tokens=50)
 

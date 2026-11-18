@@ -23,8 +23,11 @@ def make(tmp_path, cap=None):
     return store, Harness(store, FakeProvider(lambda *a: text("ok")), seeder=None, **kw)
 
 
+_IDS = __import__("itertools").count(1)
+
+
 def bg(n, skill="website"):
-    return clone_use(*[clone_entry(skills=[skill], focus=False)] * n)
+    return clone_use(*[clone_entry(skills=[skill], focus=False, id=f"w{next(_IDS)}") for _ in range(n)])
 
 
 async def fill(h, store, first, then):

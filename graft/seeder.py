@@ -1,20 +1,21 @@
 """Seed actor for the one-shot clone (GRAFT_SEEDER=model|jev).
 
 Jev request design (reduced + chunked; documented limits: 64k tokens per request, 32k for the
-state plus the longest question): the state is only the new task (purpose) and the user's latest
+state plus the longest question): the state is only the new task (the part of the latest request
+an entry's skills cover, said by their names and descriptions: `Harness.task_of`) and the user's latest
 request. Each candidate row is its own Noul whose instructions carry the row plus its immediate
 neighbour rows (one before, one after) for local reference. Questions are packed into batches whose
 estimated size (state + questions, characters / 4) stays under GRAFT_SEED_TOKEN_BUDGET (default
 24000), and batches run in parallel. A question that alone would exceed the budget has its message
 truncated deterministically (recorded in the decision).
 
-With `model` (the default when TYPESAFE_API_KEY is unset) the original names the seed itself (seed_quotes / seed_row_ids). With
-`jev`, a TypeSafe Jev decision model picks the seed: one `system_one` request per clone with one
-Noul ("does a branch doing <purpose> need this message?") per candidate row. Candidates are the
+With `model` (the default when TYPESAFE_API_KEY is unset) there is no decisions client: a graft
+starts from the conversation (`Harness.default_seed`). With `jev`, a TypeSafe Jev decision model
+picks the seed: one `system_one` request per clone with one Noul ("does a branch doing the new
+task need this message?") per candidate row. Candidates are the
 text rows of the source's working view, excluding harness notes. Rows scoring at or above
 GRAFT_SEED_THRESHOLD (default 0.4) are seeded in view order, and the user's latest message (the
-trigger) is always seeded. The original's own seed fields are then ignored, except as the
-fallback when Jev fails. The question and state format match experiments/seed_eval.py, which
+trigger) is always seeded. When Jev fails, the conversation is the fallback. The question and state format match experiments/seed_eval.py, which
 replays this decision offline.
 
 Jev pricing (docs.typesafe.ai/models, verified 2026-10-04): jev-1.13.0 input $0.042 / 1M tokens,

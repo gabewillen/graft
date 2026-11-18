@@ -54,10 +54,13 @@ CANCEL_TOOL = {
     "input_schema": obj(props={"ids": {"type": "array", "minItems": 1, "maxItems": MAX_CANCEL_IDS, "items": S}},
                         required=["ids"])}
 
-MAX_CLONE_ENTRIES = 4  # entries (branches) in one fork call
+MAX_CLONE_ENTRIES = 4  # entries (branches) in one fork call, current and detached together
 
-CLONE_ENTRY = obj({"purpose": S, "skills": STRS, "focus": {"type": "boolean"},
-                   "seed_quotes": STRS, "seed_row_ids": INTS}, ["purpose", "skills", "focus"])
+# What a branch id looks like: chosen by the model, or drawn by the harness (6 hex characters).
+BRANCH_ID_PATTERN = "^[a-z0-9][a-z0-9-]{0,31}$"
+
+# One entry of the branch call: the skills the branch holds and, optionally, its id.
+CLONE_ENTRY = obj({"id": {"type": "string", "pattern": BRANCH_ID_PATTERN}, "skills": STRS}, ["skills"])
 
 BASE_SYSTEM = (
     "You are a helpful assistant talking with one user in one ongoing conversation. "
@@ -65,7 +68,7 @@ BASE_SYSTEM = (
     "assistant and you narrow your tools for each task."
 )
 
-# The `fork` skill: graft's clone skill, as the original is told it.
+# The `branch` skill: graft's clone skill, as the original is told it.
 CLONE_INSTRUCTIONS = """\
 You hold only the `fork` skill. You talk with the user and route each request, and you work on
 a request by forking yourself: each branch you fork is you, carrying on with one part of the conversation
@@ -81,33 +84,31 @@ with the user is HEAD. A current branch takes HEAD: the user talks to it until i
 comes back to main. A detached branch works off to the side with no line to the user, while HEAD
 stays on main.
 
-FORK (one call per user message). `fork(branch=[...])` takes a list of one to four branches and
-starts them all at once. At most four detached branches of yours may be live at a time. Each entry has:
-- `purpose`: what this branch is for.
+FORK (one call per user message). `fork(current={...}, detached=[{...}, ...])` starts every
+branch it names at once. Give `current`, `detached`, or both; one call has at most four branches.
+At most four detached branches of yours may be live at a time. Each branch is `{id?, skills}`:
 - `skills`: catalog skill names the branch holds (never `fork`, `merge` or `detached`).
-- `focus` (required): true or false. At most one entry may have `focus: true`.
-  - `focus: true`: a current branch. In it you carry on the conversation with the user; here you
-    are paused until it merges. Use it when the task needs the user: requirements are still
-    open, or the user will want to iterate on the result.
-  - `focus: false`: a detached branch. In it you work out of sight and never talk to the user;
-    here you keep the conversation. Use it when the task is fully specified by what the user
-    already said and is independent of the other branches. A request with several independent
-    parts is one `fork` call with one detached entry per part.
-- the seed: the messages already in your conversation that this branch needs, as pointers (never
-  copies). Name each one either by `seed_quotes` (a short verbatim excerpt of that message, e.g.
-  its first words; each must match exactly one message) or by `seed_row_ids` (the row ids that
-  harness notes list). Seed every user message that carries facts the branch needs (audience,
-  tone, constraints, prior work) and end with the user message that asks for the task.
-In each branch you do only the part its skills cover and ignore the rest of the request, even when
-its seed is the whole message. So a request with several parts needs one entry per part: a part
-with no entry is done by nobody.
-If any entry is invalid the whole call is refused, with the violations per entry and an index of
-your messages, and no branch is started; fix it and call `fork` once more.
+- `id` (optional): a short name for the branch, lowercase letters, digits and `-` (for example
+  "site"), unique in this conversation and never reused. Without one, the branch gets a random id.
+  Results, notes and `stop` use it. Two branches of one call with the same skills need ids.
+- `current`: at most one branch, in which you carry on the conversation with the user; on main
+  you are paused until it merges. Use it when the task needs the user: requirements are still open,
+  or the user will want to iterate on the result.
+- `detached`: branches in which you work out of sight and never talk to the user; HEAD stays
+  on main. Use them when the task is fully specified by what the user already said and
+  is independent of the other branches. A request with several independent parts is one `fork`
+  call with one detached branch per part.
+Every branch starts from this conversation as it stands, as a git branch starts from its parent:
+you do not choose what it sees.
+In each branch you do only the part its skills cover and ignore the rest of the request. So a
+request with several parts needs one branch per part: a part with no branch is done by nobody.
+If any branch is invalid the whole call is refused, with the violations per branch, and no branch
+is started; fix it and call `fork` once more.
 Detached branches do not share locks: never give two branches work that changes the same thing.
 After a call with no current branch, tell the user briefly what you started. While detached
 branches run you keep talking to the user; a running branch cannot be steered from here.
 
-STOP. `stop(ids=["c2", ...])` stops detached branches of yours that are still running; harness
+STOP. `stop(ids=["site", ...])` stops detached branches of yours that are still running; harness
 notes and the fork result give their ids. Use it when the user asks you to stop a part, or when
 a part is no longer needed. You stop branches only from here: in a branch you never stop another
 branch. A stopped branch is stopped where it is and merges like any other when your turn ends:
@@ -124,8 +125,7 @@ MERGE (automatic). When a branch merges, what you did there becomes your memory 
 decision on your part: the harness appends a note listing the row ids, then the text messages
 (user and assistant) of that branch's conversation that you do not already have. If you left a
 current branch because the user asked for something else, that message is the last one; route it
-(usually: fork again, seeding from the rows you now hold). Harness notes list which of your
-branches are still running. If a current branch hands a request back while detached branches from
+(usually: fork again). Harness notes list which of your branches are still running. If a current branch hands a request back while detached branches from
 the same call are still running, do not fork again for the parts those branches are doing:
 fork only for what nobody is doing. Detached branches merge when you are free: what you did in
 them appears the same way, followed by a harness note asking you to tell the user the outcome. Tell
@@ -179,20 +179,21 @@ anything. Do the task with your tools, using only what this conversation already
 
 CATALOG: list[Skill] = [
     Skill(name="fork",
-          description="Built-in. When a user request needs any catalog skill, call fork(branch=[...]) right "
-          "away, with no text, instead of doing or planning the work here. Each entry is a branch "
-          "of yourself holding only the skills its part needs: in the current one (focus=true) you "
-          "carry the conversation with the user; detached ones (focus=false) work out of sight. "
+          description="Built-in. When a user request needs any catalog skill, call fork(current={...}, "
+          "detached=[...]) right away, with no text, instead of doing or planning the work here. Each "
+          "is a branch of yourself holding only the skills its part needs: in the current one you "
+          "carry the conversation with the user; detached ones work out of sight. "
           "stop(ids=[ids]) stops detached branches that are still running. Load this skill "
-          "for the current and detached branches, seeds, stopping, and how branches merge.",
+          "for current and detached branches, ids, stopping, and how branches merge.",
           instructions=CLONE_INSTRUCTIONS, tools=[
         LOAD_SKILL_TOOL,
-        {"name": "fork", "description": "Fork yourself, one branch per entry, in one call. Each entry "
-                                          "names its purpose, the skills that branch holds, whether you "
-                                          "carry the conversation in it (focus: at most one true), and its "
-                                          "seed (messages of yours, by short verbatim quote or by row id).",
-         "input_schema": obj(props={"branch": {"type": "array", "minItems": 1, "maxItems": MAX_CLONE_ENTRIES,
-                                         "items": CLONE_ENTRY}}, required=["branch"])},
+        {"name": "fork", "description": "Fork yourself in one call: `current`, the branch in which you "
+                                          "carry the conversation with the user, and `detached`, branches "
+                                          "that work out of sight; give either or both. Each branch names "
+                                          "the skills it holds and, optionally, its id.",
+         "input_schema": obj(props={"current": CLONE_ENTRY,
+                                    "detached": {"type": "array", "maxItems": MAX_CLONE_ENTRIES,
+                                                 "items": CLONE_ENTRY}}, required=[])},
         CANCEL_TOOL,
     ]),
     Skill(name="merge",

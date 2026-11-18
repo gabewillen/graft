@@ -31,12 +31,13 @@ def text(t):
     return [{"type": "text", "text": t}]
 
 
-def clone_entry(skills, *, focus, quotes=(REQUEST,), purpose="p"):
-    return {"purpose": purpose, "skills": skills, "focus": focus, "seed_quotes": list(quotes)}
+def clone_entry(skills, *, focus, id=None):
+    return {"skills": skills, "focus": focus, **({"id": id} if id is not None else {})}
 
 
 def clone_use(*entries, id="t"):
-    return {"id": id, "name": "fork", "input": {"branch": list(entries)}}
+    from _util import branch_input
+    return {"id": id, "name": "fork", "input": branch_input(*entries)}
 
 
 def user_texts(messages):
@@ -130,14 +131,36 @@ def is_wake(block):
 
 # ------------------------------------------------------------------ the clone call is one batch
 def test_clone_entries_shape():
-    assert clone_entries({"purpose": "p", "skills": ["website"]})[1]  # not a list of entries
-    assert clone_entries({"branch": []})[1]
-    _, v = clone_entries({"branch": [{"purpose": "p", "skills": ["website"]}]})
-    assert v == ["branch[0]: focus is required and must be true or false"]
-    _, v = clone_entries({"branch": [clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=True)]})
-    assert len(v) == 1 and "at most one entry may have focus=true" in v[0]
-    es, v = clone_entries({"branch": [clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=False)]})
-    assert v == [] and len(es) == 2
+    """`current` (one branch), `detached` (a list), or both; at least one branch in all."""
+    assert clone_entries({})[1] == ["`fork` needs `current`, a non-empty `detached`, or both; each branch is {id?, skills}"]
+    assert clone_entries({"detached": []})[1] == clone_entries({})[1]  # empty detached and no current
+    assert clone_entries({"detached": {"skills": ["website"]}})[1]  # not a list
+    _, v = clone_entries({"current": {"skills": ["website"], "focus": True}})
+    assert v == ["current: unknown field 'focus' (a branch has only `id` and `skills`)"]
+    _, v = clone_entries({"detached": [{"skills": ["website"]}], "branch": []})
+    assert v == ["unknown field 'branch' (`fork` takes `current` and `detached`)"]
+    es, v = clone_entries({"current": {"skills": ["website"]}, "detached": [{"skills": ["slides"]}]})
+    assert v == [] and [(e.label, e.focus) for e in es] == [("current", True), ("detached[0]", False)]
+    es, v = clone_entries({"current": {"skills": ["website"]}})
+    assert v == [] and len(es) == 1
+    es, v = clone_entries({"detached": [{"skills": ["slides"]}, {"skills": ["website"]}]})
+    assert v == [] and not any(e.focus for e in es)
+
+
+def test_branch_ids_are_checked_and_the_same_skills_twice_need_ids():
+    _, v = clone_entries({"detached": [{"skills": ["website"]}, {"skills": ["website"]}]})
+    assert v == ["detached[0] and detached[1] hold the same skills: give each an id to tell them apart"]
+    _, v = clone_entries({"detached": [{"id": "a", "skills": ["website"]}, {"skills": ["website"]}]})
+    assert len(v) == 1  # both need ids
+    es, v = clone_entries({"detached": [{"id": "a", "skills": ["website"]}, {"id": "b", "skills": ["website"]}]})
+    assert v == [] and [e.name for e in es] == ["a", "b"]
+    _, v = clone_entries({"detached": [{"id": "a", "skills": ["website"]}, {"id": "a", "skills": ["slides"]}]})
+    assert v == ["id 'a' is given to more than one branch"]
+    for bad in ("Site", "-site", "", "a" * 33, "a b", 7, None.__class__):
+        _, v = clone_entries({"current": {"id": bad, "skills": ["website"]}})
+        assert len(v) == 1 and v[0].startswith("current: id ") and "is not a branch id" in v[0], bad
+    for good in ("site", "0", "a" * 32, "my-site-2"):
+        assert clone_entries({"current": {"id": good, "skills": ["website"]}})[1] == [], good
 
 
 def test_refused_batch_is_atomic(tmp_path):
@@ -146,17 +169,15 @@ def test_refused_batch_is_atomic(tmp_path):
     async def go():
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
-        for bad in (clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=True)),          # two focus
-                    clone_use(clone_entry(skills=["website"], focus=False), {"purpose": "p", "skills": ["slides"],
-                                                          "seed_quotes": [REQUEST]}),        # focus missing
-                    clone_use(clone_entry(skills=["website"], focus=False), clone_entry(skills=["nope"], focus=False)),            # one bad entry
-                    clone_use(clone_entry(skills=["website"], focus=False), clone_entry(skills=["slides"], focus=False, quotes=["no such message"]))):
+        for bad in (clone_use(clone_entry(skills=["website"], focus=True), {"skills": ["slides"], "purpose": "p"}),  # a field too many
+                    clone_use(clone_entry(skills=["website"], focus=False), clone_entry(skills=["website"], focus=False)),  # same skills, no ids
+                    clone_use(clone_entry(skills=["website"], focus=False), clone_entry(skills=["nope"], focus=False))):  # one bad entry
             children, msg = await clone_in_turn(h=h, use=bad)
-            assert children is None and "no branch was started" in msg and "Your messages" in msg
+            assert children is None and "no branch was started" in msg
             assert clones(store) == [] and status(store=store, tl="o") == "active"
             assert store.con.execute("SELECT count(*) FROM timelines").fetchone()[0] == 1
             assert not store.con.execute("SELECT 1 FROM transactions WHERE status='committed'").fetchone()
-        assert "branch[1]: unknown skill 'nope'" in msg or "branch[1]: seed quote" in msg  # per-entry violations
+        assert "detached[1]: unknown skill 'nope'" in msg  # per-entry violations
         children, msg = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["website"], focus=False), clone_entry(skills=["slides"], focus=False)))
         assert children == ["c1", "c2"]  # distinct ids for one batch
         assert "c1 (detached, running" in msg and "c2 (detached, running" in msg
@@ -679,7 +700,7 @@ def test_skill_text_carries_the_own_part_rule():
     background = " ".join(BACKGROUND_INSTRUCTIONS.split()).lower()
     assert "only if you could not do your own part" in background
     clone = " ".join(CLONE_INSTRUCTIONS.split()).lower()
-    assert "only the part its skills cover" in clone and "one entry per part" in clone
+    assert "only the part its skills cover" in clone and "one branch per part" in clone
     assert "still running" in clone and "do not fork again for the parts" in clone
 
 
@@ -694,7 +715,7 @@ def test_a_focus_graft_seeded_with_a_multi_part_message_does_its_part(tmp_path):
             return bench_graft_policy(system, messages, tools)
         last = messages[-1]["content"][-1]
         if last["type"] == "text" and last["text"] == multi:
-            return [clone_use(clone_entry(skills=["website"], focus=True, quotes=[multi]), clone_entry(skills=["slides"], focus=False, quotes=[multi]),
+            return [clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=False),
                               id="k1") | {"type": "tool_use"}]
         return text("Okay.")
 
@@ -723,7 +744,7 @@ def test_pivot_policy_website_graft_keeps_a_multi_part_seed(tmp_path):
     async def go():
         await h.start()
         store.add_turn("o", "user", "text", "I need a website and later a slide show. Our services: cleaning.")
-        (c1,), msg = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["website"], focus=True, quotes=["I need a website"])))
+        (c1,), msg = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["website"], focus=True)))
         store.add_turn(tl="o", role="assistant", kind="tool_use", content={"id": "t", "input": {}}, tool_name="fork")
         store.add_turn(tl="o", role="user", kind="tool_result", content={"tool_use_id": "t", "content": msg}, tool_name="fork")
         await h.run(c1)  # the seed also mentions slides: that is another instance's part
@@ -817,7 +838,7 @@ def test_out_of_scope_background_joins_cannot_loop_without_a_user_message(tmp_pa
         if policy.calls > 12:  # the probe's stop: without a bound this never ends
             return text("Giving up.")
         policy.calls += 1
-        return [clone_use(clone_entry(skills=["website"], focus=False, quotes=["Earlier note."]), id=f"k{policy.calls}") | {"type": "tool_use"}]
+        return [clone_use(clone_entry(skills=["website"], focus=False), id=f"k{policy.calls}") | {"type": "tool_use"}]
 
     policy.calls = 0
     store, h, _ = make(tmp_path, policy)
@@ -953,21 +974,17 @@ def test_wake_note_does_not_point_at_rows_the_size_backstop_dropped(tmp_path):
 
 def test_clone_entries_validates_model_written_fields_and_keeps_raw_indexes():
     from graft.skills import CATALOG, MAX_CLONE_ENTRIES
-    es, v = clone_entries({"branch": ["junk", {"purpose": "p", "skills": "website", "focus": True},
-                                     {"purpose": "p", "skills": ["website", "website"], "focus": False,
-                                      "seed_quotes": [1], "seed_row_ids": ["7", True]}]})
-    assert [e.index for e in es] == [1, 2]  # the index in the model's list, not in the filtered one
-    assert v == ["branch[0]: must be an object",
-                 "branch[1]: skills must be a list of strings",
-                 "branch[2]: skills lists ['website'] more than once",
-                 "branch[2]: seed_quotes must be a list of strings",
-                 "branch[2]: seed_row_ids must be a list of integers"]
-    assert es[0].skills == [] and es[1].seed_quotes == [] and es[1].seed_row_ids == []  # nothing unusable kept
-    _, v = clone_entries({"branch": [clone_entry(skills=["website"], focus=False)] * (MAX_CLONE_ENTRIES + 1)})
-    assert v == [f"a fork call takes at most {MAX_CLONE_ENTRIES} entries (got {MAX_CLONE_ENTRIES + 1})"]
-    assert clone_entries("not a dict")[1] and clone_entries({"branch": {"purpose": "p"}})[1]
+    es, v = clone_entries({"detached": ["junk", {"skills": "website"}, {"skills": ["website", "website"], "id": "x"}]})
+    assert [e.label for e in es] == ["detached[1]", "detached[2]"]  # the index in the model's list, not in the filtered one
+    assert v == ["detached[0]: must be an object {id?, skills}",
+                 "detached[1]: skills must be a list of strings",
+                 "detached[2]: skills lists ['website'] more than once"]
+    assert es[0].skills == []  # nothing unusable kept
+    _, v = clone_entries({"detached": [clone_entry(skills=["website"], focus=False, id=f"w{i}") for i in range(MAX_CLONE_ENTRIES + 1)]})
+    assert v == [f"a fork call takes at most {MAX_CLONE_ENTRIES} branches (got {MAX_CLONE_ENTRIES + 1})"]
+    assert clone_entries("not a dict")[1] and clone_entries({"current": "x"})[1]
     schema = next(t for s in CATALOG if s.name == "fork" for t in s.tools if t["name"] == "fork")["input_schema"]
-    assert schema["properties"]["branch"]["maxItems"] == MAX_CLONE_ENTRIES
+    assert schema["properties"]["detached"]["maxItems"] == MAX_CLONE_ENTRIES and schema["required"] == []
 
 
 def test_clone_call_refuses_bad_entries_by_raw_index_and_caps_live_background_grafts(tmp_path):
@@ -977,12 +994,13 @@ def test_clone_call_refuses_bad_entries_by_raw_index_and_caps_live_background_gr
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
         children, msg = await clone_in_turn(h=h, use=clone_use("junk", clone_entry(skills=["nope"], focus=False)))
-        assert children is None and "branch[0]: must be an object" in msg and "branch[1]: unknown skill 'nope'" in msg
-        children, msg = await clone_in_turn(h=h, use=clone_use(*[clone_entry(skills=["website"], focus=False)] * MAX_LIVE_BACKGROUND))
+        assert children is None and "detached[0]: must be an object" in msg and "detached[1]: unknown skill 'nope'" in msg
+        children, msg = await clone_in_turn(h=h, use=clone_use(*[clone_entry(skills=["website"], focus=False, id=f"w{i}")
+                                                                for i in range(MAX_LIVE_BACKGROUND)]))
         assert len(children) == MAX_LIVE_BACKGROUND
         children, msg = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["slides"], focus=False)))
         assert children is None and f"at most {MAX_LIVE_BACKGROUND} detached branches may be live" in msg
-        assert "c1, c2, c3, c4" in msg and len(clones(store)) == MAX_LIVE_BACKGROUND
+        assert "w0, w1, w2, w3" in msg and len(clones(store)) == MAX_LIVE_BACKGROUND  # named as the model knows them
         (focus,), msg = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["slides"], focus=True)))  # a focus clone is not capped
         assert focus == "c5"
         statuses = {r[0] for r in store.con.execute("SELECT status FROM transactions")}
@@ -1192,7 +1210,7 @@ def test_multi_entry_clone_call_with_an_async_seeder_and_one_fallback(tmp_path):
             # entries are seeded concurrently: each waits until the other has started too
             await asyncio.wait_for(asyncio.shield(self.both), timeout=WAIT_TIMEOUT)
             self.live -= 1
-            if "deck" in purpose:
+            if "slides" in purpose:  # the task is said by the entry's skills
                 return sd.SeedDecision(error="TimeoutError: seeder timeout", model="fake-1")
             return sd.SeedDecision(scores={c["row_id"]: 0.9 for c in cands}, model="fake-1", requests=1)
 
@@ -1207,15 +1225,15 @@ def test_multi_entry_clone_call_with_an_async_seeder_and_one_fallback(tmp_path):
         store.add_turn("o", "assistant", "text", "Noted.")
         req = store.add_turn("o", "user", "text", REQUEST)
         (c1, c2), msg = await clone_in_turn(h=h, use=clone_use(
-            clone_entry(skills=["website"], focus=False, quotes=(), purpose="the site"),
-            clone_entry(skills=["slides"], focus=False, quotes=(REQUEST,), purpose="the deck")))
+            clone_entry(skills=["website"], focus=False),
+            clone_entry(skills=["slides"], focus=False)))
         assert seeder.peak == 2
         assert [r["row_id"] for r in store.view(c1)][0] == fact and store.view(c1)[-1]["row_id"] == req
-        assert [r["row_id"] for r in store.view(c2)] == [req]  # the model's own seed: the fallback
-        assert sorted(str(x["fallback"]) for x in h.seeder_log) == ["None", "model_seed"]
+        assert [r["row_id"] for r in store.view(c2)] == h.default_seed("o")  # the conversation: the fallback
+        assert sorted(str(x["fallback"]) for x in h.seeder_log) == ["None", "conversation"]
         audits = [__import__("json").loads(r[0])["seeder"] for r in store.con.execute(
             "SELECT scratch FROM transactions WHERE kind='clone' AND status='committed' ORDER BY tx_id")]
-        assert [a["fallback"] for a in audits] == [None, "model_seed"] and "seeder timeout" in audits[1]["error"]
+        assert [a["fallback"] for a in audits] == [None, "conversation"] and "seeder timeout" in audits[1]["error"]
         await h.machines.stop()
 
     asyncio.run(go())
@@ -1234,8 +1252,7 @@ def policy(system, messages, tools):
         threading.Event().wait()  # a background clone whose model call never returns
     if last["type"] == "tool_result":
         return [{"type": "text", "text": "Started."}]
-    return [{"type": "tool_use", "id": "k1", "name": "fork", "input": {"branch": [
-        {"purpose": "p", "skills": ["website"], "focus": False, "seed_quotes": [last["text"]]}]}}]
+    return [{"type": "tool_use", "id": "k1", "name": "fork", "input": {"detached": [{"skills": ["website"]}]}}]
 
 cli.make_provider = lambda: FakeProvider(policy)
 sys.argv = ["graft", "chat", "--db", sys.argv[1]]
@@ -1334,7 +1351,7 @@ def test_a_failed_graft_blocks_only_its_own_part(tmp_path):
     assert store.timeline("c3")["join_reason"] == "done"
     assert h.part_of("c3") == {"slides"}
     refusal = [r["content"] for r in store.view("o") if r["kind"] == "tool_result" and "fork refused" in r["content"]]
-    assert len(refusal) == 1 and "branch[0]:" in refusal[0] and "already failed" in refusal[0]
+    assert len(refusal) == 1 and "detached[0]:" in refusal[0] and "already failed" in refusal[0]
     assert "branch[1]:" not in refusal[0]  # the slides entry was fine
     assert [w["joined"] for w in h.wakes] == [[("c1", "failed"), ("c2", "out_of_scope")], [("c3", "done")]]
     assert validate(store.view("o"), "o", require_user_end=False) == []
@@ -1426,8 +1443,8 @@ def test_parallel_experiment_answers_a_question_with_a_bounded_follow_up(capsys,
         if "fork" in names:
             if last["type"] == "tool_result":
                 return text("(waiting)")
-            return [clone_use(clone_entry(skills=["website"], focus=True, quotes=[last["text"]]), clone_entry(skills=["slides"], focus=False, quotes=[last["text"]]),
-                              clone_entry(skills=["calendar"], focus=False, quotes=[last["text"]]), id="k1") | {"type": "tool_use"}]
+            return [clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=False),
+                              clone_entry(skills=["calendar"], focus=False), id="k1") | {"type": "tool_use"}]
         told = any(parallel.FOLLOW_UP in t for t in user_texts(messages))
         if "site_write" in names and not told:
             return text("Which colours would you like?")  # a focus graft asking for missing details
@@ -1465,7 +1482,7 @@ def test_a_user_message_that_looks_like_a_harness_note_does_not_lift_the_reclone
         if policy.calls > 12:  # the probe's stop: without a bound this never ends
             return text("Giving up.")
         policy.calls += 1
-        return [clone_use(clone_entry(skills=["website"], focus=False, quotes=[spoof]), id=f"k{policy.calls}") | {"type": "tool_use"}]
+        return [clone_use(clone_entry(skills=["website"], focus=False), id=f"k{policy.calls}") | {"type": "tool_use"}]
 
     policy.calls = 0
     store, h, _ = make(tmp_path, policy)
@@ -1518,7 +1535,10 @@ def test_a_store_without_the_harness_mark_is_refused(tmp_path):
         Store(path)
 
 
-def test_a_seed_may_only_point_at_rows_the_source_holds(tmp_path):
+def test_a_graft_starts_from_the_conversation_and_never_from_rows_the_source_does_not_hold(tmp_path):
+    """The seed is the source's conversation (its text rows through the last user message): never a
+    running sibling's rows, never tool calls or their output, never a harness note. Once a sibling
+    has merged, its text rows are the source's own memory and the next graft starts with them."""
     store, h, _ = make(tmp_path, lambda *a: text("ok"))
 
     async def go():
@@ -1529,20 +1549,16 @@ def test_a_seed_may_only_point_at_rows_the_source_holds(tmp_path):
         secret = store.add_turn(c1, "user", "tool_result", {"tool_use_id": "x1", "content": "SIBLING OUTPUT"},
                                 "site_read")
         said = store.add_turn(c1, "assistant", "text", "Working on it.")
-        for rid in (secret, said):  # a running sibling's rows, of any kind
-            children, msg = await clone_in_turn(h=h, use=clone_use(
-                {"purpose": "p", "skills": ["slides"], "focus": False, "seed_row_ids": [req, rid]}))
-            assert children is None and f"row {rid} is not in your conversation" in msg
-        assert clones(store) == [c1]
+        (c2,), _ = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["slides"], focus=False)))
+        assert store.pointed(c2) == {req}  # a running sibling's rows, of any kind, are not the source's
         await h.do_join(c1, "done")
         await h.drain_and_wake("o")
-        nxt = store.add_turn("o", "user", "text", "Now the deck, please.")
-        (c2,), _ = await clone_in_turn(h=h, use=clone_use(  # once joined, its text row is the source's own memory
-            {"purpose": "p", "skills": ["slides"], "focus": False, "seed_row_ids": [req, said, nxt]}))
-        assert said in store.pointed(c2)
-        children, msg = await clone_in_turn(h=h, use=clone_use(  # its tool output never joined: still refused
-            {"purpose": "p", "skills": ["calendar"], "focus": False, "seed_row_ids": [nxt, secret]}))
-        assert children is None and f"row {secret} is not in your conversation" in msg
+        nxt = store.add_turn("o", "user", "text", "Now the calendar, please.")
+        (c3,), _ = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["calendar"], focus=False)))
+        seeded = [r["row_id"] for r in store.view(c3)]
+        assert said in seeded and secret not in seeded and seeded[-1] == nxt  # its text merged; its tool output never did
+        assert not any(store.turn(r)["harness"] for r in seeded)  # the merge record and the wake note are not seeded
+        assert all(store.turn(r)["kind"] == "text" for r in seeded)
         await h.settle()
         await h.machines.stop()
 
@@ -1720,8 +1736,8 @@ def test_a_seeder_failure_cancels_the_sibling_seeder_calls(tmp_path):
         await h.start()
         state["deck"] = asyncio.get_running_loop().create_future()  # done when the deck's seeding starts
         store.add_turn("o", "user", "text", REQUEST)
-        children, msg = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["website"], focus=False, purpose="the site"),
-                                                         clone_entry(skills=["slides"], focus=False, purpose="the deck")))
+        children, msg = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["website"], focus=False),
+                                                         clone_entry(skills=["slides"], focus=False)))
         assert children is None and "seeder exploded" in msg
         del state["deck"]
         assert state == {"cancelled": True, "started": 2}  # nothing keeps running after the refusal
@@ -1737,7 +1753,7 @@ def test_an_over_cap_clone_call_is_refused_before_any_entry_work_with_one_audit_
         await h.start()
         store.add_turn("o", "user", "text", REQUEST)
         children, msg = await clone_in_turn(h=h, use=clone_use(*[clone_entry(skills=["website"], focus=False)] * 300))
-        assert children is None and "at most 4 entries (got 300)" in msg and "branch[" not in msg
+        assert children is None and "at most 4 branches (got 300)" in msg and "detached[" not in msg
         await h.machines.stop()
 
     asyncio.run(go())
@@ -1806,7 +1822,7 @@ def test_chat_status_and_error_lines_go_to_stderr(tmp_path, monkeypatch, capsys)
             raise ValueError("wake exploded")
         if last["type"] == "tool_result":
             return text("Started.")
-        return [clone_use(clone_entry(skills=["website"], focus=False, quotes=[last["text"]]), id="k1") | {"type": "tool_use"}]
+        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
     lines = iter(["Build me a website."])
 
@@ -1836,9 +1852,9 @@ def test_chat_status_and_error_lines_go_to_stderr(tmp_path, monkeypatch, capsys)
 
 
 # ------------------------------------------------------------------ hand-backs are bounded whatever the seed says
-def _always_clones(seed, reason, stop=12):
-    """An original that clones one website focus graft for every request and hand-back, seeded
-    with `seed` (model-chosen), and a graft that joins `reason` at once."""
+def _always_clones(reason, stop=12):
+    """An original that clones one website focus graft for every request and hand-back,
+    and a graft that joins `reason` at once."""
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
@@ -1848,7 +1864,7 @@ def _always_clones(seed, reason, stop=12):
             return text("ok")
         policy.calls += 1
         return [{"type": "tool_use", "id": f"k{policy.calls}", "name": "fork",
-                 "input": {"branch": [{"purpose": "p", "skills": ["website"], "focus": True, **seed}]}}]
+                 "input": {"current": {"skills": ["website"]}}}]
 
     policy.calls = 0
     return policy
@@ -1860,7 +1876,7 @@ def committed_clones(store):
 
 @pytest.mark.parametrize("reason,most", [("out_of_scope", 2), ("failed", 1)])
 def test_a_focus_graft_seeded_on_an_older_message_cannot_loop(tmp_path, reason, most):
-    policy = _always_clones({"seed_quotes": ["first message"]}, reason)
+    policy = _always_clones(reason)
     store, h, _ = make(tmp_path, policy)
 
     async def go():
@@ -1872,23 +1888,6 @@ def test_a_focus_graft_seeded_on_an_older_message_cannot_loop(tmp_path, reason, 
 
     asyncio.run(go())
     assert committed_clones(store) == most  # not one per hand-back until the stack overflows
-
-
-def test_a_focus_graft_seeded_on_a_harness_row_cannot_loop(tmp_path):
-    store, h, _ = make(tmp_path, lambda *a: text("ok"))
-
-    async def go():
-        await h.start()
-        await h.user_says("first message about the site")
-        note = store.add_turn("o", "user", "text", "(harness note: something the harness wrote)", harness=True)
-        h.provider.policy = _always_clones({"seed_row_ids": [note]}, "out_of_scope")
-        out = await h.user_says("second message please do it")
-        assert out and out[-1] == "ok"
-        assert store.timeline("c1")["join_trigger"] is None  # a harness row is never a request
-        await h.close()
-
-    asyncio.run(go())
-    assert committed_clones(store) == 2
 
 
 def test_clone_calls_per_user_message_are_capped_whatever_the_keys(tmp_path):
@@ -1908,8 +1907,7 @@ def test_clone_calls_per_user_message_are_capped_whatever_the_keys(tmp_path):
             return text("That is all I can do.")
         skill = parts[policy.calls % len(parts)]
         policy.calls += 1
-        return [{"type": "tool_use", "id": f"k{policy.calls}", "name": "fork", "input": {"branch": [
-            {"purpose": "p", "skills": [skill], "focus": True, "seed_quotes": [REQUEST]}]}}]
+        return [{"type": "tool_use", "id": f"k{policy.calls}", "name": "fork", "input": {"current": {"skills": [skill]}}}]
 
     policy.calls, policy.refusals = 0, []
     store, h, _ = make(tmp_path, policy)
@@ -2284,8 +2282,8 @@ def test_cancel_ids_validates_model_written_input():
     ids, problems = cancel_ids({"ids": ["c1", 3, None, " c2 ", "c1", "", ["c3"], True]}, limit=MAX_CANCEL_IDS)
     assert ids == ["c1"]  # in order, no repeats; an id is taken as written, never trimmed into shape
     assert [p.split(":")[0] for p in problems] == [f"ids[{i}]" for i in (1, 2, 3, 5, 6, 7)]
-    ids, problems = cancel_ids({"ids": [long_id, injected, "c2", "o", "c_1-x"]}, limit=MAX_CANCEL_IDS)
-    assert ids == ["c2", "o", "c_1-x"] and len(problems) == 2
+    ids, problems = cancel_ids({"ids": [long_id, injected, "c2", "o", "c-1-x"]}, limit=MAX_CANCEL_IDS)
+    assert ids == ["c2", "o", "c-1-x"] and len(problems) == 2
     for p in problems:  # a malformed value is shown as a short repr: bounded, and on one line
         assert len(p) < 120 and "\n" not in p and long_id not in p and "..." in p
     deep = "x"
@@ -2497,7 +2495,7 @@ def test_a_cancel_call_reports_each_bad_id_and_never_raises(tmp_path):
             assert states() == before and h.wakes == []
         by_attempt = dict(zip(map(repr, bad), (r for r, _ in script.results)))
         assert "no such branch" in by_attempt[repr({"ids": ["c9"]})]
-        assert "main cannot be stopped" in by_attempt[repr({"ids": ["o"]})]
+        assert "o: not stopped: no such branch" in by_attempt[repr({"ids": ["o"]})]  # a timeline id the model never saw
         assert "current branch" in by_attempt[repr({"ids": ["c1"]})]
         assert "is not a branch id" in by_attempt[repr({"ids": ["c2\nc3"]})]
         # one call with a good id and bad ones: the good one is cancelled, each bad one is reported
@@ -2536,7 +2534,8 @@ def test_a_focus_graft_whose_model_calls_cancel_is_refused(tmp_path):
         assert await h.user_says(REQUEST) == ["I can only book things."]
         assert holder(store) == "c1"  # the focus graft holds the conversation, and still cannot cancel
         (name, content, is_error), = tool_results(store=store, tl="c1")
-        assert name == "stop" and is_error and content.count("you stop branches only from main") == 3
+        assert name == "stop" and is_error and content.count("you stop branches only from main") == 2
+        assert "o: not stopped: no such branch" in content  # ids resolve only through branch ids
         assert status(store=store, tl="c2") == "background"
         script.open()
         await h.close()
@@ -2580,7 +2579,7 @@ def test_a_graft_stopped_right_after_a_response_with_a_tool_and_a_cancel_keeps_i
         last = messages[-1]["content"][-1]
         if last["type"] != "tool_result":
             return [{"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "home", "content": "hi"}},
-                    cancel_use(ids=["c9", "o"], id="g1")]
+                    cancel_use(ids=["c9", "o", "c1"], id="g1")]
         second_call.set()
         assert script.gates[skill].wait(GATE_TIMEOUT)
         return text("website finished")
@@ -2601,7 +2600,8 @@ def test_a_graft_stopped_right_after_a_response_with_a_tool_and_a_cancel_keeps_i
     asyncio.run(go())
     results = tool_results(store=store, tl="c1")
     assert results[0][0] == "site_write" and not results[0][2] and "not executed" not in results[0][1]
-    assert results[1][0] == "stop" and results[1][2] and results[1][1].count("you stop branches only from main") == 2
+    assert results[1][0] == "stop" and results[1][2] and results[1][1].count("you stop branches only from main") == 1
+    assert results[1][1].count("no such branch") == 2
     assert h.world.site == {"home": "hi"}
     note = [r for r in join_records(store) if "your branch c1 was stopped before it finished" in r]
     assert len(note) == 1 and "you had run there: site_write." in note[0]
@@ -3473,7 +3473,8 @@ def test_cancel_and_clone_in_one_response_replace_a_part_at_the_cap(tmp_path):
     async def go():
         await h.start()
         await h.user_says(REQUEST)
-        children, msg = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["social"], focus=False), id="probe"))
+        children, msg = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["social"], focus=False, id="probe"),
+                                                               id="probe"))
         assert children is None and f"at most {MAX_LIVE_BACKGROUND} detached branches" in msg  # at the cap
         out = await h.user_says(STOP)
         after = tool_results(store=store, tl="o")[1:]
@@ -3828,7 +3829,7 @@ def _focus_then_root(gate, entered=None):
             if last["type"] == "tool_result":
                 return text("Handing over.")
             if last["type"] == "text" and last["text"] == "Build a website.":
-                return [clone_use(clone_entry(skills=["website"], focus=True, quotes=["Build a website."]), id="t1")
+                return [clone_use(clone_entry(skills=["website"], focus=True), id="t1")
                         | {"type": "tool_use"}]
             return text(f"ROOT ANSWERS: {user_texts(messages)[-1]}")
         if entered is not None:
@@ -4086,7 +4087,7 @@ def test_a_cancelled_call_answered_by_a_focus_graft_stops_its_first_run(tmp_path
         if "fork" in names:
             if last["type"] == "tool_result":
                 return text("Handing over.")
-            return [clone_use(clone_entry(skills=["website"], focus=True, quotes=["Build a website."]), id="t1")
+            return [clone_use(clone_entry(skills=["website"], focus=True), id="t1")
                     | {"type": "tool_use"}]
         entered.set()
         assert gate.wait(GATE_TIMEOUT)
@@ -4148,7 +4149,7 @@ def test_a_cancelled_settle_does_not_take_the_errors_the_next_settle_raises(tmp_
 
 
 def test_a_cancel_beside_a_clone_refused_in_preparation_still_runs_first(tmp_path):
-    bad = clone_entry(skills=["social"], focus=False, quotes=("no such text anywhere",))
+    bad = clone_entry(skills=["social"], focus=False, id="Not An Id")
     script = Replace(entries=TWO, response=[new_clone(bad), cancel_use(ids=["c1"], id="x1")])
     store, h, said = make(tmp_path=tmp_path, policy=script)
 
@@ -4159,7 +4160,7 @@ def test_a_cancel_beside_a_clone_refused_in_preparation_still_runs_first(tmp_pat
         after = tool_results(store=store, tl="o")[1:]
         assert [name for name, _, _ in after][:2] == ["stop", "fork"]  # the cancel ran first
         results = results_by_name(store=store, tl="o")
-        assert results["stop"][0].startswith("stopped -> c1") and "matches no message" in results["fork"][0]
+        assert results["stop"][0].startswith("stopped -> c1") and "is not a branch id" in results["fork"][0]
         script.open()
         await h.close()
 
@@ -4211,9 +4212,9 @@ def test_a_cancelled_call_ends_the_run_that_answers_a_handed_back_message(tmp_pa
                    if b["type"] == "text"):  # the run that answers the handed-back message
                 entered.set()
                 assert gate.wait(GATE_TIMEOUT)
-                return [clone_use(clone_entry(skills=["calendar"], focus=False, quotes=["Build a website."]), id="late")
+                return [clone_use(clone_entry(skills=["calendar"], focus=False), id="late")
                         | {"type": "tool_use"}]
-            return [clone_use(clone_entry(skills=["website"], focus=True, quotes=["Build a website."]), id="t1")
+            return [clone_use(clone_entry(skills=["website"], focus=True), id="t1")
                     | {"type": "tool_use"}]
         return [{"type": "tool_use", "id": "j", "name": "merge", "input": {"reason": "out_of_scope"}}]
 
@@ -4321,7 +4322,7 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
                 if point in HOLD_CLONE:  # the original's turn is held while B arrives
                     entered["clone"].set()
                     assert gates["clone"].wait(GATE_TIMEOUT)
-                return [clone_use(clone_entry(skills=["website"], focus=focus, quotes=[request]), id="t1")
+                return [clone_use(clone_entry(skills=["website"], focus=focus), id="t1")
                         | {"type": "tool_use"}]
             if request in gates:
                 entered[request].set()
@@ -4761,7 +4762,7 @@ def test_a_withdrawn_request_whose_row_was_written_never_reaches_a_later_turn_as
             return text("answer to A")
         if point in ("it is handed back", "its wake is noted") and not messages[-1]["content"][-1].get("harness") \
                 and messages[-1]["content"][-1]["type"] == "text":
-            return [clone_use(clone_entry(skills=["website"], focus=True, quotes=["B"]), id="t1") | {"type": "tool_use"}]
+            return [clone_use(clone_entry(skills=["website"], focus=True), id="t1") | {"type": "tool_use"}]
         if point == "its run is running":
             entered.set()
             assert gate.wait(GATE_TIMEOUT)
@@ -4825,7 +4826,7 @@ def test_a_focus_graft_never_hands_back_a_message_that_was_withdrawn(tmp_path):
         last = messages[-1]["content"][-1]
         if "fork" in {t["name"] for t in tools}:
             if last["type"] == "text" and not last.get("harness") and last["text"] == "FOCUS go":
-                return [clone_use(clone_entry(skills=["website"], focus=True, quotes=["FOCUS go"]), id="t1")
+                return [clone_use(clone_entry(skills=["website"], focus=True), id="t1")
                         | {"type": "tool_use"}]
             return text("original here")
         if user_texts(messages)[-1] == "B":
@@ -4880,7 +4881,7 @@ def test_a_withdrawal_mark_binds_only_the_conversation_not_a_background_graft_se
         if last.get("harness"):
             seen["wake"] = messages
             return text("report")
-        return [clone_use(clone_entry(skills=["website"], focus=False, quotes=["BG go"]), id="t1")
+        return [clone_use(clone_entry(skills=["website"], focus=False), id="t1")
                 | {"type": "tool_use"}]
 
     store, h, said = make(tmp_path=tmp_path, policy=policy)
@@ -4980,28 +4981,24 @@ def _clones_on(entry_for, seen):
 
 
 @pytest.mark.parametrize("focus", [False, True])
-@pytest.mark.parametrize("by", ["quote", "row id"])
-def test_a_message_the_user_withdrew_is_refused_as_a_seed(tmp_path, by, focus, mark):
-    """resolve_seed: a clone seeded with a message the user withdrew, by quote or by row id, is
-    refused; no graft is made and no model call is made for it."""
+def test_a_message_the_user_withdrew_is_never_in_a_grafts_seed(tmp_path, focus, mark):
+    """default_seed: a graft starts from the conversation, which leaves out a message the user
+    withdrew; the graft never sees it."""
     seen = {}
-
-    def entry(seen):
-        if by == "quote":
-            return clone_entry(skills=["website"], focus=focus, quotes=[WITHDRAWN])
-        return {"purpose": "p", "skills": ["website"], "focus": focus, "seed_row_ids": [seen["row"]]}
-
-    store, h, said = make(tmp_path=tmp_path, policy=_clones_on(entry_for=entry, seen=seen))
+    store, h, said = make(tmp_path=tmp_path, policy=_clones_on(
+        entry_for=lambda seen: clone_entry(skills=["website"], focus=focus), seen=seen))
     real = h.begin_request
     h.begin_request = lambda **kw: seen.setdefault("row", real(**kw))
 
     async def then():
-        assert await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT) == ["answered C"]
+        await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT)
 
     row = withdrawn_then(h=h, then=then, mark=mark)
     assert seen["row"] == row
-    assert seen["result"].startswith("fork refused") and "withdrew" in seen["result"], seen["result"]
-    assert store.timeline("c1") is None and "graft" not in seen
+    (name, result, _), = tool_results(store=store, tl="o")
+    assert name == "fork" and result.startswith("forked"), result
+    assert row not in store.pointed("c1") and WITHDRAWN not in user_texts(seen["graft"][0])
+    assert user_texts(seen["graft"][0]) == ["C"]
     assert [r["withdrawn"] for r in store.view("o") if r["row_id"] == row] == [1]
 
 
@@ -5020,7 +5017,7 @@ def test_a_quote_of_a_message_withdrawn_and_sent_again_names_the_one_sent_again(
             seen["result"] = last["content"]
             return text("Started.")
         if last["type"] == "text" and not last.get("harness") and last["text"] == WITHDRAWN:
-            return [clone_use(clone_entry(skills=["website"], focus=False, quotes=[WITHDRAWN]), id="t1")
+            return [clone_use(clone_entry(skills=["website"], focus=False), id="t1")
                     | {"type": "tool_use"}]
         return text("ok")
 
@@ -5038,25 +5035,10 @@ def test_a_quote_of_a_message_withdrawn_and_sent_again_names_the_one_sent_again(
     assert user_texts(seen["graft"]) == [WITHDRAWN]
 
 
-def test_the_seed_index_of_a_refused_call_leaves_out_a_message_the_user_withdrew(tmp_path, mark):
-    """seed_index: a refused clone call's result lists the messages a seed may name; a message the
-    user withdrew is not among them."""
-    seen = {}
-    store, h, said = make(tmp_path=tmp_path, policy=_clones_on(
-        entry_for=lambda seen: clone_entry(skills=["website"], focus=False, quotes=["no such message"]), seen=seen))
-
-    async def then():
-        await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT)
-
-    row = withdrawn_then(h=h, then=then, mark=mark)
-    index = seen["result"].split("Your messages (row_id role: text):", 1)[1]
-    assert f" {row} user:" not in index and " user: C" in index, index
-
-
-@pytest.mark.parametrize("seeder_answer", ["scores", "an error: the model's seed is the fallback"])
+@pytest.mark.parametrize("seeder_answer", ["scores", "an error: the conversation is the fallback"])
 def test_the_seeder_never_seeds_a_message_the_user_withdrew(tmp_path, seeder_answer, mark):
-    """The seeder actor and its fallback: the withdrawn message is no candidate, and a model seed
-    naming it is no fallback (the seed falls back to the candidates instead)."""
+    """The seeder actor and its fallback: the withdrawn message is no candidate, and the fallback
+    (the conversation) leaves it out too."""
     from graft import seeder as sd
     seen, offered = {}, []
 
@@ -5070,7 +5052,7 @@ def test_the_seeder_never_seeds_a_message_the_user_withdrew(tmp_path, seeder_ans
             return sd.SeedDecision(error="offline")
 
     def entry(seen):
-        return {"purpose": "p", "skills": ["website"], "focus": False, "seed_row_ids": [seen["row"]]}
+        return clone_entry(skills=["website"], focus=False)
 
     store = Store(str(tmp_path / "s.db"))
     install(store)
@@ -5103,11 +5085,11 @@ def test_a_final_seed_holding_a_message_the_user_withdrew_is_refused_whoever_cho
     store = Store(str(tmp_path / "g.db"))
     install(store)
     h = Harness(store=store, provider=FakeProvider(_clones_on(
-        entry_for=lambda seen: clone_entry(skills=["website"], focus=False, quotes=["C"]), seen=seen)),
+        entry_for=lambda seen: clone_entry(skills=["website"], focus=False), seen=seen)),
         seeder=Seeder())
 
-    async def seed_with_actor(src, purpose, model_seed, model_problems):
-        return [seen["row"]] + model_seed, [], {}
+    async def seed_with_actor(src, skills):
+        return [seen["row"]] + h.default_seed(src), {}
     h.seed_with_actor = seed_with_actor
 
     async def then():
@@ -5259,7 +5241,7 @@ def test_a_withdrawn_request_runs_no_cancel_call_after_the_cancel(tmp_path):
         if user_texts(messages)[-1] == "BG go":
             if last["type"] == "tool_result":
                 return text("Started.")
-            return [clone_use(clone_entry(skills=["website"], focus=False, quotes=["BG go"]), id="t1")
+            return [clone_use(clone_entry(skills=["website"], focus=False), id="t1")
                     | {"type": "tool_use"}]
         return [cancel_use(ids=["c1"], id="x1"), load_use(n=1)]  # the cancel calls run after the others
 
@@ -5337,7 +5319,7 @@ def test_a_message_waiting_when_the_original_hands_over_is_answered_before_a_lat
             if messages[-1]["content"][-1]["type"] == "tool_result":
                 return text("Handing over.")
             assert gate.wait(GATE_TIMEOUT)
-            return [clone_use(clone_entry(skills=["website"], focus=True, quotes=[request]), id="t1") | {"type": "tool_use"}]
+            return [clone_use(clone_entry(skills=["website"], focus=True), id="t1") | {"type": "tool_use"}]
         calls.append(request)
         return text(f"c1 answers {request}")
 
@@ -5745,7 +5727,7 @@ class Faults:
 
 
 BG, FOCUS, STAY = "BG: build a website.", "FOCUS: build a website.", "STAY: build a website and stay."
-BAD = "BAD: build a website."  # the original clones with a seed quote that matches nothing: refused
+BAD = "BAD: build a website."  # the original forks with an id that is not one: refused in preparation
 STOP = "STOP"  # the original cancels c1
 
 
@@ -5785,8 +5767,8 @@ class FaultScript:
             if is_wake(last):
                 return text("Reported.")
             if request in (BG, FOCUS, STAY, BAD) and last["type"] == "text" and last["text"] == request:
-                quotes = ["no message says this"] if request == BAD else [request]
-                entry = clone_entry(skills=["website"], focus=request in (FOCUS, STAY), quotes=quotes)
+                entry = clone_entry(skills=["website"], focus=request in (FOCUS, STAY),
+                                    id="Not An Id" if request == BAD else None)
                 return [clone_use(entry, id=f"k{len(messages)}") | {"type": "tool_use"}]
             if request == STOP and last["type"] == "text" and last["text"] == request:
                 return [{"type": "tool_use", "id": f"x{len(messages)}", "name": "stop", "input": {"ids": ["c1"]}}]
@@ -6186,9 +6168,9 @@ def test_a_cancel_after_the_answer_is_a_withdrawal_its_background_graft_stops_an
         if last["type"] == "tool_result":
             assert entered.wait(GATE_TIMEOUT)  # c1's first model call is in flight
             return text("Started.")
-        if last.get("harness"):
+        if last.get("harness") or last.get("text") != "BG go":
             return text("report")
-        return [clone_use(clone_entry(skills=["website"], focus=False, quotes=["BG go"]), id="t1") | {"type": "tool_use"}]
+        return [clone_use(clone_entry(skills=["website"], focus=False), id="t1") | {"type": "tool_use"}]
 
     store, h, said = make(tmp_path=tmp_path, policy=policy)
     tasks = {}

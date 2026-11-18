@@ -66,10 +66,9 @@ def test_jev_selects_by_threshold_with_trigger_and_audit(tmp_path, monkeypatch):
     async def go():
         await h.start()
         r = rows(store)
-        # the original's own seed fields are ignored when the seeder is jev (schema unchanged)
-        children, text = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {"branch": [{
-            "purpose": "build slides", "skills": ["slides"], "focus": True,
-            "seed_quotes": ["I need a website."]}]}})
+        # the decisions client picks the seed; the entry names only its skills
+        children, text = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
+            "current": {"skills": ["slides"]}}})
         assert children == ["c1"], text
         seed = [x["row_id"] for x in store.view("c1")]
         assert seed == [r["u2"], r["trig"]]  # selected in view order + trigger; harness note never a candidate
@@ -83,6 +82,7 @@ def test_jev_selects_by_threshold_with_trigger_and_audit(tmp_path, monkeypatch):
         assert audit["threshold"] == 0.4 and audit["selected"] == seed and audit["fallback"] is None
         assert audit["scores"][str(r["u2"])] == 0.9 and audit["model"] == "jev-1.13.0" and audit["input_tokens"] == 600
         assert h.seeder_log[0]["latency"] >= 0
+        assert audit["task"].startswith("the part of the latest user request covered by: slides (")
         await h.machines.stop()
 
     asyncio.run(go())
@@ -99,8 +99,8 @@ def test_leading_assistant_row_gets_nearest_earlier_user_row(tmp_path, monkeypat
     async def go():
         await h.start()
         r = rows(store)
-        (child,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {"branch": [
-            {"purpose": "p", "skills": ["slides"], "focus": True}]}})
+        (child,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
+            "current": {"skills": ["slides"]}}})
         assert [x["row_id"] for x in store.view(child)] == [r["u2"], r["a2"], r["trig"]]
         assert h.seeder_log[0]["added_lead_user_row"] == r["u2"]
         await h.machines.stop()
@@ -108,26 +108,20 @@ def test_leading_assistant_row_gets_nearest_earlier_user_row(tmp_path, monkeypat
     asyncio.run(go())
 
 
-@pytest.mark.parametrize("with_model_seed", [True, False])
-def test_seeder_failure_falls_back_and_is_recorded(tmp_path, monkeypatch, with_model_seed):
+def test_seeder_failure_falls_back_to_the_conversation_and_is_recorded(tmp_path, monkeypatch):
+    """A decisions client that fails: the graft starts from the conversation (its text rows from
+    the first user row through the last, harness notes left out), as without one."""
     store, h = setup(tmp_path, FakeJev(fail=True), monkeypatch)
 
     async def go():
         await h.start()
         r = rows(store)
-        args = {"purpose": "p", "skills": ["slides"], "focus": True}
-        if with_model_seed:
-            args["seed_row_ids"] = [r["u2"], r["trig"]]
-        children, text = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {"branch": [args]}})
-        child = children[0] if children else None
+        (child,), text = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
+            "current": {"skills": ["slides"]}}})
         audit = h.seeder_log[0]
-        assert "TimeoutError" in audit["error"]
-        seed = [x["row_id"] for x in store.view(child)] if child else audit["selected"]
-        if with_model_seed:
-            assert audit["fallback"] == "model_seed" and seed == [r["u2"], r["trig"]]
-        else:
-            assert audit["fallback"] == "all_candidates"
-            assert seed == [r["asst0"], r["u1"], r["a1"], r["u2"], r["a2"], r["trig"]]
+        assert "TimeoutError" in audit["error"] and audit["fallback"] == "conversation"
+        seed = [x["row_id"] for x in store.view(child)]
+        assert seed == [r["u1"], r["a1"], r["u2"], r["a2"], r["trig"]] == h.default_seed("o")
         await h.machines.stop()
 
     asyncio.run(go())
