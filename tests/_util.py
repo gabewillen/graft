@@ -20,7 +20,7 @@ def pointing(store, use, src="o"):
     args = use.get("input")
     if not isinstance(args, dict):
         return use
-    seeded = lambda e: dict(e, messages=conversation(store, src)) if isinstance(e, dict) and not e.get(
+    seeded = lambda e: dict(e, messages=conversation(store=store, src=src)) if isinstance(e, dict) and not e.get(
         "messages") and "reason" not in e else e
     out = dict(args)
     if "current" in out:
@@ -36,7 +36,7 @@ async def clone_in_turn(h, use, src="o"):
     the conversation, `pointing`). A turn that still holds the conversation afterwards (background
     grafts only, or a refused call) is ended, so `src` is left at rest. Returns (new timeline ids or
     None, result text)."""
-    use = pointing(h.store, use, src)
+    use = pointing(store=h.store, use=use, src=src)
     await h.begin_turn(src)
     children, focus, text = await h.clone_call(src=src, use=use)
     if focus is None:

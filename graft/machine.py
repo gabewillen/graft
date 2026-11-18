@@ -1351,7 +1351,7 @@ def rejoins(ctx, inst, event) -> bool:
     return inst.kind == "focus" and inst.focus is None and inst.in_turn and not (inst.closing or inst.final)
 
 
-def turn_began(ctx, inst, event) -> None:  # entry of a run of the model loop
+def turn_began(ctx, inst, event) -> None:  # a run of the model loop began (its activity says so)
     inst.in_turn = True
 
 
@@ -1527,6 +1527,8 @@ async def busy_activity(ctx, inst: TimelineSM, event) -> None:
     call being prepared, a step) handles `hsm/error` as its own failure, so the run's failure is
     typed to be told apart from it. Like the library's own `hsm/error`, it is sent only while the
     run's state is still active: a run that raises as it is ended (its state left) is stale."""
+    # the run begins (a step that failed held this activity back, `Activity`, so it never gets here): recorded by the machine, so a fault from here on ends a turn (`rejoins`)
+    inst.dispatch(inst.context(), hsm.Event(name="turn_began"))
     try:
         _close_out(inst)
         _mark_pending(inst)
@@ -3769,7 +3771,7 @@ def _timeline(name: str) -> hsm.Model:
                     T(On("inbox_handed"), S("../closing_calls"), G(handed_withdraws_run), Effect(take_handed, turn_cut_short)),
                     T(On("inbox_handed"), Call(checked(handed_withdraws_run, effects=(take_handed,)))),
                     T(On("shutdown"), S("../closing_calls"), Effect(interrupted_closing, turn_cut_short)),
-                    _work("run", Entry(turn_began), Activity(work=busy_activity, done="run"),
+                    _work("run", Activity(work=busy_activity, done="run"), T(On("turn_began"), Call(turn_began)),
                           T(On("turn_done"), S("../../ran"), Effect(end_run))),
                     _work("driven", T(On("driven_done"), S("../../rest"), Effect(end_driven))),
                 ),

@@ -2373,3 +2373,28 @@ def test_past_the_recovery_bound_a_hand_over_still_finishes(monkeypatch):
         assert holders(host) == ["c1"] and host.status["o"] == "cloned"
         await m.stop()
     run(go)
+
+
+def test_a_focus_graft_whose_first_run_a_fault_kept_from_starting_rests(monkeypatch):
+    """The step that would start c1's first run fails (`engage` raises): the run's activity holds
+    back, no run began, so the recovery leaves c1 at rest instead of joining it."""
+    import graft.machine as machine_module
+    real, armed = machine_module.engage, [True]
+
+    def engage(ctx, inst, event):
+        if inst.timeline_id == "c1" and armed:
+            armed.clear()
+            raise RuntimeError("engage bug")
+        return real(ctx=ctx, inst=inst, event=event)
+
+    async def go():
+        monkeypatch.setattr(machine_module, "engage", engage)
+        host, m = await started()
+        await say(m=m, text="go")
+        recovered = host.next("recover", "c1")
+        await clone(m=m, pairs=[("c1", True)])
+        await asyncio.wait_for(recovered, GUARD)
+        assert await at_rest(m=m, tl="c1") == "ended"
+        assert not host.logged(prefix=("run", "c1")) and not host.logged(prefix=("apply", "c1"))
+        await m.stop()
+    run(go)
