@@ -33,7 +33,7 @@ from graft.harness import (CANCELLED_BY_THE_TOOL, CANCELLED_WHILE_RUNNING, FAILE
 from graft.providers import FakeProvider
 from graft import seeder as seeder_mod
 from graft.skills import BACKGROUND_INSTRUCTIONS, BUILTIN, CATALOG, CLONE_INSTRUCTIONS, JOIN_INSTRUCTIONS, \
-    catalog, install
+    install
 
 # Stems, so every inflection is caught (clone, clones, cloned, cloning; join, joins, joined, ...).
 BANNED = re.compile(r"\bclon|\bjoin|\binstances?\b|\bsub-?agents?\b|\bworkers?\b|\bhelpers?\b|\bdelegat"
@@ -106,13 +106,9 @@ def last_block(messages):
     return messages[-1]["content"][-1]
 
 
-def make(tmp_path, policy, name, cap=None, **kw):
+def make(tmp_path, policy, name, **kw):
     store = Store(str(tmp_path / f"{name}.db"))
-    if cap is None:
-        install(store)
-    else:
-        install(store=store, max_live_background=cap)
-        kw["max_live_background"] = cap
+    install(store)
     rec = Recorder(policy)
     h = Harness(store=store, provider=FakeProvider(policy=rec), seeder=None, **kw)
     return store, h, rec
@@ -143,10 +139,9 @@ def test_the_built_in_skills_and_tools_say_branch_and_merge():
     assert "forking yourself: each branch you fork is you" in original and "in the first person" in original
 
 
-@pytest.mark.parametrize("cap", [1, 4, 7])
-def test_no_built_in_skill_text_or_tool_uses_a_banned_word(cap):
+def test_no_built_in_skill_text_or_tool_uses_a_banned_word():
     found = []
-    for s in catalog(max_live_background=cap):
+    for s in CATALOG:
         if s.name not in BUILTIN:
             continue
         found += [("name", s.name), ("description", s.description), ("instructions", s.instructions)]
@@ -181,7 +176,7 @@ def test_the_banned_words_are_caught():
 def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
     """Two background parts, a refused call (bad entries and seeds, a tool beside it), a graft
     that tries to cancel and to merge silently, a cancel by the original (bad ids among them), the
-    wake that reports it, and a re-branch of the cancelled part, which is refused."""
+    wake that reports it, and a new branch for the stopped part, which is allowed (no harness limit)."""
     slides_gate = threading.Event()
     website_gate = threading.Event()  # c1 is still running when the original cancels: it is not named
     waits = []  # each gate wait's outcome, asserted in the test body (a failure on a model-call thread is a failed run)
@@ -201,6 +196,7 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
                 return [use(tool="stop", use_id="x1", ids=["c2", "c9", "o", 5])]
             if last["type"] == "tool_result" and last["tool_use_id"] == "x1":
                 website_gate.set()
+                slides_gate.set()  # c2 is stopped: the slides branch forked again later finishes
                 return text("Okay.")
             if last["type"] == "text" and last.get("harness") and "c2 (stopped)" in last["text"]:
                 return [use(tool="fork", use_id="b3", **branched(entry(skills=["slides"], focus=False)))]
@@ -234,7 +230,7 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
     assert len(cancel) == 1 and cancel[0].startswith("stopped -> c2 (what you did in it"), results
     assert "c9: not stopped: no such branch" in cancel[0] and "o: not stopped:" in cancel[0], cancel
     assert "ids[3]: not stopped: a int is not a branch id" in cancel[0], cancel
-    assert any("already failed, was stopped" in t for t in results), results  # the re-branch block
+    assert len({t for t in results if t.startswith("forked -> ")}) == 2, results  # a stopped part may be forked again
     assert any("merge(reason='done') refused" in t for t in results), results
     notes = [t for w, t in rec.seen if w == "note"]
     assert any(t.startswith("(harness note: your detached branch") and "c2 (stopped)" in t
@@ -274,62 +270,6 @@ def test_focus_hand_back_and_failure_say_branch_and_merge(tmp_path):
     notes = [t for w, t in rec.seen if w == "note"]
     assert any("merged, reason=out_of_scope" in t for t in notes), notes
     assert any("branch c2 failed" in t for t in notes), notes
-    check(rec.seen + store_texts(store))
-
-
-def test_caps_and_spent_calls_say_branch(tmp_path):
-    """The live cap (a harness with another cap), the entries limit, and a run with no calls left."""
-    def policy(system, messages, tools):
-        names = {t["name"] for t in tools}
-        last = last_block(messages)
-        if "fork" in names:
-            n = sum(1 for m in messages for b in m["content"] if b["type"] == "tool_result")
-            if n == 0:
-                return [use(tool="fork", use_id="k1", **branched(entry(skills=["website"], focus=False), entry(skills=["slides"], focus=False)))]
-            if n == 1:
-                return [use(tool="fork", use_id="k2", **branched(*[entry(skills=["website"], focus=False, id=f"w{i}") for i in range(5)]))]
-            if n == 2:
-                return [use(tool="fork", use_id="k3", **branched(entry(skills=["website"], focus=False)))]
-            return text("Okay.")
-        return text("Done here.")
-
-    store, h, rec = make(tmp_path=tmp_path, policy=policy, name="c", cap=1)
-
-    async def go():
-        await h.start()
-        await h.user_says(REQUEST)
-        await h.settle()
-        await h.close()
-
-    asyncio.run(go())
-    results = [t for w, t in rec.seen if w == "result"]
-    assert any("at most 1 detached branches may be live" in t for t in results), results
-    assert any("a fork call takes at most 4 branches" in t for t in results), results
-    assert any("no fork calls left" in t for t in results), results
-    check(rec.seen + store_texts(store))
-
-
-def test_the_per_message_cap_says_branch(tmp_path):
-    def policy(system, messages, tools):
-        names = {t["name"] for t in tools}
-        last = last_block(messages)
-        if "fork" in names:
-            if last["type"] == "tool_result" and ("not executed" in str(last["content"])
-                                                  or "fork refused" in str(last["content"])):
-                return text("Okay.")
-            return [use(tool="fork", use_id=f"p{len(messages)}", **branched(entry(skills=["website"], focus=False)))]
-        return text("Site finished.")
-
-    store, h, rec = make(tmp_path=tmp_path, policy=policy, name="d")
-
-    async def go():
-        await h.start()
-        await h.user_says(REQUEST)
-        await h.settle()
-        await h.close()
-
-    asyncio.run(go())
-    assert any("are used up" in t for w, t in rec.seen if w == "result")
     check(rec.seen + store_texts(store))
 
 
@@ -563,5 +503,5 @@ def test_the_merge_record_of_a_branch_that_wrote_nothing_and_plural_stops_say_br
     h.wake_note(src="o", joined=[("c1", CANCELLED), ("c2", CANCELLED)], handed_back=False, running=[], background=True)
     note = store.view("o")[-1]["content"]
     assert "detached branches c1 (stopped), c2 (stopped) merged" in note and "You stopped c1, c2" in note
-    assert "they were stopped" in note and "The parts you were doing" in note, note
+    assert "they were stopped" in note and "forked for again" not in note, note  # no re-fork block
     check([("result", stopped), ("note", note)])

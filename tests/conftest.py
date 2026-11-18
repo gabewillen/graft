@@ -17,3 +17,4 @@ def counted_branch_ids(monkeypatch):
         count = itertools.count(1)
         return lambda: f"c{next(count)}"
     monkeypatch.setattr(harness_mod, "new_names", counted)
+

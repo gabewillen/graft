@@ -7,12 +7,11 @@ Tool names use underscores because API tool names cannot contain dots.
 
 from __future__ import annotations
 
-import copy
 import json
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 from .db import Skill, Store
-from .machine import MAX_LIVE_BACKGROUND, described
+from .machine import described
 
 
 def obj(props: dict, required: list[str]) -> dict:
@@ -37,24 +36,14 @@ JOIN_TOOL = {
     "input_schema": obj({"reason": {"type": "string", "enum": ["done", "out_of_scope", "failed"]}},
                         ["reason"])}
 
-def cancel_limit(max_live_background: int) -> int:
-    """Graft ids one cancel call (the model's `stop`) takes: twice the live cap (anything longer is noise)."""
-    return 2 * max_live_background
-
-
-# Graft ids in one cancel call at the default cap; a harness with another cap takes twice its cap.
-MAX_CANCEL_IDS = cancel_limit(MAX_LIVE_BACKGROUND)
-
 # graft's cancel, as the model is told it: `stop`. `cancelled` is not a reason a graft can give: only the
 # harness sets it, when the original stops a graft.
 CANCEL_TOOL = {
     "name": "stop",
     "description": "Stop detached branches of yours that are still running, by id. Each one is "
                    "stopped where it is and what you did in it so far merges back when your turn ends.",
-    "input_schema": obj(props={"ids": {"type": "array", "minItems": 1, "maxItems": MAX_CANCEL_IDS, "items": S}},
+    "input_schema": obj(props={"ids": {"type": "array", "minItems": 1, "items": S}},
                         required=["ids"])}
-
-MAX_CLONE_ENTRIES = 4  # entries (branches) in one fork call, current and detached together
 
 # What a branch id looks like: chosen by the model, or drawn by the harness (6 hex characters).
 BRANCH_ID_PATTERN = "^[a-z0-9][a-z0-9-]{0,31}$"
@@ -85,8 +74,7 @@ comes back to main. A detached branch works off to the side with no line to the 
 stays on main.
 
 FORK (one call per user message). `fork(current={...}, detached=[{...}, ...])` starts every
-branch it names at once. Give `current`, `detached`, or both; one call has at most four branches.
-At most four detached branches of yours may be live at a time. Each branch is `{id?, skills}`:
+branch it names at once. Give `current`, `detached`, or both. Each branch is `{id?, skills}`:
 - `skills`: catalog skill names the branch holds (never `fork`, `merge` or `detached`).
 - `id` (optional): a short name for the branch, lowercase letters, digits and `-` (for example
   "site"), unique in this conversation and never reused. Without one, the branch gets a random id.
@@ -117,8 +105,8 @@ Nothing you already did there outside the conversation (a page written, a bookin
 so tell the user what was left behind. An id that is unknown, is the current branch, or has
 already finished is reported in the result and nothing happens for it. To replace a part with
 different work, call `stop` and `fork` in the same response: the stop runs first, so the stopped
-branch's place is free for the new one. Do not fork again for the same part you stopped unless
-the user asks for it in a new message; that entry is refused. Any tool call other than `stop`
+branch's place is taken by the new one. Do not fork again for a part you stopped unless the user
+asks for it in a new message. Any tool call other than `stop`
 beside a `fork` call is skipped.
 
 MERGE (automatic). When a branch merges, what you did there becomes your memory here, with no
@@ -192,8 +180,7 @@ CATALOG: list[Skill] = [
                                           "that work out of sight; give either or both. Each branch names "
                                           "the skills it holds and, optionally, its id.",
          "input_schema": obj(props={"current": CLONE_ENTRY,
-                                    "detached": {"type": "array", "maxItems": MAX_CLONE_ENTRIES,
-                                                 "items": CLONE_ENTRY}}, required=[])},
+                                    "detached": {"type": "array", "items": CLONE_ENTRY}}, required=[])},
         CANCEL_TOOL,
     ]),
     Skill(name="merge",
@@ -290,48 +277,8 @@ def skill_listing(store: Store, names: list[str], heading: str) -> str:
     return heading + "\n" + "\n".join(f"- {r[0]}: {r[1]}" for r in rows if r)
 
 
-LIVE_CAP_SENTENCE = "At most four detached branches of yours may be live at a time."
-
-
-def catalog(max_live_background: int = MAX_LIVE_BACKGROUND) -> list[Skill]:
-    """The catalog for a harness whose cap on live background grafts is `max_live_background`.
-    At the default cap it is CATALOG itself, byte for byte (prompts and caches depend on it);
-    another cap is said in the clone skill's text (a cap above the four entries a clone call
-    takes is reached across calls) and bounds the cancel tool's list."""
-    if LIVE_CAP_SENTENCE not in CLONE_INSTRUCTIONS:  # the text drifted: the cap could not be said
-        raise ValueError("the branch skill no longer says the live cap as LIVE_CAP_SENTENCE")
-    if max_live_background == MAX_LIVE_BACKGROUND:
-        return CATALOG
-    said = (f"At most {max_live_background} detached branches of yours may be live at a time"
-            + (" (across fork calls: one call takes at most four)." if max_live_background > MAX_CLONE_ENTRIES
-               else "."))
-    out = []
-    for skill in CATALOG:
-        if skill.name == "fork":
-            tools = copy.deepcopy(skill.tools)
-            for t in tools:
-                if t["name"] == "stop":
-                    t["input_schema"]["properties"]["ids"]["maxItems"] = cancel_limit(max_live_background)
-            skill = replace(skill, instructions=skill.instructions.replace(LIVE_CAP_SENTENCE, said), tools=tools)
-        out.append(skill)
-    return out
-
-
-def says_live_cap(store: Store, max_live_background: int) -> bool:
-    """Does the store's installed clone skill say this cap, and its cancel tool take twice it, as
-    `install` wrote them? True if no clone skill is installed: a store a host fills itself (tests,
-    a bare harness) has no text that could say another cap, so there is nothing to disagree."""
-    row = store.con.execute("SELECT instructions FROM skills WHERE name='fork'").fetchone()
-    tool = store.con.execute("SELECT input_schema FROM tools WHERE name='stop'").fetchone()
-    if row is None or tool is None:
-        return True
-    want = next(s.instructions for s in catalog(max_live_background=max_live_background) if s.name == "fork")
-    taken = json.loads(tool[0])["properties"]["ids"].get("maxItems")
-    return row[0] == want and taken == cancel_limit(max_live_background)
-
-
-def install(store: Store, max_live_background: int = MAX_LIVE_BACKGROUND) -> None:
-    for s in catalog(max_live_background):
+def install(store: Store) -> None:
+    for s in CATALOG:
         store.add_skill(s)
 
 

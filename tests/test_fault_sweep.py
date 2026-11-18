@@ -785,7 +785,7 @@ def _clean(case: Case) -> list[str]:
     return problems
 
 
-@pytest.mark.parametrize("scenario,first", [("BG", "take_clone"), ("BG", "attempt_clone"), ("FOCUS", "take_clone")])
+@pytest.mark.parametrize("scenario,first", [("BG", "take_clone"), ("BG", "judge_call"), ("FOCUS", "take_clone")])
 def test_a_close_out_that_cannot_be_written_is_written_before_the_next_row(tmp_path, monkeypatch, scenario, first):
     """A step fails, and so does its recovery's close-out (`host.recover`): what it could not write
     (the run's open calls, the clone call's rollback) is kept and written before anything next
@@ -799,7 +799,7 @@ def test_a_close_out_that_cannot_be_written_is_written_before_the_next_row(tmp_p
 
 @pytest.mark.parametrize("scenario,first,second", [
     ("BG", "take_clone", "begin_recovery"), ("STAY", "take_clone", "begin_recovery"),
-    ("BG", "attempt_clone", "begin_recovery"), ("BG", "take_clone", "recovered"),
+    ("BG", "judge_call", "begin_recovery"), ("BG", "take_clone", "recovered"),
     ("plain", "take_message", "_requeue_strays"), ("plain", "take_message", "_errors_for_session"),
     ("plain", "request_written", "_errors_for_session"), ("BG", "spawned", "_errors_for_session"),
     ("STOP", "cancel_head", "_errors_for_session"), ("BG", "take_clone", "_restate_and_fail"),

@@ -161,14 +161,11 @@ on to its focus graft with its own record, and the graft re-states both in one e
 stopped is reported (`telling`) and raised by `close`, and the rest are still stopped.
 
 Rules the graph enforces. Only the original clones, only in a turn or wake (every wake is a full run), never while
-closing, at most CLONE_TRIES clone calls per run (one, and one retry; a committed call is the
-run's last; a call past them is not prepared), never more than one focus graft per call, never beyond the harness's cap of live background grafts (MAX_LIVE_BACKGROUND by default), never
-more than MAX_CLONE_CALLS_PER_MESSAGE committed clone calls per user message, never for a request
-handed back MAX_REQUEST_HANDBACKS times, and never for a part of the current request that failed,
-came back twice, or was cancelled (the re-clone blocks are the original's own data). A clone call
-that arrives while cancel calls of the same response are being carried out waits for them (it is
-deferred). Only the original cancels, only while it runs, and only a background graft of its own
-whose join has not been raised. Joins are applied only from rest, one per step.
+closing, never for a request that was withdrawn, and never more than one focus graft per call.
+It does not bound how much an agent forks: that is the host's (spec: Depth, No usage limits). A
+clone call that arrives while cancel calls of the same response are being carried out waits for
+them (it is deferred). Only the original cancels, only while it runs, and only a background graft
+of its own whose join has not been raised. Joins are applied only from rest, one per step.
 """
 
 from __future__ import annotations
@@ -182,27 +179,17 @@ from typing import Any, Callable, NamedTuple, Protocol
 
 import hsm
 
-# Live (running or queued, not cancelled) background grafts per source, by default; a harness may
-# set another cap (`Machines.max_live_background`).
-MAX_LIVE_BACKGROUND = 4
 CANCELLED = "cancelled"  # the join reason of a cancelled graft: set by the harness only
 # Times a join's commit is tried, at successive commit points, before it is given up.
 MAX_JOIN_ATTEMPTS = 3
-# Joins that may hand one request back to a timeline before it stops cloning for that request.
-MAX_REQUEST_HANDBACKS = 8
-# Clone calls committed for one user message (the original's own request), across every wake it sets off.
-MAX_CLONE_CALLS_PER_MESSAGE = 4
 # Stops a source tries for one background graft made for a withdrawn request before it gives that
 # stop up (it is told, and the graft stops at its next step instead): a stop that always fails
 # never keeps the source stopping it.
 MAX_STOP_ATTEMPTS = 3
-# Clone calls a run may make: the first, and one retry after a refusal. A committed call uses
-# them all (one committed clone call per run).
-CLONE_TRIES = 2
 
 
 HEAD = 0  # the first item of a list: queues and work lists are taken from their head
-NONE_YET = 0  # a count not started: no attempt, no hand-back, no arrival so far
+NONE_YET = 0  # a count not started: no attempt so far
 STATE_HEAD = 2  # a state path split at its first two separators: '', the model, and the rest
 # What an activity never takes for an outcome: the interpreter's own exits, the only exceptions
 # asyncio lets out of the loop (any other, GeneratorExit included, is only stored on the task).
@@ -254,11 +241,10 @@ class RunOutcome(NamedTuple):
 
 
 class Prepared(NamedTuple):
-    """A clone call the harness has seeded and validated: [(graft id, focus)], each entry's (label
-    in the model's call, catalog skills), the harness's record of the batch, and each graft's name
+    """A clone call the harness has seeded and validated: [(graft id, focus)], the harness's record
+    of the batch, and each graft's name
     (the id the model knows it by, which the clone rules' words use)."""
     pairs: list[tuple[str, bool]]
-    parts: list[tuple[str, frozenset[str]]]
     data: Any
     names: Any = None
 
@@ -307,17 +293,14 @@ class Clone:
     """A clone call put to the original's machine as the model made it. The machine runs the
     cancels carried with it first, then decides whether the call may be tried at all, has the
     harness prepare it (seed and validate: an activity), and decides and commits it. `use`: the
-    model's tool call; `store`: the machine writes the call's result row; `request`: the
-    original's current request row, set by its machine as it takes the call (`_request_key`).
-    `pairs`, `parts` and `data`
+    model's tool call; `store`: the machine writes the call's result row.
+    `pairs`, `data` and `names`
     are filled when the call is prepared (see Prepared)."""
     use: dict
     reply: asyncio.Future
     store: bool = False
-    request: int | None = None
     cancels: "Cancel | None" = None  # cancel calls of the same response: the machine runs them first
     pairs: list[tuple[str, bool]] = field(default_factory=list)
-    parts: list[tuple[str, frozenset[str]]] = field(default_factory=list)
     data: Any = None
     names: dict[str, str] = field(default_factory=dict)  # graft id -> the id the model knows it by
 
@@ -333,7 +316,6 @@ class CancelCall:
 class Cancel:
     calls: list[CancelCall]
     reply: asyncio.Future
-    request: int | None = None
 
 
 @dataclass
@@ -367,7 +349,7 @@ class Host(Protocol):
     def graft_failed(self, tl: str, error: BaseException) -> None: ...
     def begin_request(self, tl: str, text: str) -> int: ...
     def mark_withdrawn(self, timelines: list[str], rows: list[int]) -> None: ...
-    async def prepare_clone(self, src: str, clone: Clone, retry_left: bool) -> "Prepared | str": ...
+    async def prepare_clone(self, src: str, clone: Clone) -> "Prepared | str": ...
     def roll_back_clone(self, src: str) -> None: ...
     def commit_clone(self, src: str, clone: Clone) -> str: ...
     def refuse_clone(self, src: str, clone: Clone, why: str, error: BaseException | None) -> str: ...
@@ -375,8 +357,7 @@ class Host(Protocol):
     async def call_tool(self, tl: str, use: dict) -> tuple[str, bool]: ...
     def close_tool_uses(self, tl: str, known: dict[str, tuple[str, bool]]) -> None: ...
     def record_join(self, child: str, reason: str) -> None: ...
-    def apply_join(self, src: str, join: QueuedJoin, cloned_for: int | None, running: list[str]
-                   ) -> tuple[bool, int | None, bool]: ...
+    def apply_join(self, src: str, join: QueuedJoin, running: list[str]) -> tuple[bool, bool]: ...
     def wake_note(self, src: str, joined: list[tuple[str, str]], handed_back: bool, running: list[str],
                   background: bool) -> None: ...
     def cancel_text(self, call: CancelCall, outcomes: dict[str, str]) -> tuple[str, bool]: ...
@@ -401,10 +382,8 @@ class TimelineSM(hsm.Instance):
         self.held = held  # made in a turn its caller drives: it does not run on its own
         self.queue: list[QueuedJoin] = []  # joins waiting on this timeline, in finish order
         self.grafts: dict[str, bool] = {}  # its grafts whose join has not been applied: id -> focus
-        self.parts: dict[str, frozenset[str]] = {}  # graft -> its catalog skills (its part)
         self.names: dict[str, str] = {}  # graft -> the id the model knows it by (its words use it)
         self.made: dict[str, bool] = {}  # every graft it made -> focus (kept after its join)
-        self.cloned_for: dict[str, int | None] = {}  # graft -> the request it was made for
         self.mode = TURN  # the mode of its current or next run
         self.inbox: list[Request] = []  # user messages not yet begun, in arrival order
         self.request: Request | None = None  # the message whose row is being written
@@ -459,7 +438,6 @@ class TimelineSM(hsm.Instance):
         self.outcomes: dict[str, str] = {}
         self.claims: dict[str, int] = {}  # graft -> the call of the response that names it first
         self.unstored: dict[str, tuple[str, bool]] = {}  # tool_use id -> a result not yet written
-        self.max_live_background = machines.max_live_background  # the harness's cap (the clone rule)
         self.tool: ToolCall | None = None  # the host tool call its run is making (`calling`)
         # A frozen graft's close-out it could not write (its open calls' known results), carried
         # with its join for its source to write (`QueuedJoin.closing`).
@@ -476,22 +454,10 @@ class TimelineSM(hsm.Instance):
         # became of its ids, for the recovery to write its real result (it ran: never "not run").
         self.cut_cancels: list[tuple[CancelCall, dict[str, str]]] = []
         self.reported: BaseException | None = None  # an error already shown, that ends the run
-        # The user messages it took as requests, in order: each whose row it wrote while it was
-        # live, and each a focus graft handed back. Its current request is the last of them not
-        # withdrawn (`_request_key`); the bounds below are keyed by it (None: no request yet).
-        self.asked: list[Request] = []
-        # the request whose call was done (`call_done`) last, still live then: it can never be
-        # withdrawn, so no request before it, and not None, can be current again (`_settle`)
-        self.settled: Request | None = None
-        self.blocks: set[tuple[int | None, frozenset[str]]] = set()  # re-clone blocks (per part)
-        self.arrivals: dict[tuple[int | None, frozenset[str]], int] = {}
-        self.handbacks: dict[int | None, int] = {}
-        self.clone_calls: dict[int | None, int] = {}  # clone calls committed, per request
         self.reason = ""  # background: its join reason, while it is recorded
         self.close_first = False  # background: its run ended early (its open calls need results)
         self.forced: asyncio.Future | None = None
         self.claims_next: list[tuple[int, str]] = []
-        self.clone_tries = 0  # clone calls tried in the current run (see CLONE_TRIES)
         self.spawned_ids: list[str] = []  # grafts of a clone call whose machines must be undone
         self.spawn_error: BaseException | None = None
         # failures to tell the user, one per step: (kind, clones, error, the source it is told from)
@@ -992,25 +958,14 @@ def io(done: str, work: Callable) -> hsm.RedefinableBehaviors:
 
 # ------------------------------------------------------------------ rule words (read by guards)
 def clone_refusal(inst: TimelineSM, grafts: list[tuple[str, bool]]) -> str | None:
-    """The focus rule and the cap on live background grafts (a graft whose join is queued but not
-    yet applied is still live)."""
+    """The focus rule: at most one branch carries the conversation. (How many branches an agent
+    makes is not the harness's to bound: spec, Depth, No usage limits.)"""
     if not grafts:
         return "a fork call needs at least one branch"
     focus = [g for g, f in grafts if f]
     if len(focus) > 1:
         return f"at most one branch may carry the conversation, got {focus}"
-    live = [inst.names.get(g, g) for g, is_focus in inst.grafts.items() if not is_focus]
-    cap = inst.max_live_background
-    if len(live) + sum(1 for _, f in grafts if not f) > cap:
-        return (f"at most {cap} detached branches may be live at once "
-                f"({', '.join(live) or 'none'} still {'is' if len(live) == 1 else 'are'}); use fewer "
-                "detached entries or wait for them to merge")
     return None
-
-
-def blocked_parts(inst: TimelineSM, clone: Clone) -> list[tuple[str, frozenset[str]]]:
-    return [(i, part) for i, part in clone.parts
-            if any(r == clone.request and blocked & part for r, blocked in inst.blocks)]
 
 
 def decline_why(inst: TimelineSM, clone: Clone) -> str | None:
@@ -1021,14 +976,6 @@ def decline_why(inst: TimelineSM, clone: Clone) -> str | None:
         return "the user's call this turn answers was withdrawn"
     if inst.source_id is not None:
         return "you fork only from main (branches are one level deep)"
-    if inst.clone_tries >= CLONE_TRIES:
-        return "no fork calls left for this message; answer the user instead"
-    if inst.clone_calls.get(clone.request, NONE_YET) >= MAX_CLONE_CALLS_PER_MESSAGE:
-        return (f"the {MAX_CLONE_CALLS_PER_MESSAGE} fork calls for this user message are used up. Do not "
-                "fork again: answer the user yourself, briefly saying what could not be done")
-    if inst.handbacks.get(clone.request, NONE_YET) >= MAX_REQUEST_HANDBACKS:
-        return ("branches for this message have failed or handed it back too many times. Do not fork "
-                "for it again: answer the user yourself, briefly saying what could not be done")
     return None
 
 
@@ -1039,12 +986,6 @@ def clone_why(inst: TimelineSM, clone: Clone) -> str | None:
     rule = clone_refusal(inst=inst, grafts=clone.pairs)
     if rule is not None:
         return f"forking is not possible now: {rule}"
-    blocked = blocked_parts(inst=inst, clone=clone)
-    if blocked:
-        return "\n- ".join(
-            f"{i}: a branch with skills {sorted(part)} for this message already failed, was stopped, "
-            "or handed it back twice. Do not fork for that part again: leave this entry out and tell "
-            "the user, briefly, what could not be done" for i, part in blocked)
     return None
 
 
@@ -1117,40 +1058,10 @@ def _prune(inst: TimelineSM) -> None:
     """The withdrawal record keeps only ids of requests it still holds, of requests it answered
     whose calls are not done, and of requests its background grafts were made for whose joins are
     not applied yet: it is bounded by them."""
-    _prune_requests(inst)
     inst.withdrawn &= {r.id for r in _known(inst)}
     inst.stopped_unwanted &= set(inst.grafts)  # only grafts still its own (live) are remembered
     inst.stop_attempts = {g: n for g, n in inst.stop_attempts.items() if g in inst.grafts}
     inst.stops_told &= set(inst.grafts)
-
-
-def _request_key(inst: TimelineSM) -> int | None:
-    """The original's current request: the row of the last request it took that is not
-    withdrawn; None before any (its bounds are kept under None)."""
-    return next((r.row for r in reversed(inst.asked) if not _withdrawn(inst=inst, request=r)), None)
-
-
-def _settle(inst: TimelineSM, rid: int) -> None:
-    """A user's call is done: if it is one of its requests and was live then, it can never be
-    withdrawn, so it and those after it are the only requests that can be current again. Only
-    this positive signal settles a request: one it handed to a focus graft is not its own to
-    hold meanwhile, but may still be withdrawn."""
-    done = [i for i, r in enumerate(inst.asked) if r.id == rid and not _withdrawn(inst=inst, request=r)]
-    inst.settled = inst.asked[done[HEAD]] if done else inst.settled
-    inst.asked = inst.asked[done[HEAD]:] if done else inst.asked
-
-
-def _prune_requests(inst: TimelineSM) -> None:
-    """Requests that can never be current again, and the bounds kept for them, are dropped. A
-    withdrawn request leaves `asked` (read before the withdrawal record is pruned); the requests
-    before the settled one went when it settled (`_settle`); every bound not keyed by one of the
-    requests left goes with them (None's too, once a request has settled)."""
-    inst.asked = [r for r in inst.asked if not _withdrawn(inst=inst, request=r)]
-    keys = {r.row for r in inst.asked} | (set() if inst.settled is not None else {None})
-    inst.clone_calls = {k: n for k, n in inst.clone_calls.items() if k in keys}
-    inst.handbacks = {k: n for k, n in inst.handbacks.items() if k in keys}
-    inst.arrivals = {k: n for k, n in inst.arrivals.items() if k[HEAD] in keys}
-    inst.blocks = {b for b in inst.blocks if b[HEAD] in keys}
 
 
 def _unwanted(inst: TimelineSM, child: str) -> bool:
@@ -1682,8 +1593,7 @@ async def prepare_activity(ctx, inst: TimelineSM, event) -> None:
     or shutdown ends this activity, and `unpreparing` rolls the call's audit back). The outcome is
     `prepared`: a Prepared call, or the text of a refusal the harness already audited."""
     _mark_pending(inst)  # the call's seeds are resolved from the view (a driven turn has no run start)
-    prepared = await inst.host.prepare_clone(src=inst.timeline_id, clone=inst.clone,
-                                             retry_left=inst.clone_tries < CLONE_TRIES)
+    prepared = await inst.host.prepare_clone(src=inst.timeline_id, clone=inst.clone)
     inst.dispatch(inst.context(), hsm.Event(name="prepared", data=prepared))
 
 
@@ -1884,7 +1794,7 @@ def _apply(inst, event):
     _close_out(inst)
     _mark_pending(inst)  # the join copies rows into the view: rows still to be marked are marked first
     join = inst.queue[0]
-    return inst.host.apply_join(src=inst.timeline_id, join=join, cloned_for=inst.cloned_for.get(join.child),
+    return inst.host.apply_join(src=inst.timeline_id, join=join,
                                 running=_still_running(inst))
 
 
@@ -1959,24 +1869,19 @@ def take_inbox(ctx, inst, event) -> None:
 
 
 def request_written(ctx, inst, event) -> None:
-    """The message's row is written: it is the run's request, and the original's current one
-    (`asked`), so it may clone again: its bounds are its own. If it is withdrawn, the request
-    before it is current again, with its bounds as they were."""
+    """The message's row is written: it is the run's request."""
     closed_out(inst)
     request, inst.request = inst.request, None
     request.row = event.data
     inst.answering, inst.answered = request, False
-    inst.mode, inst.clone_tries = TURN, 0
-    inst.asked.append(request)
+    inst.mode = TURN
     inst.waiters.append(Waiter(reply=request.reply, user=True, request=request))
 
 
 def request_dropped(ctx, inst, event) -> None:
     """The message's row is written, but its caller withdrew it meanwhile: no run starts for it.
     The row stays (rows are never removed) and is marked withdrawn next (`dropping`), so no later
-    turn reads it as a live request. It never became a request, so the bounds of the last one
-    (its re-clone blocks and its committed clone calls) hold: the wakes that follow are still
-    under them."""
+    turn reads it as a live request."""
     closed_out(inst)
     request, inst.request = inst.request, None
     inst.unmarked.append(event.data)
@@ -2126,7 +2031,6 @@ def stop_one(ctx, inst, event) -> None:
 def call_finished(ctx, inst, event) -> None:
     """A user's call is done (its request id): a request it answered can no longer be withdrawn."""
     inst.returned = [r for r in inst.returned if r.id != event.data]
-    _settle(inst=inst, rid=event.data)
     _prune(inst)
 
 
@@ -2205,14 +2109,14 @@ def take_handed_and_engage(ctx, inst, event) -> None:
 
 def begin_run(ctx, inst, event) -> None:
     mode, reply = event.data
-    inst.mode, inst.answering, inst.clone_tries, inst.recoveries = mode, None, 0, 0
+    inst.mode, inst.answering, inst.recoveries = mode, None, 0
     inst.waiters.append(Waiter(reply=reply, user=False))
     _session(inst=inst, name="engaged", data=inst.timeline_id)
 
 
 def begin_driven(ctx, inst, event) -> None:
     mode, reply = event.data
-    inst.mode, inst.answering, inst.clone_tries, inst.recoveries = mode, None, 0, 0
+    inst.mode, inst.answering, inst.recoveries = mode, None, 0
     _session(inst=inst, name="engaged", data=inst.timeline_id)
     _resolve(reply=reply, value="started")
 
@@ -2472,13 +2376,9 @@ def return_to_source(ctx, inst, event) -> None:
 
 # ------------------------------------------------------------------ effects: clone
 def take_clone(ctx, inst, event) -> None:
-    """The clone call (and the cancels it carries) is decided under the original's current
-    request, its own (never a row the harness reads from the view)."""
+    """The clone call, and the cancels it carries (run first)."""
     inst.clone = event.data
     inst.cancel = event.data.cancels
-    inst.clone.request = _request_key(inst)
-    if inst.cancel is not None:
-        inst.cancel.request = inst.clone.request
     inst.declined = inst.refused = (None, None)
 
 
@@ -2499,11 +2399,6 @@ def clone_refusal_not_written(ctx, inst, event) -> None:
     inst.reported = event.data
     _report(inst=inst, kind="task", clones=[], error=event.data)
     _fail(reply=clone.reply, error=event.data)
-
-
-def attempt_clone(ctx, inst, event) -> None:
-    """The call may be tried: it uses one of the run's clone tries, and is prepared next."""
-    inst.clone_tries += 1
 
 
 def _outcome(rule: Callable, inst: TimelineSM) -> tuple[str | None, BaseException | None]:
@@ -2544,11 +2439,11 @@ def refuse_prepared(ctx, inst, event) -> None:
 
 
 def take_prepared(ctx, inst, event) -> None:
-    """The harness prepared the call: its grafts, parts and batch, or the text of its refusal."""
+    """The harness prepared the call: its grafts, batch and names, or the text of its refusal."""
     if isinstance(event.data, str):
         inst.rejection = event.data
     else:
-        inst.clone.pairs, inst.clone.parts, inst.clone.data, names = event.data
+        inst.clone.pairs, inst.clone.data, names = event.data
         inst.clone.names = dict(names or {})
         inst.refused = _outcome(rule=clone_why, inst=inst)  # read by the prepared gate
 
@@ -2609,16 +2504,12 @@ def spawned(ctx, inst, event) -> None:
 def _register_grafts(inst: TimelineSM, clone: Clone) -> None:
     """The grafts of a clone call whose machines started become the original's (also done by a
     recovery, for a step that failed after they started: grafts already started stay its own)."""
-    for (child, focus), (_, part) in zip(clone.pairs, clone.parts or [("", frozenset())] * len(clone.pairs)):
+    for child, focus in clone.pairs:
         inst.grafts[child] = focus
-        inst.parts[child] = part
         inst.names[child] = clone.names.get(child, child)
-        inst.cloned_for[child] = clone.request
         inst.made[child] = focus
         if not focus and inst.answering is not None:
             inst.graft_requests[child] = inst.answering
-    inst.clone_calls[clone.request] = inst.clone_calls.get(clone.request, NONE_YET) + 1
-    inst.clone_tries = CLONE_TRIES  # one committed clone call per run
     inst.focus = next((g for g, f in clone.pairs if f), None)
     inst.spawn_plan = []
 
@@ -2719,7 +2610,6 @@ def clone_done(ctx, inst, event) -> None:
 # ------------------------------------------------------------------ effects: cancel
 def take_cancel(ctx, inst, event) -> None:
     inst.cancel = event.data
-    inst.cancel.request = _request_key(inst)  # a cancelled part is blocked under it
     inst.clone = None
 
 
@@ -2736,7 +2626,7 @@ def checks_from(ctx, inst, event) -> None:  # entry of `cancels`: the ids to dec
 
 def cancel_head(ctx, inst, event) -> None:
     """The graph allows this id: the graft leaves the live grafts at once, and `cancel` is
-    forwarded to it. Its part is blocked only if its join lands as cancelled."""
+    forwarded to it."""
     child = inst.to_check.pop(HEAD)
     index, _ = inst.claims_next.pop(HEAD)
     inst.claims[child] = index
@@ -2753,17 +2643,12 @@ def refuse_head(ctx, inst, event) -> None:
 
 
 def cancel_landed(ctx, inst, event) -> None:
-    """A graft this call cancelled has queued its join: its outcome is the join's reason, and its
-    part is blocked only if it was cancelled (a graft that finished first is not), under both the
-    request current at the cancel and the request the graft was made for, so a withdrawal of the
-    message that cancelled it does not lift the block."""
+    """A graft this call cancelled has queued its join: its outcome is the join's reason (a graft
+    that finished first keeps its own)."""
     join: QueuedJoin = event.data
     inst.queue.append(join)
     inst.pending.discard(join.child)
     inst.outcomes[join.child] = join.reason
-    part = inst.parts.get(join.child, frozenset())
-    keys = {inst.cancel.request, inst.cloned_for.get(join.child)}
-    inst.blocks |= {(key, part) for key in keys} if join.reason == CANCELLED else set()
     _session(inst=inst, name="graft_received", data=join.child)
 
 
@@ -2831,10 +2716,8 @@ def focus_back(ctx, inst, event) -> None:
 def _take_focus_join(inst: TimelineSM, handed: tuple) -> None:
     """The conversation comes back with its focus graft's join (also done by a recovery, for a
     step that failed taking it: the join it carried is not lost)."""
-    join, waiters, inbox, answering, withdrawn, unmarked, returned, asked = handed
+    join, waiters, inbox, answering, withdrawn, unmarked, returned = handed
     inst.focus = None
-    # the messages the focus graft took (answered or handed back) are requests of the original's
-    inst.asked += [r for r in asked if all(r is not k for k in inst.asked)]
     inst.queue.append(join)
     inst.waiters.extend(waiters)
     inst.inbox = list(inbox) + inst.inbox
@@ -2849,14 +2732,12 @@ def start_joining(ctx, inst, event) -> None:  # entry of `joining`: a commit poi
 
 
 def applied(ctx, inst, event) -> None:
-    """One join applied: it leaves the queue, the graft is told, and a hand-back is counted under
-    the request the graft was working on (blocking that part if it failed or came back twice):
-    the row the harness names, if it is one of the original's requests, else the request the
-    graft was made for (a row that is none of them is a key no bound would ever read)."""
-    committed_, named, ends = event.data
+    """One join applied: it leaves the queue and the graft is told. Its news (and the request
+    it was made for) is kept for the wake; whether the view now ends on a handed-back message it
+    must answer is kept too."""
+    committed_, ends = event.data
     closed_out(inst)
     join = inst.queue.pop(HEAD)
-    request = named if any(r.row == named for r in inst.asked) else inst.cloned_for.get(join.child)
     inst.grafts.pop(join.child, None)
     inst.stopping.discard(join.child)
     news = (not inst.made.get(join.child) or join.reason != "done") and not _unwanted(inst=inst, child=join.child)
@@ -2864,11 +2745,6 @@ def applied(ctx, inst, event) -> None:
     # the wake its news sets off is for the request the graft was made for, if any
     inst.woken_for += [r for r in [inst.graft_requests.pop(join.child, None)] if news and r is not None]
     inst.ends_on_request = ends
-    if join.reason not in ("done", CANCELLED):
-        part = inst.parts.get(join.child, frozenset())
-        inst.handbacks[request] = inst.handbacks.get(request, NONE_YET) + 1
-        n = inst.arrivals[(request, part)] = inst.arrivals.get((request, part), NONE_YET) + 1
-        inst.blocks |= {(request, part)} if join.reason == "failed" or n >= 2 else set()
     _forward(target=inst.machines.timelines.get(join.child), name="join_commit" if committed_ else "join_rollback")
 
 
@@ -2899,14 +2775,12 @@ def abandon_head(ctx, inst, event) -> None:
 
 
 def answer_handback(ctx, inst, event) -> None:
-    inst.clone_tries = 0
     inst.mode = Mode(name="turn", user=True, about=tuple(c for c, _ in inst.news))
 
 
 def wake_run(ctx, inst, event) -> None:
-    """Every wake is a full run: it may reply, clone, cancel and go on, under the bounds of any
-    turn. A focus graft that failed or handed back makes it answer that graft's request."""
-    inst.clone_tries = 0
+    """Every wake is a full run: it may reply, clone, cancel and go on, as any turn. A focus graft
+    that failed or handed back makes it answer that graft's request."""
     inst.mode = Mode(name="wake", answers=_handed_back(inst), about=tuple(c for c, _ in inst.news))
 
 
@@ -2943,7 +2817,7 @@ def _hand_back(inst: TimelineSM, event: hsm.Event | None) -> None:
     users = [w for w in inst.waiters if w.user] + also
     others = [w for w in inst.waiters if not w.user]
     inst.handed_back = (join, users, list(inst.inbox), inst.answering, set(inst.withdrawn), list(inst.unmarked),
-                        list(inst.returned), list(inst.asked))
+                        list(inst.returned))
     inst.waiters, inst.inbox, inst.answering = [], [], None
     for w in others:
         _resolve(reply=w.reply, value="joined")
@@ -3604,7 +3478,7 @@ def _work(name: str, *activity: hsm.RedefinableBehaviors) -> hsm.RedefinableStat
         ),
         hsm.Choice(
             "clone_gate",  # the whole call: may it be tried at all? Decided before anything is seeded
-            T(S("preparing"), G(may_try), Effect(attempt_clone)),
+            T(S("preparing"), G(may_try)),
             T(S("steps/cloning/rejecting"), G(declines), Effect(decline)),
             # the step failed (its rules were not worked out on what it brought): refused with its error
             T(S("steps/cloning/rejecting"), Effect(checked(may_try, declines, effects=(decline_failed_step,)))),
@@ -4699,9 +4573,8 @@ class Machines:
     """The registry of machines and the requests the harness puts to them. It decides nothing and
     exposes nothing of a machine's data: every request is an event, and the graph answers it."""
 
-    def __init__(self, host: Host, max_live_background: int = MAX_LIVE_BACKGROUND):
+    def __init__(self, host: Host):
         self.host = host
-        self.max_live_background = max_live_background  # the cap the clone rule reads (data, not a graph)
         self.timelines: dict[str, TimelineSM] = {}
         self.session: SessionSM | None = None
         self.scribe: ScribeSM | None = None
