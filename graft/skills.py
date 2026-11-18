@@ -77,7 +77,7 @@ FORK (one call per user message). `fork(current={...}, detached=[{...}, ...])` s
 branch it names at once. Give `current`, `detached`, or both. Each branch is `{id?, skills}`:
 - `skills`: catalog skill names the branch holds (never `fork`, `merge` or `detached`).
 - `id` (optional): a short name for the branch, lowercase letters, digits and `-` (for example
-  "site"), unique in this conversation and never reused. Without one, the branch gets a random id.
+  "site"; never "main", the line you hold here), unique in this conversation and never reused. Without one, the branch gets a random id.
   Results, notes and `stop` use it. Two branches of one call with the same skills need ids.
 - `current`: at most one branch, in which you carry on the conversation with the user; on main
   you are paused until it merges. Use it when the task needs the user: requirements are still open,

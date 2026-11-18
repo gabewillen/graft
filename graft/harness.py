@@ -82,6 +82,8 @@ GRAFT_ID = re.compile(BRANCH_ID_PATTERN)
 # Draws of a random id for one entry before the call is refused: a source that keeps colliding, or
 # returns something that is not an id, is an error of the call's preparation, never a loop.
 MAX_NAME_DRAWS = 16
+# The line the original holds, as the model is told it (git's main): never a branch's id.
+MAIN = "main"
 
 
 # What `draw_names` raises (an error of the call's preparation, so the call is refused): its text
@@ -206,6 +208,9 @@ def _entry(e: object, label: str, focus: bool, v: list[str]) -> CloneEntry | Non
     if name is not None and not (isinstance(name, str) and GRAFT_ID.fullmatch(name)):
         v.append(f"{label}: id {_echo(name)} is not a branch id (lowercase letters, digits and -, "
                  "starting with a letter or digit, at most 32 characters)")
+        name = None
+    elif name == MAIN:
+        v.append(f"{label}: id 'main' is the line you hold, not a branch; give the branch another id")
         name = None
     skills = _strings(e, name="skills", label=label, violations=v)
     repeated = sorted({k for k in skills if skills.count(k) > 1})
@@ -449,8 +454,13 @@ class Harness:
         are all background grafts (the machine says so: it made them)."""
         err = _described(error)
         record = (src, clones, err)
-        # the user knows a graft by the id the model gave or drew, never by its timeline id
-        names = self._names(clones=[self.shown(c) for c in clones], background=background)
+        # the user knows a graft by the id the model gave or drew, never by its timeline id; the
+        # failure told may be the store's own, so a name that cannot be read is left out
+        try:
+            shown = [self.shown(c) for c in clones]
+        except Exception:  # noqa: BLE001 - the line is still told, without the ids
+            shown = []
+        names = self._names(clones=shown, background=background)
         if kind == "wake":
             self.wake_errors.append(record)
             line = f"(harness error: {names} merged, but reporting the result failed: {err})"

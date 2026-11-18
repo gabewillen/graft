@@ -30,11 +30,19 @@ def fork(*, current=None, detached=(), id="t"):
     return {"id": id, "name": "fork", "input": inp}
 
 
+def test_main_is_the_line_the_original_holds_and_never_a_branch_id():
+    from graft.harness import clone_entries
+    _, v = clone_entries({"current": {"id": "main", "skills": ["website"]}})
+    assert v == ["current: id 'main' is the line you hold, not a branch; give the branch another id"]
+    assert clone_entries({"current": {"id": "main-site", "skills": ["website"]}})[1] == []
+
+
 def test_the_default_source_draws_six_lowercase_hex_characters():
     draw = new_names(rng=random.Random(7))  # imported before the tests' counted source replaces it
     ids = [draw() for _ in range(50)]
     assert all(re.fullmatch(r"[0-9a-f]{6}", i) and GRAFT_ID.fullmatch(i) for i in ids), ids
-    assert ids == [new_names(rng=random.Random(7))() for _ in range(1)] + ids[1:]  # seeded: replayable
+    replay = new_names(rng=random.Random(7))
+    assert [replay() for _ in range(50)] == ids  # seeded: replayable
     assert len(set(ids)) > 45
 
 
@@ -207,3 +215,18 @@ def test_a_request_handed_back_any_number_of_times_may_still_be_forked_for(tmp_p
     reasons = [store.timeline(f"c{i}")["join_reason"] for i in range(1, rounds + 1)]
     assert reasons == ["out_of_scope"] * rounds  # each hand-back was forked for again
     assert store.timeline(f"c{rounds + 1}") is None
+
+
+def test_an_error_line_is_still_told_when_the_store_cannot_name_the_branch(tmp_path):
+    """The failure told may be the store's own: a name that cannot be read is left out of the line
+    (never the timeline id in its place), and the line is still told."""
+    said = []
+    store = Store(str(tmp_path / "err2.db"))
+    install(store)
+    h = Harness(store=store, provider=FakeProvider(lambda *a: text("ok")), seeder=None, emit=said.append)
+
+    def broken(tl):
+        raise OSError("store gone")
+    store.name_of = broken
+    h._report_failure(kind="commit", src="o", clones=["c1"], error=OSError("disk full"), quiet=False, background=True)
+    assert said and said[-1].startswith("(harness error: committing the merge of a branch failed") and "c1" not in said[-1]
