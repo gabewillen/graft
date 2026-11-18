@@ -108,9 +108,9 @@ def test_leading_assistant_row_gets_nearest_earlier_user_row(tmp_path, monkeypat
     asyncio.run(go())
 
 
-def test_seeder_failure_falls_back_to_the_conversation_and_is_recorded(tmp_path, monkeypatch):
-    """A decisions client that fails: the graft starts from the conversation (its text rows from
-    the first user row through the last, harness notes left out), as without one."""
+def test_seeder_failure_falls_back_to_the_entrys_messages_and_is_recorded(tmp_path, monkeypatch):
+    """A decisions client that fails: the graft starts from the messages its entry points at, as
+    without one (here the conversation, pointed at by row id)."""
     store, h = setup(tmp_path, FakeJev(fail=True), monkeypatch)
 
     async def go():
@@ -119,9 +119,9 @@ def test_seeder_failure_falls_back_to_the_conversation_and_is_recorded(tmp_path,
         (child,), text = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
             "current": {"skills": ["slides"]}}})
         audit = h.seeder_log[0]
-        assert "TimeoutError" in audit["error"] and audit["fallback"] == "conversation"
+        assert "TimeoutError" in audit["error"] and audit["fallback"] == "messages"
         seed = [x["row_id"] for x in store.view(child)]
-        assert seed == [r["u1"], r["a1"], r["u2"], r["a2"], r["trig"]] == h.default_seed("o")
+        assert seed == [r["u1"], r["a1"], r["u2"], r["a2"], r["trig"]]
         await h.machines.stop()
 
     asyncio.run(go())

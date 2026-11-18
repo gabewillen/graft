@@ -38,6 +38,7 @@ The sweep runs with `-m sweep` (it is left out of the default run); the check of
 out runs by default."""
 
 import asyncio
+from _util import ran, started
 import collections
 import contextlib
 import dataclasses
@@ -180,10 +181,10 @@ class Policy(FaultScript):
                 if last["type"] == "text" and last["text"] == request:
                     entries = [clone_entry(skills=[k], focus=False) for k in WAITING_TOOLS]
                     return [clone_use(*entries, id=f"k{len(messages)}") | {"type": "tool_use"}]
-                if last["type"] == "tool_result":
+                if ran(last):
                     self.answer_gate.wait(WAIT + HANG)  # the call is withdrawn before it is answered
                 return text("Reported." if is_wake(last) else "Started.")
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("done")
             skill = next(k for k, (tool, _) in WAITING_TOOLS.items() if tool in names)
             tool, args = WAITING_TOOLS[skill]
@@ -194,10 +195,10 @@ class Policy(FaultScript):
                     entry = clone_entry(skills=["website"], focus=request == TOOL_FOCUS)
                     return [clone_use(entry, id=f"k{len(messages)}") | {"type": "tool_use"}]
                 return text("Reported." if is_wake(last) else "Started.")
-            if last["type"] == "tool_result" and request == TOOL_FOCUS:
+            if ran(last) and request == TOOL_FOCUS:
                 return [{"type": "text", "text": "site done"},
                         {"type": "tool_use", "id": f"j{len(messages)}", "name": "merge", "input": {"reason": "done"}}]
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("site done")
             return [{"type": "tool_use", "id": f"w{len(messages)}", "name": "site_write",
                      "input": {"page": "index", "content": "hi"}}]

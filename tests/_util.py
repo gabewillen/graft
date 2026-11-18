@@ -3,11 +3,38 @@ machine's state is copied to `timelines.status` in the step that enters it, so a
 call the store says where every timeline is."""
 
 
+def conversation(store, src="o"):
+    """The row ids of src's conversation a test branch starts from by default: its messages (text
+    rows that are not harness notes or withdrawn) from the first user message to the last."""
+    rows = [r for r in store.working_view(src)
+            if r["kind"] == "text" and not r["harness"] and not r["withdrawn"]]
+    users = [i for i, r in enumerate(rows) if r["role"] == "user"]
+    return [r["row_id"] for r in rows[users[0]:users[-1] + 1]] if users else []
+
+
+def pointing(store, use, src="o"):
+    """`use` with every entry that names no messages pointed at src's conversation (by row id):
+    a driven turn stores no fork call, so its branches start from their messages alone."""
+    args = use.get("input")
+    if not isinstance(args, dict):
+        return use
+    seeded = lambda e: dict(e, messages=conversation(store, src)) if isinstance(e, dict) and not e.get(
+        "messages") and "reason" not in e else e
+    out = dict(args)
+    if "current" in out:
+        out["current"] = seeded(out["current"])
+    if isinstance(out.get("detached"), list):
+        out["detached"] = [seeded(e) for e in out["detached"]]
+    return dict(use, input=out)
+
+
 async def clone_in_turn(h, use, src="o"):
-    """Make a clone call the way the harness loop does, inside a turn of `src` (a turn of its
-    own: the call is the turn's first, with its one retry left). A turn that still holds the
-    conversation afterwards (background grafts only, or a refused call) is ended, so `src` is
-    left at rest. Returns (new timeline ids or None, result text)."""
+    """Make a clone call the way the harness loop does, inside a turn of `src` (a turn its caller
+    drives, so the call is not a row of src's view: an entry that names no messages is pointed at
+    the conversation, `pointing`). A turn that still holds the conversation afterwards (background
+    grafts only, or a refused call) is ended, so `src` is left at rest. Returns (new timeline ids or
+    None, result text)."""
+    use = pointing(h.store, use, src)
     await h.begin_turn(src)
     children, focus, text = await h.clone_call(src=src, use=use)
     if focus is None:
@@ -41,15 +68,68 @@ def holder(store):
 
 
 def branch_input(*entries):
-    """A fork call's input from test entries: each {"skills", "focus", "id"?}; the one with
-    focus=True is `current`, the others are `detached`, in order. A dict without `focus` is
+    """A fork call's input from test entries: each {"skills", "focus", "id"?, "messages"?,
+    "reason"?} (no messages: an empty list); the one with focus=True is `current`, the others are
+    `detached`, in order. A dict without `focus` is
     passed through as a detached entry (a malformed one, for refusal tests)."""
     current = [e for e in entries if isinstance(e, dict) and e.get("focus") is True]
     detached = [e for e in entries if not (isinstance(e, dict) and e.get("focus") is True)]
-    strip = lambda e: {k: v for k, v in e.items() if k != "focus"} if isinstance(e, dict) else e
+    strip = lambda e: {"messages": [], **{k: v for k, v in e.items() if k != "focus"}} if isinstance(e, dict) else e
     out = {}
     if current:
         out["current"] = strip(current[0])
     if detached or not current:
         out["detached"] = [strip(e) for e in detached]
     return out
+
+
+def _quotes(messages):
+    """The user's own messages in a rendered view, as quotes (no harness rows, no nonce, no repeats)."""
+    import re
+    out = []
+    for m in messages:
+        if m["role"] != "user":
+            continue
+        for b in m["content"]:
+            if b["type"] == "text" and not b.get("harness"):
+                q = re.sub(r"^\[conversation [^\]]*\]\s*", "", b["text"]).strip()
+                if q and q not in out:
+                    out.append(q)
+    return out
+
+
+def quoting(policy):
+    """A scripted policy whose fork calls point every entry that names no messages and gives no
+    reason at the user's messages in its view (as quotes), as a test default: the branch then
+    starts from the conversation's requests, as a model that quotes them would make it."""
+    def wrapped(system, messages, tools):
+        blocks = policy(system, messages, tools)
+        if not isinstance(blocks, list):
+            return blocks
+        out = []
+        for b in blocks:
+            args = b.get("input") if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "fork" else None
+            if isinstance(args, dict):
+                fill = lambda e: dict(e, messages=_quotes(messages)) if isinstance(e, dict) and not e.get(
+                    "messages") and "reason" not in e else e
+                args = dict(args)
+                if "current" in args:
+                    args["current"] = fill(args["current"])
+                if isinstance(args.get("detached"), list):
+                    args["detached"] = [fill(e) for e in args["detached"]]
+                b = dict(b, input=args)
+            out.append(b)
+        return out
+    return wrapped
+
+
+def started(block):
+    """Is this block a branch's own fork result, the last row of its first view (spec: Clone)?"""
+    return (block.get("type") == "tool_result" and isinstance(block.get("content"), str)
+            and block["content"].startswith("You are now on branch "))
+
+
+def ran(block):
+    """Is this block the result of a tool call the timeline made itself (not a branch's fork
+    result, which ends a branch's first view)?"""
+    return block.get("type") == "tool_result" and not started(block)

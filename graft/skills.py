@@ -48,8 +48,15 @@ CANCEL_TOOL = {
 # What a branch id looks like: chosen by the model, or drawn by the harness (6 hex characters).
 BRANCH_ID_PATTERN = "^[a-z0-9][a-z0-9-]{0,31}$"
 
-# One entry of the fork call: the skills the branch holds and, optionally, its id.
-CLONE_ENTRY = obj({"id": {"type": "string", "pattern": BRANCH_ID_PATTERN}, "skills": STRS}, ["skills"])
+# One entry of the fork call: the skills the branch holds, the messages it starts from (pointers:
+# short exact quotes or row ids), optionally main's own words for it, and optionally its id.
+MESSAGES = {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+            "description": "The messages of this conversation the branch starts from: each a short exact "
+                           "quote of one message (or its row id). It may be empty if you give a reason."}
+REASON = {"type": "string", "description": "Your own words for this branch: the part it does, and anything "
+                                           "it needs to know that the messages do not say."}
+CLONE_ENTRY = obj({"id": {"type": "string", "pattern": BRANCH_ID_PATTERN}, "skills": STRS,
+                   "messages": MESSAGES, "reason": REASON}, ["skills", "messages"])
 
 BASE_SYSTEM = (
     "You are a helpful assistant talking with one user in one ongoing conversation. "
@@ -74,8 +81,14 @@ comes back to main. A detached branch works off to the side with no line to the 
 stays on main.
 
 FORK (one call per user message). `fork(current={...}, detached=[{...}, ...])` starts every
-branch it names at once. Give `current`, `detached`, or both. Each branch is `{id?, skills}`:
+branch it names at once. Give `current`, `detached`, or both. Each branch is
+`{id?, skills, messages, reason?}`:
 - `skills`: catalog skill names the branch holds (never `fork`, `merge` or `detached`).
+- `messages`: the messages of this conversation the branch starts from, each a short exact quote
+  of one message (or its row id). The branch sees only these, then this fork call. It may be
+  empty when `reason` says everything the branch needs.
+- `reason` (optional): your own words for the branch: its part, and anything it needs that the
+  messages do not say. The branch reads it in this fork call.
 - `id` (optional): a short name for the branch, lowercase letters, digits and `-` (for example
   "site"; never "main", the line you hold here), unique in this conversation and never reused. Without one, the branch gets a random id.
   Results, notes and `stop` use it. Two branches of one call with the same skills need ids.
@@ -86,8 +99,7 @@ branch it names at once. Give `current`, `detached`, or both. Each branch is `{i
   on main. Use them when the task is fully specified by what the user already said and
   is independent of the other branches. A request with several independent parts is one `fork`
   call with one detached branch per part.
-Every branch starts from this conversation as it stands, as a git branch starts from its parent:
-you do not choose what it sees.
+You choose what each branch sees, as a git branch is cut from the commits you pick.
 In each branch you do only the part its skills cover and ignore the rest of the request. So a
 request with several parts needs one branch per part: a part with no branch is done by nobody.
 If any branch is invalid the whole call is refused, with the violations per branch, and no branch

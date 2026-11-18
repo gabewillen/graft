@@ -64,7 +64,6 @@ def test_valid_view():
 
 @pytest.mark.parametrize("rows,needle", [
     ([], "empty"),
-    ([row(1, "assistant", "text", "x"), row(2, "user", "text", "y")], "start with a user"),
     ([row(1, "user", "text", "x"), use(2, "u1"), row(3, "user", "text", "y")], "has no tool_result"),
     ([row(1, "user", "text", "x"), res(2, "zz")], "has no tool_use"),
     ([row(1, "user", "text", "x"), use(2, "u1"), row(3, "user", "text", "y"), res(4, "u1")],

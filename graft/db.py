@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
 SCHEMA = """
@@ -120,6 +120,12 @@ class Graft:
     skills: list[str]
     focus: bool = True
     name: str | None = None  # the id the model knows it by
+    # The source's clone turn as the graft sees it: pointers to the assistant rows that hold the
+    # clone call and to the source's results of that turn's other calls, then the graft's own
+    # fork result (a tool_result block, written as a row the graft owns). Empty and None for a call
+    # that is not a row in the source's view (a turn its caller drives).
+    turn: list[int] = field(default_factory=list)
+    result: dict | None = None
 
 
 class Store:
@@ -346,16 +352,18 @@ class Store:
 
     def commit_clone(self, source: str, grafts: Sequence[Graft],
                      audits: Sequence[tuple[int, str, Any]] = ()) -> None:
-        """One SQL transaction for the whole clone call: every graft's timelines row, seed
-        pointers and timeline_skills links, and the `committed` outcome of its audit records
+        """One SQL transaction for the whole clone call: every graft's timelines row, seed and
+        clone-turn pointers, fork result row and timeline_skills links, and the `committed` outcome of its audit records
         (`audits`: (tx_id, committed_sql, scratch)), or none of it."""
         self.con.execute("BEGIN")
         try:
             for g in grafts:
                 self.create_timeline(g.child, source, g.skills,
                                      status="active" if g.focus else "background", name=g.name)
-                for rid in g.seed:
+                for rid in [*g.seed, *g.turn]:
                     self.append(g.child, rid)
+                if g.result is not None:
+                    self.add_turn(g.child, "user", "tool_result", g.result, tool_name="fork", harness=True)
             for tx, sql, scratch in audits:
                 self.end_tx(tx, status="committed", committed_sql=sql, scratch=scratch)
             self.con.execute("COMMIT")
@@ -456,9 +464,8 @@ def validate(rows: list[dict], viewer: str, trigger: int | None = None,
         if r["kind"] == "thinking" and r["owner_timeline"] != viewer:
             v.append(f"row {rid}: thinking block owned by {r['owner_timeline']} is bound to its "
                      f"own conversation; exclude it from {viewer}'s view")
-    if rows[0]["role"] != "user":
-        v.append(f"view must start with a user turn (row {rows[0].get('row_id')} is assistant); "
-                 "user and assistant turns must alternate starting with user")
+    # A view may start with either role: a graft pointed at no messages starts on its source's
+    # clone turn (spec: Validated views).
     # group into messages (consecutive same role)
     groups: list[list[dict]] = []
     for r in rows:

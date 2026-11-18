@@ -14,7 +14,7 @@ import threading
 
 import pytest
 
-from _util import clone_in_turn, clones, holder, holders, status
+from _util import clone_in_turn, clones, holder, holders, status, ran, started, pointing
 from graft.db import Store, render, validate
 from graft.harness import (NOT_RUN_BESIDE_CLONE, NOT_RUN_INTERRUPTED, NOT_RUN_JOINING, Harness,
                            NotRun, _reason, cancel_ids, clone_entries)
@@ -67,7 +67,7 @@ class Script:
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 self.replying.set()
                 if self.root_gate_on_reply:
                     assert self.gates["root"].wait(5)
@@ -122,35 +122,38 @@ def is_wake(block):
 # ------------------------------------------------------------------ the clone call is one batch
 def test_clone_entries_shape():
     """`current` (one branch), `detached` (a list), or both; at least one branch in all."""
-    assert clone_entries({})[1] == ["`fork` needs `current`, a non-empty `detached`, or both; each branch is {id?, skills}"]
+    shape = "{id?, skills, messages, reason?}"
+    m = {"messages": ["q"]}
+    assert clone_entries({})[1] == [f"`fork` needs `current`, a non-empty `detached`, or both; each branch is {shape}"]
     assert clone_entries({"detached": []})[1] == clone_entries({})[1]  # empty detached and no current
     assert clone_entries({"detached": {"skills": ["website"]}})[1]  # not a list
-    _, v = clone_entries({"current": {"skills": ["website"], "focus": True}})
-    assert v == ["current: unknown field 'focus' (a branch has only `id` and `skills`)"]
-    _, v = clone_entries({"detached": [{"skills": ["website"]}], "branch": []})
+    _, v = clone_entries({"current": {"skills": ["website"], "focus": True, **m}})
+    assert v == [f"current: unknown field 'focus' (a branch is {shape})"]
+    _, v = clone_entries({"detached": [{"skills": ["website"], **m}], "branch": []})
     assert v == ["unknown field 'branch' (`fork` takes `current` and `detached`)"]
-    es, v = clone_entries({"current": {"skills": ["website"]}, "detached": [{"skills": ["slides"]}]})
+    es, v = clone_entries({"current": {"skills": ["website"], **m}, "detached": [{"skills": ["slides"], **m}]})
     assert v == [] and [(e.label, e.focus) for e in es] == [("current", True), ("detached[0]", False)]
-    es, v = clone_entries({"current": {"skills": ["website"]}})
+    es, v = clone_entries({"current": {"skills": ["website"], **m}})
     assert v == [] and len(es) == 1
-    es, v = clone_entries({"detached": [{"skills": ["slides"]}, {"skills": ["website"]}]})
+    es, v = clone_entries({"detached": [{"skills": ["slides"], **m}, {"skills": ["website"], **m}]})
     assert v == [] and not any(e.focus for e in es)
 
 
 def test_branch_ids_are_checked_and_the_same_skills_twice_need_ids():
-    _, v = clone_entries({"detached": [{"skills": ["website"]}, {"skills": ["website"]}]})
+    m = {"messages": ["q"]}
+    _, v = clone_entries({"detached": [{"skills": ["website"], **m}, {"skills": ["website"], **m}]})
     assert v == ["detached[0] and detached[1] hold the same skills: give each an id to tell them apart"]
-    _, v = clone_entries({"detached": [{"id": "a", "skills": ["website"]}, {"skills": ["website"]}]})
+    _, v = clone_entries({"detached": [{"id": "a", "skills": ["website"], **m}, {"skills": ["website"], **m}]})
     assert len(v) == 1  # both need ids
-    es, v = clone_entries({"detached": [{"id": "a", "skills": ["website"]}, {"id": "b", "skills": ["website"]}]})
+    es, v = clone_entries({"detached": [{"id": "a", "skills": ["website"], **m}, {"id": "b", "skills": ["website"], **m}]})
     assert v == [] and [e.name for e in es] == ["a", "b"]
-    _, v = clone_entries({"detached": [{"id": "a", "skills": ["website"]}, {"id": "a", "skills": ["slides"]}]})
+    _, v = clone_entries({"detached": [{"id": "a", "skills": ["website"], **m}, {"id": "a", "skills": ["slides"], **m}]})
     assert v == ["id 'a' is given to more than one branch"]
     for bad in ("Site", "-site", "", "a" * 33, "a b", 7, None.__class__):
-        _, v = clone_entries({"current": {"id": bad, "skills": ["website"]}})
+        _, v = clone_entries({"current": {"id": bad, "skills": ["website"], **m}})
         assert len(v) == 1 and v[0].startswith("current: id ") and "is not a branch id" in v[0], bad
     for good in ("site", "0", "a" * 32, "my-site-2"):
-        assert clone_entries({"current": {"id": good, "skills": ["website"]}})[1] == [], good
+        assert clone_entries({"current": {"id": good, "skills": ["website"], **m}})[1] == [], good
 
 
 def test_refused_batch_is_atomic(tmp_path):
@@ -409,7 +412,7 @@ def test_background_silent_done_is_refused_until_it_writes_its_result(tmp_path):
 
     asyncio.run(go())
     assert h.silent_done_refusals == ["c1"]
-    refusal = [r for r in store.view("c1") if r["kind"] == "tool_result"][0]
+    refusal = [r for r in store.view("c1") if r["kind"] == "tool_result" and not r["harness"]][0]
     assert "you have not written your result yet" in refusal["content"]
     assert store.timeline("c1")["join_reason"] == "done"
     assert "Site built with defaults." in [r["content"] for r in store.view("o")]
@@ -497,7 +500,7 @@ def test_a_done_join_wakes_a_full_run_that_clones_the_next_task(tmp_path):
         last = messages[-1]["content"][-1]
         if "fork" not in names:
             return text("Deck built." if "slides_create" in names else "Site built.")
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("Refused: " + last["content"] if last.get("is_error") else "Started.")
         if is_wake(last) and "c1 (done)" in last["text"]:
             return [{"type": "text", "text": "The website is done; starting the deck."},
@@ -531,7 +534,7 @@ def test_a_failed_join_wakes_a_full_run_that_clones_another_part(tmp_path):
             if "slides_create" in names:
                 return text("Deck built.")
             return [{"type": "tool_use", "id": "j1", "name": "merge", "input": {"reason": "failed"}}]
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("Refused: " + last["content"] if last.get("is_error") else "Started.")
         if is_wake(last) and "c1 (failed)" in last["text"]:
             return [{"type": "text", "text": "The website failed; starting the deck."},
@@ -564,7 +567,7 @@ def test_a_focus_hand_back_wakes_a_full_run_that_clones_another_part(tmp_path):
             if "slides_create" in names:
                 return text("Deck built.")
             return [{"type": "tool_use", "id": "j1", "name": "merge", "input": {"reason": "out_of_scope"}}]
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("Refused: " + last["content"] if last.get("is_error") else "Started.")
         if is_wake(last) or (last["type"] == "text" and "c1 (out_of_scope) merged" in last["text"]):
             if "c1 (out_of_scope)" in last["text"]:
@@ -745,7 +748,7 @@ def test_an_exception_inside_clone_handling_ends_as_a_refused_tool_result(tmp_pa
 
     def policy(system, messages, tools):
         last = messages[-1]["content"][-1]
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("Could not start that.")
         return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
@@ -850,13 +853,14 @@ def test_wake_note_does_not_point_at_rows_the_size_backstop_dropped(tmp_path):
 
 def test_clone_entries_validates_model_written_fields_and_keeps_raw_indexes():
     from graft.skills import CATALOG
-    es, v = clone_entries({"detached": ["junk", {"skills": "website"}, {"skills": ["website", "website"], "id": "x"}]})
+    es, v = clone_entries({"detached": ["junk", {"skills": "website", "messages": ["q"]},
+                                       {"skills": ["website", "website"], "id": "x", "messages": ["q"]}]})
     assert [e.label for e in es] == ["detached[1]", "detached[2]"]  # the index in the model's list, not in the filtered one
-    assert v == ["detached[0]: must be an object {id?, skills}",
+    assert v == ["detached[0]: must be an object {id?, skills, messages, reason?}",
                  "detached[1]: skills must be a list of strings",
                  "detached[2]: skills lists ['website'] more than once"]
     assert es[0].skills == []  # nothing unusable kept
-    es, v = clone_entries({"detached": [{"skills": ["website"], "id": f"w{i}"} for i in range(300)]})
+    es, v = clone_entries({"detached": [{"skills": ["website"], "id": f"w{i}", "messages": ["q"]} for i in range(300)]})
     assert v == [] and len(es) == 300  # a call may name any number of branches: no harness limit
     assert clone_entries("not a dict")[1] and clone_entries({"current": "x"})[1]
     schema = next(t for s in CATALOG if s.name == "fork" for t in s.tools if t["name"] == "fork")["input_schema"]
@@ -1106,11 +1110,11 @@ def test_multi_entry_clone_call_with_an_async_seeder_and_one_fallback(tmp_path):
             clone_entry(skills=["slides"], focus=False)))
         assert seeder.peak == 2
         assert [r["row_id"] for r in store.view(c1)][0] == fact and store.view(c1)[-1]["row_id"] == req
-        assert [r["row_id"] for r in store.view(c2)] == h.default_seed("o")  # the conversation: the fallback
-        assert sorted(str(x["fallback"]) for x in h.seeder_log) == ["None", "conversation"]
+        assert [r["row_id"] for r in store.view(c2)] == [fact, store.view("o")[1]["row_id"], req]  # its messages: the fallback
+        assert sorted(str(x["fallback"]) for x in h.seeder_log) == ["None", "messages"]
         audits = [__import__("json").loads(r[0])["seeder"] for r in store.con.execute(
             "SELECT scratch FROM transactions WHERE kind='clone' AND status='committed' ORDER BY tx_id")]
-        assert [a["fallback"] for a in audits] == [None, "conversation"] and "seeder timeout" in audits[1]["error"]
+        assert [a["fallback"] for a in audits] == [None, "messages"] and "seeder timeout" in audits[1]["error"]
         await h.machines.stop()
 
     asyncio.run(go())
@@ -1129,7 +1133,7 @@ def policy(system, messages, tools):
         threading.Event().wait()  # a background clone whose model call never returns
     if last["type"] == "tool_result":
         return [{"type": "text", "text": "Started."}]
-    return [{"type": "tool_use", "id": "k1", "name": "fork", "input": {"detached": [{"skills": ["website"]}]}}]
+    return [{"type": "tool_use", "id": "k1", "name": "fork", "input": {"detached": [{"skills": ["website"], "messages": [], "reason": "Build the website."}]}}]
 
 cli.make_provider = lambda: FakeProvider(policy)
 sys.argv = ["graft", "chat", "--db", sys.argv[1]]
@@ -1279,7 +1283,7 @@ def test_parallel_experiment_answers_a_question_with_a_bounded_follow_up(capsys,
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("(waiting)")
             return [clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=False),
                               clone_entry(skills=["calendar"], focus=False), id="k1") | {"type": "tool_use"}]
@@ -1454,7 +1458,7 @@ def test_a_focus_graft_whose_run_raises_joins_failed_without_the_model(tmp_path)
         last = messages[-1]["content"][-1]
         if "fork" not in names:
             raise ValueError("provider exploded")
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("Sorry, I could not build that.")
         if any(b.get("harness") for m in messages for b in m["content"] if b["type"] == "text"):
             return text("Sorry, I could not build that.")
@@ -1563,7 +1567,7 @@ def test_chat_status_and_error_lines_go_to_stderr(tmp_path, monkeypatch, capsys)
             return text("Site built.")
         if is_wake(last):
             raise ValueError("wake exploded")
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("Started.")
         return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
@@ -1603,10 +1607,10 @@ def _fails_after_speaking(raises):
         if "fork" in names:
             if last["type"] == "text" and last.get("harness"):
                 return text("Sorry, building the site failed.")
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("(waiting)")
             return [clone_use(clone_entry(skills=["website"], focus=True), id="k1") | {"type": "tool_use"}]
-        if raises and any(m["role"] == "assistant" for m in messages):
+        if raises and any(ran(b) for m in messages for b in m["content"]):  # after its own first step
             raise ValueError("provider exploded")
         return [{"type": "text", "text": "Working on it."},
                 {"type": "tool_use", "id": f"r{len(messages)}", "name": "site_read", "input": {"page": "home"}}]
@@ -1780,7 +1784,7 @@ def test_a_model_call_that_never_returns_times_out_and_the_graft_joins_failed(tm
             return text("too late")
         if last["type"] == "text" and last.get("harness"):
             return text("That did not work.")
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("Started.")
         return [clone_use(clone_entry(skills=["website"], focus=focus), id="k1") | {"type": "tool_use"}]
 
@@ -1903,7 +1907,7 @@ class CancelScript:
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 if not last["tool_use_id"].startswith("x"):
                     return text("Started.")
                 self.results.append((last["content"], last["is_error"]))
@@ -1938,9 +1942,10 @@ async def in_turn(h, tl, coro_fn):
 
 
 def tool_results(store, tl):
-    """tl's own stored tool results: (tool name, content, is_error)."""
+    """tl's own stored tool results of the calls it made: (tool name, content, is_error). A branch's
+    fork result (the harness's row ending its first view) is not one of them."""
     rows = [(r["tool_name"], json.loads(r["content"])) for r in store.view(tl)
-            if r["kind"] == "tool_result" and r["owner_timeline"] == tl]
+            if r["kind"] == "tool_result" and r["owner_timeline"] == tl and not r["harness"]]
     return [(name, data["content"], bool(data.get("is_error"))) for name, data in rows]
 
 
@@ -2037,7 +2042,7 @@ def test_the_original_cancels_a_graft_during_its_model_call_and_its_work_so_far_
 def test_a_graft_cancelled_after_it_acted_joins_what_it_wrote_and_the_tools_it_ran(tmp_path):
     def graft(skill, messages):
         last = messages[-1]["content"][-1]
-        if last["type"] != "tool_result":
+        if not ran(last):
             return [{"type": "text", "text": "Writing the home page."},
                     {"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "home", "content": "hi"}}]
         second_call.set()
@@ -2193,7 +2198,7 @@ def test_a_focus_graft_whose_model_calls_cancel_is_refused(tmp_path):
     def graft(skill, messages):
         last = messages[-1]["content"][-1]
         if skill == "calendar":
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("I can only book things.")
             return [cancel_use(ids=["c2", "c1", "o"], id="g1")]
         return script.finish(skill=skill, messages=messages)
@@ -2219,7 +2224,7 @@ def test_a_graft_whose_model_calls_cancel_is_refused_and_its_sibling_runs_on(tmp
     def graft(skill, messages):
         last = messages[-1]["content"][-1]
         if skill == "website":
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("website finished")
             return [cancel_use(ids=["c2"], id="g1")]
         assert script.gates[skill].wait(GATE_TIMEOUT)
@@ -2249,7 +2254,7 @@ def test_a_graft_stopped_right_after_a_response_with_a_tool_and_a_cancel_keeps_i
     tool's real result was stored before; the original then cancels it."""
     def graft(skill, messages):
         last = messages[-1]["content"][-1]
-        if last["type"] != "tool_result":
+        if not ran(last):
             return [{"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "home", "content": "hi"}},
                     cancel_use(ids=["c9", "o", "c1"], id="g1")]
         second_call.set()
@@ -2609,7 +2614,7 @@ def test_a_graft_is_never_queued_as_cancelled_while_its_task_still_runs(tmp_path
     task is stopped before anything that can fail, so nothing runs in its timeline afterwards."""
     def graft(skill, messages):
         last = messages[-1]["content"][-1]
-        if last["type"] != "tool_result":
+        if not ran(last):
             assert script.gates[skill].wait(GATE_TIMEOUT)  # its first call hangs until the gate
             return [{"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "home", "content": "late"}}]
         return text("website finished")
@@ -2720,7 +2725,7 @@ def test_the_cancel_record_pairs_each_tool_call_with_the_result_of_its_own_turn(
     """A graft reuses one tool-use id: a call that ran, then a call that failed. The failed one
     must not hide the one that ran."""
     def graft(skill, messages):
-        results = [b for m in messages for b in m["content"] if b["type"] == "tool_result"]
+        results = [b for m in messages for b in m["content"] if ran(b)]
         if len(results) == 0:
             return [{"type": "tool_use", "id": "same", "name": "site_write", "input": {"page": "home", "content": "hi"}}]
         if len(results) == 1:
@@ -2787,9 +2792,9 @@ class CloneOnCancelWake(CancelScript):
         last = messages[-1]["content"][-1]
         if "fork" in names and is_wake(last) and "c1 (stopped)" in last["text"]:
             return [clone_use(clone_entry(skills=["website"], focus=False), id="w1") | {"type": "tool_use"}]
-        if "fork" in names and last["type"] == "tool_result" and last["tool_use_id"] == "w1":
+        if "fork" in names and ran(last) and last["tool_use_id"] == "w1":
             return [clone_use(clone_entry(skills=["calendar"], focus=False), id="w2") | {"type": "tool_use"}]
-        if "fork" in names and last["type"] == "tool_result" and last["tool_use_id"] == "w2":
+        if "fork" in names and ran(last) and last["tool_use_id"] == "w2":
             return text("Booking started.")
         return super().__call__(system=system, messages=messages, tools=tools)
 
@@ -2842,7 +2847,7 @@ class CancelThenWithdraw(CancelScript):
     def __call__(self, system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
-        if "fork" in names and last["type"] == "tool_result" and last["tool_use_id"].startswith("x"):
+        if "fork" in names and ran(last) and last["tool_use_id"].startswith("x"):
             self.after_cancel.set()
             assert self.gates["cancel"].wait(GATE_TIMEOUT)
             return text("Stopped.")
@@ -2889,7 +2894,7 @@ def test_the_cancel_record_lists_a_tool_that_acted_and_then_returned_an_error(tm
     the record names it and says it returned an error; a call the harness did not run is not
     named."""
     def graft(skill, messages):
-        results = [b for m in messages for b in m["content"] if b["type"] == "tool_result"]
+        results = [b for m in messages for b in m["content"] if ran(b)]
         if not results:
             return [{"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "home", "content": 5}},
                     {"type": "tool_use", "id": "w2", "name": "slides_create", "input": {"title": "not my tool"}}]
@@ -3107,7 +3112,7 @@ def test_a_graft_whose_model_answers_as_its_cancel_is_accepted_runs_no_tool(tmp_
     graft must not store that response or run its tool."""
     def graft(skill, messages):
         last = messages[-1]["content"][-1]
-        if last["type"] != "tool_result":
+        if not ran(last):
             assert script.gates[skill].wait(GATE_TIMEOUT)
             return [{"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "home", "content": "hi"}}]
         return text("done")
@@ -3151,7 +3156,7 @@ def test_a_tool_whose_output_reads_like_a_harness_refusal_is_still_in_the_cancel
 
     def graft(skill, messages):
         last = messages[-1]["content"][-1]
-        if last["type"] != "tool_result":
+        if not ran(last):
             if mode == "tool_output":
                 return [{"type": "tool_use", "id": "r1", "name": "site_read", "input": {"page": "home"}}]
             return [{"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "x", "content": "y"}}]
@@ -3309,7 +3314,7 @@ def _focus_then_root(gate, entered=None):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("Handing over.")
             if last["type"] == "text" and last["text"] == "Build a website.":
                 return [clone_use(clone_entry(skills=["website"], focus=True), id="t1")
@@ -3458,7 +3463,7 @@ def test_the_cancel_record_names_a_tool_that_ran_under_a_repeated_tool_use_id(tm
     second = threading.Event()
 
     def graft(skill, messages):
-        if messages[-1]["content"][-1]["type"] != "tool_result":
+        if not ran(messages[-1]["content"][-1]):
             return [{"type": "tool_use", "id": "d", "name": "no_such_tool", "input": {}},
                     {"type": "tool_use", "id": "d", "name": "site_write", "input": {"page": "home", "content": "hi"}}]
         second.set()
@@ -3553,7 +3558,7 @@ def test_a_run_may_fork_again_after_a_committed_call(tmp_path):
             return text("done")
         last = messages[-1]["content"][-1]
         forks = sum(1 for m in messages for b in m["content"] if b["type"] == "tool_result")
-        if last["type"] == "tool_result" and forks >= 3:
+        if ran(last) and forks >= 3:
             return text("Started three.")
         if last["type"] == "text" and last.get("harness"):
             return text("Reported.")
@@ -3582,7 +3587,7 @@ def test_a_cancelled_call_answered_by_a_focus_graft_stops_its_first_run(tmp_path
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("Handing over.")
             return [clone_use(clone_entry(skills=["website"], focus=True), id="t1")
                     | {"type": "tool_use"}]
@@ -3616,7 +3621,7 @@ def test_a_cancelled_settle_does_not_take_the_errors_the_next_settle_raises(tmp_
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("Started.")
             if is_wake(last):
                 raise RuntimeError("wake run model call failed")
@@ -3703,7 +3708,7 @@ def test_a_cancelled_call_ends_the_run_that_answers_a_handed_back_message(tmp_pa
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("ok.")
             if any("merged, reason=out_of_scope" in b.get("text", "") for m in messages for b in m["content"]
                    if b["type"] == "text"):  # the run that answers the handed-back message
@@ -3741,7 +3746,7 @@ def test_a_cancelled_call_ends_the_wake_run_that_follows_its_turn(tmp_path):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 replying.set()
                 assert finish.wait(GATE_TIMEOUT)  # the graft's join is queued during this turn
                 return text("Started.")
@@ -3810,7 +3815,7 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
                 entered["wake"].set()
                 assert gates["wake"].wait(GATE_TIMEOUT)
                 return [{"type": "tool_use", "id": "w", "name": "load_skill", "input": {"name": "fork"}}]
-            if last["type"] == "tool_result":
+            if ran(last):
                 entered["root"].set()
                 assert gates["root"].wait(GATE_TIMEOUT)
                 return text("Started.")
@@ -4025,13 +4030,13 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
         if store.timeline(tl) is not None:
             assert violations(store=store, tl=tl) == [], (point, tl)
     if point == "focus graft starting":
-        assert [r for r in store.view("c1") if r["role"] == "assistant"
+        assert [r for r in store.view("c1") if r["role"] == "assistant" and r["owner_timeline"] == "c1"
                 and r["content"] != "c1 answers C"] == []  # c1 never acted on it
         for tl in ("o", "c1"):  # its row is marked in the conversation it was asked in
             assert [r["withdrawn"] for r in store.view(tl) if r["content"] == "FOCUS go"] == [1], tl
         assert later == [["C"]]  # the next turn reads it as withdrawn, not as a request
     if point in BACKGROUND_POINTS:  # the graft made for it stopped before acting, and woke nothing
-        assert [r for r in store.view("c1") if r["role"] == "assistant"] == [], point
+        assert [r for r in store.view("c1") if r["role"] == "assistant" and r["owner_timeline"] == "c1"] == [], point
         assert store.timeline("c1")["join_reason"] == "cancelled" and h.wakes == [], point
     # a withdrawn request is marked in the view whose run never answered it; one its turn answered
     # before the cancel (the joins, wake note and wake that follow the turn) is not
@@ -4076,7 +4081,7 @@ def test_a_withdrawn_request_starts_nothing_more_wherever_its_run_is(tmp_path, p
             return text("no compact call")
         if user_texts(messages)[-1] == "A":
             return text("answer to A")
-        done = sum(1 for m in messages for b in m["content"] if b["type"] == "tool_result")
+        done = sum(1 for m in messages for b in m["content"] if ran(b))
         if point == "a tool runs" and done == 0:
             return [load_use(n=1), load_use(n=2)]
         if point in ("a tool runs", "a tool result is stored", *COMPACTING) and done:
@@ -4102,7 +4107,7 @@ def test_a_withdrawn_request_starts_nothing_more_wherever_its_run_is(tmp_path, p
         if "cancelled" in task:  # a model call started after the caller had gone
             calls_after.append(tag)
         result = await real_complete(tag, system, messages, tools, **kw)
-        done = sum(1 for m in messages for b in m["content"] if b["type"] == "tool_result")
+        done = sum(1 for m in messages for b in m["content"] if ran(b))
         if "cancelled" not in task and (
                 (point == "a later response comes back" and done == 1 and user_texts(messages)[-1] == "B")
                 or (point == "a compaction call comes back" and tag.endswith(":compaction"))):
@@ -4371,7 +4376,7 @@ def test_a_withdrawal_mark_binds_only_the_conversation_not_a_background_graft_se
             assert gates["c1"].wait(GATE_TIMEOUT)
             seen["c1"] = messages
             return text("website finished")
-        if last["type"] == "tool_result":
+        if ran(last):
             entered["root"].set()
             assert gates["root"].wait(GATE_TIMEOUT)
             return text("Started.")
@@ -4402,7 +4407,7 @@ def test_a_withdrawal_mark_binds_only_the_conversation_not_a_background_graft_se
     assert [r["withdrawn"] for r in store.view("c1") if r["content"] == "BG go"] == [0]
     assert [r["withdrawn"] for r in store.view("o") if r["content"] == "BG go"] == [1]
     assert store.timeline("c1")["join_reason"] == "cancelled" and "wake" not in seen
-    assert [r for r in store.view("c1") if r["role"] == "assistant"] == []  # its late response was not stored
+    assert [r for r in store.view("c1") if r["role"] == "assistant" and r["owner_timeline"] == "c1"] == []  # its late response was not stored
     assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
 
 
@@ -4468,7 +4473,7 @@ def _clones_on(entry_for, seen):
         if "fork" not in {t["name"] for t in tools}:
             seen.setdefault("graft", []).append(messages)
             return text("graft acted")
-        if last["type"] == "tool_result":
+        if ran(last):
             seen["result"] = last["content"]
             return text("answered C")
         if last["type"] == "text" and not last.get("harness") and last["text"] == "C":
@@ -4510,7 +4515,7 @@ def test_a_quote_of_a_message_withdrawn_and_sent_again_names_the_one_sent_again(
         if "fork" not in {t["name"] for t in tools}:
             seen["graft"] = messages
             return text("graft acted")
-        if last["type"] == "tool_result":
+        if ran(last):
             seen["result"] = last["content"]
             return text("Started.")
         if last["type"] == "text" and not last.get("harness") and last["text"] == WITHDRAWN:
@@ -4527,15 +4532,15 @@ def test_a_quote_of_a_message_withdrawn_and_sent_again_names_the_one_sent_again(
     row = withdrawn_then(h=h, then=then, mark=mark)
     again = [r["row_id"] for r in store.view("o") if r["content"] == WITHDRAWN and not r["withdrawn"]]
     assert len(again) == 1 and seen["result"].startswith("forked"), seen.get("result")
-    assert [r["row_id"] for r in store.view("c1") if r["owner_timeline"] != "c1"] == again  # its seed
+    assert [r["row_id"] for r in store.view("c1") if r["owner_timeline"] != "c1" and r["kind"] == "text"] == again  # its seed
     assert row not in store.pointed("c1")
     assert user_texts(seen["graft"]) == [WITHDRAWN]
 
 
-@pytest.mark.parametrize("seeder_answer", ["scores", "an error: the conversation is the fallback"])
+@pytest.mark.parametrize("seeder_answer", ["scores", "an error: its messages are the fallback"])
 def test_the_seeder_never_seeds_a_message_the_user_withdrew(tmp_path, seeder_answer, mark):
     """The seeder actor and its fallback: the withdrawn message is no candidate, and the fallback
-    (the conversation) leaves it out too."""
+    (the entry's own messages) leaves it out too."""
     from graft import seeder as sd
     seen, offered = {}, []
 
@@ -4585,8 +4590,8 @@ def test_a_final_seed_holding_a_message_the_user_withdrew_is_refused_whoever_cho
         entry_for=lambda seen: clone_entry(skills=["website"], focus=False), seen=seen)),
         seeder=Seeder())
 
-    async def seed_with_actor(src, skills):
-        return [seen["row"]] + h.default_seed(src), {}
+    async def seed_with_actor(src, skills, fallback, exclude):
+        return [seen["row"]] + fallback, {}
     h.seed_with_actor = seed_with_actor
 
     async def then():
@@ -4708,7 +4713,7 @@ def test_a_run_that_fails_while_a_clone_call_is_prepared_is_the_runs_failure(tmp
         slow.entered = asyncio.get_running_loop().create_future()
         said = asyncio.create_task(h.user_says(REQUEST))
         await until(event=entered, what="the run's model call")
-        call = asyncio.create_task(h.clone_call(src="o", use=clone_use(clone_entry(skills=["website"], focus=False))))
+        call = asyncio.create_task(h.clone_call(src="o", use=pointing(store, clone_use(clone_entry(skills=["website"], focus=False)))))
         await asyncio.wait_for(slow.entered, timeout=WAIT_TIMEOUT)  # the call is being prepared
         gate.set()
         with pytest.raises(RuntimeError, match="model call failed"):
@@ -4736,7 +4741,7 @@ def test_a_withdrawn_request_runs_no_cancel_call_after_the_cancel(tmp_path):
         if is_wake(last):  # the graft's join is reported
             return text("reported")
         if user_texts(messages)[-1] == "BG go":
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("Started.")
             return [clone_use(clone_entry(skills=["website"], focus=False), id="t1")
                     | {"type": "tool_use"}]
@@ -4813,7 +4818,7 @@ def test_a_message_waiting_when_the_original_hands_over_is_answered_before_a_lat
     def policy(system, messages, tools):
         request = user_texts(messages)[-1]
         if "fork" in {t["name"] for t in tools}:
-            if messages[-1]["content"][-1]["type"] == "tool_result":
+            if ran(messages[-1]["content"][-1]):
                 return text("Handing over.")
             assert gate.wait(GATE_TIMEOUT)
             return [clone_use(clone_entry(skills=["website"], focus=True), id="t1") | {"type": "tool_use"}]
@@ -4850,10 +4855,10 @@ def test_a_tool_that_ran_keeps_its_result_when_a_later_call_of_the_response_rais
     def policy(system, messages, tools):
         if "fork" in {t["name"] for t in tools}:
             last = messages[-1]["content"][-1]
-            if last["type"] == "tool_result" or last.get("harness"):  # its result, or the wake: no new fork
+            if ran(last) or last.get("harness"):  # its result, or the wake: no new fork
                 return text("Started.")
             return [clone_use(clone_entry(skills=["website"], focus=False), id="t1") | {"type": "tool_use"}]
-        if messages[-1]["content"][-1]["type"] == "tool_result":
+        if ran(messages[-1]["content"][-1]):
             return text("site done")
         return [{"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "index", "content": "hi"}},
                 {"type": "tool_use", "id": "r1", "name": "site_read", "input": {"page": "index"}}]
@@ -4888,11 +4893,11 @@ def test_a_tool_that_ran_keeps_its_real_result_when_its_row_cannot_be_written(tm
         last = messages[-1]["content"][-1]
         if "fork" in {t["name"] for t in tools}:
             if who == "original":
-                return text("Sorry.") if last["type"] == "tool_result" else [use]
-            if last["type"] == "tool_result" or last.get("harness"):
+                return text("Sorry.") if ran(last) else [use]
+            if ran(last) or last.get("harness"):
                 return text("Started.")
             return [clone_use(clone_entry(skills=["website"], focus=who == "focus"), id="t1") | {"type": "tool_use"}]
-        return text("website finished") if last["type"] == "tool_result" else [use]
+        return text("website finished") if ran(last) else [use]
 
     store, h, said = make(tmp_path=tmp_path, policy=policy)
     real_add, failed = store.add_turn, []
@@ -4975,7 +4980,7 @@ def test_a_focus_clone_whose_result_row_cannot_be_written_has_it_written_before_
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result" or last.get("harness"):
+            if ran(last) or last.get("harness"):
                 return text("Back at the original.")
             if last["text"] == REQUEST:
                 return [clone_use(clone_entry(skills=["website"], focus=True)) | {"type": "tool_use"}]
@@ -5033,7 +5038,7 @@ def test_close_during_a_clone_calls_preparation_answers_the_call(tmp_path):
         slow.entered = asyncio.get_running_loop().create_future()
         store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
         await h.begin_turn("o")
-        call = asyncio.create_task(h.clone_call(src="o", use=clone_use(clone_entry(skills=["website"], focus=False))))
+        call = asyncio.create_task(h.clone_call(src="o", use=pointing(store, clone_use(clone_entry(skills=["website"], focus=False)))))
         await asyncio.wait_for(slow.entered, timeout=WAIT_TIMEOUT)  # the call is being prepared
         await asyncio.wait_for(h.close(), timeout=WAIT_TIMEOUT)
         children, _, text_ = await asyncio.wait_for(call, timeout=WAIT_TIMEOUT)
@@ -5049,7 +5054,7 @@ def test_until_rest_answers_only_what_is_true_and_close_stops_every_machine(tmp_
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result" or last.get("harness"):
+            if ran(last) or last.get("harness"):
                 return text("ok.")
             return [clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=False))
                     | {"type": "tool_use"}]
@@ -5260,7 +5265,7 @@ class FaultScript:
         if key in self.arm_on:
             self.faults.armed.set()
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("Started.")
             if is_wake(last):
                 return text("Reported.")
@@ -5663,7 +5668,7 @@ def test_a_cancel_after_the_answer_is_a_withdrawal_its_background_graft_stops_an
                 return [{"type": "tool_use", "id": "w1", "name": "site_write",
                          "input": {"page": "index", "content": "DELETED"}}]
             return text("website finished")
-        if last["type"] == "tool_result":
+        if ran(last):
             assert entered.wait(GATE_TIMEOUT)  # c1's first model call is in flight
             return text("Started.")
         if last.get("harness") or last.get("text") != "BG go":

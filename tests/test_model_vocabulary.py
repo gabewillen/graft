@@ -18,6 +18,7 @@ every function that writes model-facing text (PRODUCERS) are scanned, and each p
 to be scanned by a mutation of its own text that the check catches."""
 
 import ast
+from _util import ran, started
 import asyncio
 import inspect
 import json
@@ -191,11 +192,11 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
                             entry(skills=["merge"], focus=False), entry(skills=["fork"], focus=False),
                             entry(skills=["website"], focus=False, purpose="p"), entry(skills=["slides"], focus=False, id="Bad Id"))),
                         use(tool="load_skill", use_id="l1", name="website")]
-            if last["type"] == "tool_result" and "b1" == last["tool_use_id"]:
+            if ran(last) and "b1" == last["tool_use_id"]:
                 return [use(tool="fork", use_id="b2", **branched(entry(skills=["website"], focus=False), entry(skills=["slides"], focus=False)))]
             if last["type"] == "text" and not last.get("harness") and last["text"] == "Stop the slides.":
                 return [use(tool="stop", use_id="x1", ids=["c2", "c9", "o", 5])]
-            if last["type"] == "tool_result" and last["tool_use_id"] == "x1":
+            if ran(last) and last["tool_use_id"] == "x1":
                 website_gate.set()
                 slides_gate.set()  # c2 is stopped: the slides branch forked again later finishes
                 return text("Okay.")
@@ -203,7 +204,7 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
                 return [use(tool="fork", use_id="b3", **branched(entry(skills=["slides"], focus=False)))]
             return text("Okay.")
         if "site_write" in names:
-            if not any(b["type"] == "tool_result" for m in messages for b in m["content"]):
+            if not any(ran(b) for m in messages for b in m["content"]):
                 return [use(tool="stop", use_id="g1", ids=["c2"]), use(tool="merge", use_id="g2", reason="done")]
             waits.append(("website", website_gate.wait(GATE_TIMEOUT)))
             return [{"type": "text", "text": "Website built."}, use(tool="site_write", use_id="g3", page="home", content="hi"),
@@ -304,12 +305,12 @@ def test_the_old_tool_names_run_nothing(tmp_path):
         names = {t["name"] for t in tools}
         last = last_block(messages)
         if "fork" in names:
-            if last["type"] == "tool_result" and last["tool_use_id"] == "old":
+            if ran(last) and last["tool_use_id"] == "old":
                 return [use(tool="fork", use_id="new", **branched(entry(skills=["website"], focus=True)))]
-            if last["type"] == "tool_result":
+            if ran(last):
                 return text("Okay.")
             return [use(tool="clone", use_id="old", clone=[{"skills": ["website"]}])]
-        if last["type"] == "tool_result" and last["tool_use_id"] == "j":
+        if ran(last) and last["tool_use_id"] == "j":
             return text("Which colors?")
         return [use(tool="join", use_id="j", reason="done")]
 
@@ -376,7 +377,8 @@ from graft import compaction as compaction_mod, db as db_mod, harness as harness
 # fails the check (it must be listed again), so a new place that words a note or a refusal is
 # added here, not missed.
 PRODUCERS = {
-    harness_mod: ["said", "merge_head", "check_skill_link", "clone_entries", "_strings", "cancel_ids",
+    harness_mod: ["said", "merge_head", "check_skill_link", "clone_entries", "_strings", "_messages", "cancel_ids",
+                  "fork_result", "Harness.resolve_messages", "Harness.message_index", "ENTRY_SHAPE",
                   "Harness.cancel_text", "Harness.system", "Harness.load", "Harness._names", "Harness._running_note",
                   "Harness.wake_note", "Harness.default_join_rows", "Harness.fit_join", "Harness.default_join",
                   "Harness.task_of", "Harness._stop_call", "_entry", "NOT_A_DRAWN_ID", "NO_FREE_ID", "Harness.prepare_clone", "Harness.refuse_clone",
@@ -390,7 +392,7 @@ PRODUCERS = {
     compaction_mod: ["COMPACT_TOOL", "EXTRACT_INSTRUCTION", "WITHDRAWN_INDEX", "index_text", "extract_request",
                      "SUMMARY_HEADER", "COMPACT_INSTRUCTION", "summary_turn"],
     seeder_mod: ["NOUL_TRUE", "NOUL_FALSE", "reduced_state", "reduced_question", "jev_request"],
-    skills_mod: ["LOAD_SKILL_TOOL", "JOIN_TOOL", "CANCEL_TOOL", "CLONE_INSTRUCTIONS", "JOIN_INSTRUCTIONS",
+    skills_mod: ["LOAD_SKILL_TOOL", "JOIN_TOOL", "CANCEL_TOOL", "MESSAGES", "REASON", "CLONE_INSTRUCTIONS", "JOIN_INSTRUCTIONS",
                  "BACKGROUND_INSTRUCTIONS", "load_skill", "skill_listing"],
 }
 # graft's own identifiers (store and transaction kinds, a graft's kind, its reason, the keys of the

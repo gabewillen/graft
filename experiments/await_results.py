@@ -113,14 +113,18 @@ def scripted(system, messages, tools):
     if "fork" in names:
         if last["type"] == "tool_result" or last.get("harness"):
             return [{"type": "text", "text": "On it."}]
-        return [use(prefix="k", tool="fork", current={"skills": ["website"]},
-                    detached=[{"skills": [skill]} for skill in ("slides", "calendar", "newsletter")])]
-    results = sum(1 for m in messages for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_result")
+        return [use(prefix="k", tool="fork", current={"skills": ["website"], "messages": [], "reason": "The site."},
+                    detached=[{"skills": [skill], "messages": [], "reason": f"The {skill} part."}
+                              for skill in ("slides", "calendar", "newsletter")])]
+    # a branch's first view ends on its own fork result: only the results of its own calls count
+    ran = lambda b: (isinstance(b, dict) and b.get("type") == "tool_result"  # noqa: E731
+                     and not str(b.get("content", "")).startswith("You are now on branch "))
+    results = sum(1 for m in messages for b in m["content"] if ran(b))
     if "slides_create" in names and results < 2:
         if results == 1:
             return [use("s", "slides_add_slide", title="Open house", bullets=["2026-12-05 10:00"])]
         return [use("s", "slides_create", title="Okafor Dental open house")]
-    if last["type"] == "tool_result":
+    if ran(last):
         return [{"type": "text", "text": "Done."}]
     if "site_write" in names:
         return [use("w", "site_write", page="home", content="Okafor Dental: cleaning, implants, whitening")]

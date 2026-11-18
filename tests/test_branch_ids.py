@@ -8,7 +8,7 @@ import re
 
 import pytest
 
-from _util import clone_in_turn
+from _util import clone_in_turn, ran, started
 from graft.db import Store
 from graft.harness import GRAFT_ID, MAX_NAME_DRAWS, Harness, new_names
 from graft.providers import FakeProvider
@@ -32,9 +32,9 @@ def fork(*, current=None, detached=(), id="t"):
 
 def test_main_is_the_line_the_original_holds_and_never_a_branch_id():
     from graft.harness import clone_entries
-    _, v = clone_entries({"current": {"id": "main", "skills": ["website"]}})
+    _, v = clone_entries({"current": {"id": "main", "skills": ["website"], "messages": ["q"]}})
     assert v == ["current: id 'main' is the line you hold, not a branch; give the branch another id"]
-    assert clone_entries({"current": {"id": "main-site", "skills": ["website"]}})[1] == []
+    assert clone_entries({"current": {"id": "main-site", "skills": ["website"], "messages": ["q"]}})[1] == []
 
 
 def test_the_default_source_draws_six_lowercase_hex_characters():
@@ -199,7 +199,7 @@ def test_a_request_handed_back_any_number_of_times_may_still_be_forked_for(tmp_p
         forks = sum(1 for m in messages for b in m["content"] if b["type"] == "tool_use" and b["name"] == "fork")
         if forks >= rounds:
             return text("I could not route that.")
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("ok")
         return [{"type": "tool_use", "id": f"f{forks}", "name": "fork", "input": {"current": {"skills": ["website"]}}}]
 

@@ -10,12 +10,13 @@ estimated size (state + questions, characters / 4) stays under GRAFT_SEED_TOKEN_
 truncated deterministically (recorded in the decision).
 
 With `model` (the default when TYPESAFE_API_KEY is unset) there is no decisions client: a graft
-starts from the conversation (`Harness.default_seed`). With `jev`, a TypeSafe Jev decision model
+starts from the messages its fork entry points at (`Harness.resolve_messages`). With `jev`, a
+TypeSafe Jev decision model
 picks the seed: one `system_one` request per clone with one Noul ("does a branch doing the new
 task need this message?") per candidate row. Candidates are the
 text rows of the source's working view, excluding harness notes. Rows scoring at or above
 GRAFT_SEED_THRESHOLD (default 0.4) are seeded in view order, and the user's latest message (the
-trigger) is always seeded. When Jev fails, the conversation is the fallback. The question and state format match experiments/seed_eval.py, which
+trigger) is always seeded. When Jev fails, the entry's own messages are the fallback. The question and state format match experiments/seed_eval.py, which
 replays this decision offline.
 
 Jev pricing (docs.typesafe.ai/models, verified 2026-10-04): jev-1.13.0 input $0.042 / 1M tokens,

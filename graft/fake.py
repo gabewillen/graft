@@ -66,6 +66,21 @@ def texts_of(messages: list[dict]) -> list[str]:
     return _user_texts(messages)
 
 
+def _quotes(messages: list[dict]) -> list[str]:
+    """The user's messages as fork pointers: exact quotes, without the conversation nonce, once each."""
+    out: list[str] = []
+    for t in _user_texts(messages):
+        q = re.sub(r"^\[conversation [^\]]*\]\s*", "", t).strip()
+        if q and q not in out:
+            out.append(q)
+    return out
+
+
+def _entry(messages: list[dict], skills: list[str]) -> dict:
+    """A fork entry that points at the user's messages: the fake original seeds a branch with them."""
+    return {"skills": skills, "messages": _quotes(messages)}
+
+
 def _ids_from_sql(out: str) -> list[int]:
     return [int(line.split(" | ")[0]) for line in out.splitlines()[1:] if re.match(r"^\d+", line)]
 
@@ -80,7 +95,7 @@ def pivot_policy(system: str, messages: list[dict], tools: list[dict]) -> list[d
             return _wake_reply(messages)
         user = [re.sub(r"^\[conversation [^\]]*\]\s*", "", t) for t in texts_of(messages)]
         wants_slides = any("slide" in t.lower() for t in user)
-        return _use(tool="fork", current={"skills": ["slides" if wants_slides else "website"]})
+        return _use(tool="fork", current=_entry(messages, ["slides" if wants_slides else "website"]))
     # a clone: load its capability skill first (progressive disclosure)
     skill = "website" if "site_write" in names else "slides" if "slides_create" in names else None
     loaded = any(b["type"] == "tool_use" and b["name"] == "load_skill"
@@ -88,9 +103,10 @@ def pivot_policy(system: str, messages: list[dict], tools: list[dict]) -> list[d
     prev_tool = next((b["name"] for m in reversed(messages) if m["role"] == "assistant"
                       for b in m["content"] if b["type"] == "tool_use"), None)
     texts = _user_texts(messages)
-    if skill and not loaded and last["type"] == "text":
+    fresh = last["type"] == "text" or prev_tool == "fork"  # a branch's first view ends on its fork result
+    if skill and not loaded and fresh:
         return _use("load_skill", name=skill)
-    if last["type"] == "tool_result" and prev_tool != "load_skill":
+    if last["type"] == "tool_result" and prev_tool not in ("load_skill", "fork"):
         return _text("Done. Anything else?")
     msg = texts[-1] if texts else ""
     if "site_write" in names:
@@ -231,7 +247,7 @@ def bench_graft_policy(system: str, messages: list[dict], tools: list[dict]) -> 
         texts = [_clean(t) for t in _user_texts(messages)]
         texts = [t for t in texts if not t.startswith("(compaction")]
         wants = _wants(texts[-1] if texts else "") or _wants(" ".join(texts)) or ["website"]
-        return _use(tool="fork", current={"skills": wants})
+        return _use(tool="fork", current=_entry(messages, wants))
     return _holder_policy(names, messages)
 
 
@@ -250,8 +266,8 @@ def parallel_graft_policy(system: str, messages: list[dict], tools: list[dict]) 
     texts = [_clean(t) for t in _user_texts(messages)]
     wants = _wants(texts[-1] if texts else "") or ["website"]
     if len(wants) == 1:
-        return _use(tool="fork", current={"skills": wants})
-    return _use(tool="fork", detached=[{"skills": [w]} for w in wants])
+        return _use(tool="fork", current=_entry(messages, wants))
+    return _use(tool="fork", detached=[_entry(messages, [w]) for w in wants])
 
 
 def bench_subagent_policy(system: str, messages: list[dict], tools: list[dict]) -> list[dict]:

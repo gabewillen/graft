@@ -183,14 +183,13 @@ async def arm_g(e, sb: sandbox.Sandbox, max_steps: int, workdir: str) -> dict:
     h = Harness(store, p, world=SandboxWorld(sb), max_steps=max_steps, nonce=uuid.uuid4().hex[:12],
                 seeder=JevSeeder())
     await h.start()
-    for t in e.parent_prefix:
-        store.add_turn("o", t.role, "text", t.text)
-    store.add_turn("o", "user", "text", subtask_text(e))
+    rows = [store.add_turn("o", t.role, "text", t.text) for t in e.parent_prefix]
+    rows.append(store.add_turn("o", "user", "text", subtask_text(e)))
     t0 = time.perf_counter()
     # one focus graft: the replay hands the recorded subtask to a single clone and joins it back
     await h.begin_turn("o")  # a clone call belongs to a turn of the source
     _, child, text = await h.clone_call(src="o", use={"id": "replay", "name": "fork", "input": {
-        "current": {"skills": [skill.name]}}})  # it starts from the conversation, the subtask last
+        "current": {"skills": [skill.name], "messages": rows}}})  # the seeder picks; these are its fallback
     forced = False
     if child:
         if await h.run(child) == "ended":  # no live user: end the task if it stopped without joining

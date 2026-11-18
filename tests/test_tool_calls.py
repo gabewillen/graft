@@ -4,6 +4,7 @@ shutdown) cancels the tool where it waits, and the call is recorded as run with 
 as not executed: it may have acted, or may still act."""
 
 import asyncio
+from _util import ran, started
 import threading
 
 import pytest
@@ -50,7 +51,7 @@ def background_original(entries):
     """An original that clones `entries` in the background, says "Started." after the clone
     result, reports on a wake note, and cancels c1 when the user says STOP."""
     def respond(last, messages):
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("Stopped." if last["tool_use_id"].startswith("x") else "Started.")
         if is_wake(last):
             return text("Report.")
@@ -70,7 +71,7 @@ def test_a_tool_that_awaits_another_clones_tool_lets_both_run_and_finish(tmp_pat
         last = messages[-1]["content"][-1]
         if "fork" in names:
             return original(last, messages)
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("done")
         if "site_write" in names:
             return [use("w1", "site_write", page="index", content="hi")]
@@ -121,7 +122,7 @@ def graft_writes(original):
         last = messages[-1]["content"][-1]
         if "fork" in names:
             return original(last, messages)
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("done")
         return [use("w1", "site_write", page="index", content="hi")]
     return policy
@@ -153,7 +154,7 @@ def test_a_focus_graft_whose_request_is_withdrawn_while_its_tool_awaits_records_
     world = Hanging()
 
     def original(last, messages):
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("Started.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
@@ -202,7 +203,7 @@ def test_a_turns_awaited_tool_calls_run_one_at_a_time_and_are_stored_in_call_ord
         last = messages[-1]["content"][-1]
         if "fork" in names:
             return original(last, messages)
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("done")
         return [use("w1", "site_write", page="index", content="hi"), use("r1", "site_read", page="index")]
 
@@ -330,7 +331,7 @@ def test_a_cancelled_graft_whose_close_out_cannot_be_written_still_names_the_run
 
 def test_a_failed_focus_graft_whose_close_out_cannot_be_written_carries_it_with_its_join(tmp_path):
     def original(last, messages):
-        if last["type"] == "tool_result" or is_wake(last) or last.get("harness"):
+        if ran(last) or is_wake(last) or last.get("harness"):
             return text("Back.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
@@ -362,7 +363,7 @@ def test_a_withdrawal_stops_a_background_graft_whose_tool_awaits_at_once(tmp_pat
     world, gate = Hanging(), threading.Event()
 
     def original(last, messages):
-        if last["type"] == "tool_result":
+        if ran(last):
             assert gate.wait(WAIT_TIMEOUT)
             return text("Started.")
         if is_wake(last):
@@ -408,7 +409,7 @@ def test_a_withdrawal_after_the_answer_stops_a_background_graft_whose_tool_await
     monkeypatch.setattr(machine, "come_to_rest", come_to_rest)
 
     def original(last, messages):
-        if last["type"] == "tool_result":
+        if ran(last):
             assert world.running.wait(WAIT_TIMEOUT)  # the answer comes once the graft's tool waits
             return text("Started.")
         if is_wake(last):
@@ -441,7 +442,7 @@ def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_r
     row write's outcome is taken (`storing`): the call is closed with what the tool returned, marked run,
     not as cut short."""
     def original(last, messages):
-        if last["type"] == "tool_result" or last.get("harness"):
+        if ran(last) or last.get("harness"):
             return text("Back.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
@@ -516,7 +517,7 @@ def test_a_tool_that_is_cancelled_by_its_host_ends_as_run_with_an_error_and_its_
 
 def test_a_focus_graft_whose_tool_is_cancelled_by_its_host_goes_on(tmp_path):
     def original(last, messages):
-        if last["type"] == "tool_result" or last.get("harness"):
+        if ran(last) or last.get("harness"):
             return text("Back.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
@@ -562,7 +563,7 @@ def test_a_graft_whose_tool_awaits_work_a_cancelled_sibling_shared_goes_on(tmp_p
         last = messages[-1]["content"][-1]
         if "fork" in names:
             return original(last, messages)
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("done")
         if "site_write" in names:
             return [use("w1", "site_write", page="i", content="x")]
@@ -751,7 +752,7 @@ def test_a_withdrawal_stops_several_background_grafts_whose_tools_await(tmp_path
         names = {t["name"] for t in tool_list}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 assert gate.wait(WAIT_TIMEOUT)
                 return text("Started.")
             if is_wake(last):
@@ -913,7 +914,7 @@ def test_a_withdrawal_stops_every_waiting_graft_even_when_one_stop_fails_once(tm
         names = {t["name"] for t in tool_list}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 assert gate.wait(WAIT_TIMEOUT)
                 return text("Started.")
             if is_wake(last):
@@ -1049,7 +1050,7 @@ def withdraw_three(tmp_path, monkeypatch, failing):
         names = {t["name"] for t in tool_list}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "tool_result":
+            if ran(last):
                 assert gate.wait(WAIT_TIMEOUT)
                 return text("Started.")
             if is_wake(last):
@@ -1145,7 +1146,7 @@ class BadExc(Exception):
 def test_a_refusal_row_whose_write_error_has_a_bad_message_still_ends_the_run(tmp_path):
     def policy(system, messages, tools):
         last = messages[-1]["content"][-1]
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("Refused.")
         return [clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=True),
                           id="k1") | {"type": "tool_use"}]  # two focus entries: refused in its preparation
@@ -1242,7 +1243,7 @@ def test_a_seeder_that_raises_a_base_exception_refuses_the_clone_call_and_leaves
 
     def policy(system, messages, tools):
         last = messages[-1]["content"][-1]
-        if last["type"] == "tool_result":
+        if ran(last):
             return text("Could not start it.")
         return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
@@ -1344,7 +1345,7 @@ def test_a_seeder_that_raises_cancelled_error_leaves_no_audit_open(tmp_path):
             raise asyncio.CancelledError()
 
     def policy(system, messages, tools):
-        if messages[-1]["content"][-1]["type"] == "tool_result":
+        if ran(messages[-1]["content"][-1]):
             return text("Could not start it.")
         return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
