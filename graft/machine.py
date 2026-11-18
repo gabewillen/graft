@@ -1528,7 +1528,8 @@ async def busy_activity(ctx, inst: TimelineSM, event) -> None:
     typed to be told apart from it. Like the library's own `hsm/error`, it is sent only while the
     run's state is still active: a run that raises as it is ended (its state left) is stale."""
     # the run begins (a step that failed held this activity back, `Activity`, so it never gets here): recorded by the machine, so a fault from here on ends a turn (`rejoins`)
-    inst.dispatch(inst.context(), hsm.Event(name="turn_began"))
+    if not ctx.is_done():  # sent only while the run's state is active, like its outcomes
+        inst.dispatch(inst.context(), hsm.Event(name="turn_began"))
     try:
         _close_out(inst)
         _mark_pending(inst)
