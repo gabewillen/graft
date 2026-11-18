@@ -181,3 +181,29 @@ def test_other_calls_of_the_fork_turn_carry_main_results_in_the_branch_and_think
     results = {b["tool_use_id"]: b["content"] for b in sent[2]["content"]}
     assert results["l1"] == NOT_RUN_BESIDE_CLONE
     assert results["f1"].endswith("Your part: what the messages above ask for that your skills cover.")
+
+
+def test_messages_and_refusals_are_bounded():
+    from graft.harness import MAX_MESSAGES
+    _, v = clone_entries({"current": {"skills": ["website"], "messages": ["q"] * (MAX_MESSAGES + 1)}})
+    assert v == [f"current: messages names {MAX_MESSAGES + 1} items; give at most {MAX_MESSAGES}"]
+
+
+def test_a_refusal_lists_a_bounded_number_of_problems_and_cuts_long_row_ids(tmp_path):
+    from graft.harness import MAX_PROBLEMS
+    calls = []
+
+    def policy(system, messages, tools):
+        last = messages[-1]["content"][-1]
+        if "fork" not in {t["name"] for t in tools}:
+            return text("built")
+        if last["type"] == "tool_result":
+            calls.append(last["content"])
+            return text("Sorry.")
+        return [fork_use(current={"skills": ["website"], "messages": [10 ** 200] + list(range(900, 940))})]
+
+    store, h = make(tmp_path, policy)
+    run(h, REQUEST)
+    refusal = calls[0]
+    assert refusal.count("\n- ") == MAX_PROBLEMS + 1 and f"and {41 - MAX_PROBLEMS} more" in refusal
+    assert "1" + "0" * 200 not in refusal and "row 100000000000000000000000... is not in" in refusal

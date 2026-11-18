@@ -33,7 +33,7 @@ LOAD_SKILL_TOOL = {
 JOIN_TOOL = {
     "name": "merge", "description": "End this turn and merge this branch back into main: what you did here "
                                     "becomes your memory there. The end of your turn merges it anyway.",
-    "input_schema": obj({"reason": {"type": "string", "description": "Optional: your own words to yourself "
+    "input_schema": obj({"reason": {"type": "string", "maxLength": 2000, "description": "Optional: your own words to yourself "
                                                                       "on main, for example what is still to do."}},
                         [])}
 
@@ -52,10 +52,10 @@ BRANCH_ID_PATTERN = "^[a-z0-9][a-z0-9-]{0,31}$"
 
 # One entry of the fork call: the skills the branch holds, the messages it starts from (pointers:
 # short exact quotes or row ids), optionally main's own words for it, and optionally its id.
-MESSAGES = {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+MESSAGES = {"type": "array", "maxItems": 50, "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
             "description": "The messages of this conversation the branch starts from: each a short exact "
                            "quote of one message (or its row id). It may be empty if you give a reason."}
-REASON = {"type": "string", "description": "Your own words for this branch: the part it does, and anything "
+REASON = {"type": "string", "maxLength": 2000, "description": "Your own words for this branch: the part it does, and anything "
                                            "it needs to know that the messages do not say."}
 CLONE_ENTRY = obj({"id": {"type": "string", "pattern": BRANCH_ID_PATTERN}, "skills": STRS,
                    "messages": MESSAGES, "reason": REASON}, ["skills", "messages"])

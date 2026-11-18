@@ -248,3 +248,10 @@ def test_main_text_beside_its_fork_call_is_no_reply_of_the_branch(tmp_path):
     run(h, REQUEST)
     assert store.timeline("c1")["join_reason"] == "out_of_scope"
     assert merge_results(store)[0].startswith("site merged without answering the user's last message")
+
+
+def test_the_schema_bounds_match_the_harness_bounds():
+    from graft.harness import MAX_MESSAGES, REASON_CHARS
+    from graft.skills import JOIN_TOOL, MESSAGES, REASON
+    assert MESSAGES["maxItems"] == MAX_MESSAGES
+    assert REASON["maxLength"] == REASON_CHARS == JOIN_TOOL["input_schema"]["properties"]["reason"]["maxLength"]

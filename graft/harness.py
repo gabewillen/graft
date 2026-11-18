@@ -108,6 +108,8 @@ ECHO_CHARS = 24  # characters of a malformed model-written value shown back, as 
 INDEX_CHARS = 100  # characters of each message shown in a refused fork call's list of messages
 INDEX_ROWS = 40  # messages shown in that list: the latest ones, with a count of the rest
 REASON_CHARS = 2000  # the longest `reason` a fork entry or a merge call may give
+MAX_MESSAGES = 50  # the most items a fork entry's `messages` may name
+MAX_PROBLEMS = 12  # violations a refused fork call lists before "and N more"
 MATCH_ROWS = 5  # row ids a quote that matches several messages lists
 
 
@@ -272,6 +274,9 @@ def _messages(e: dict, label: str, v: list[str]) -> list[int | str]:
         v.append(f"{label}: messages must be a list of the messages this branch starts from (quotes or "
                  "row ids; it may be empty if you give a reason)")
         return []
+    if len(value) > MAX_MESSAGES:
+        v.append(f"{label}: messages names {len(value)} items; give at most {MAX_MESSAGES}")
+        return []
     items = [x for x in value if isinstance(x, str) or (isinstance(x, int) and not isinstance(x, bool))]
     if len(items) != len(value):
         v.append(f"{label}: each item of messages is a short exact quote (a string) or a row id (an integer)")
@@ -340,6 +345,12 @@ def clone_entries(args: object) -> tuple[list[CloneEntry], list[str]]:
             if a.skills and set(a.skills) == set(b.skills) and (a.name is None or b.name is None):
                 v.append(f"{a.label} and {b.label} hold the same skills: give each an id to tell them apart")
     return entries, v
+
+
+def _row(value: int) -> str:
+    """A model-written row id for a refusal: in full if it is short, else cut off."""
+    text = str(value) if abs(value) < 10 ** ECHO_CHARS else str(value)[:ECHO_CHARS] + "..."
+    return text
 
 
 def _echo(value: object) -> str:
@@ -1341,7 +1352,7 @@ class Harness:
         `running`: src's grafts still running. Returns (rows to append, merge result)."""
         name = self.shown(child)
         said = dict(name=name, reason=reason, focus="merge" in {k["name"] for k in self.store.skills_for(child)},
-                    ran=self.tools_run(child, closing=closing) if reason == CANCELLED else [],
+                    ran=self.tools_run(child=child, closing=closing) if reason == CANCELLED else [],
                     running=self._running_note(running))
         full = (rows, merge_result(dropped=None, empty=not rows, **said))
         if self.window_tokens is None:
@@ -1397,7 +1408,7 @@ class Harness:
         rows, result = self.fit_join(src=src, child=child, reason=reason, rows=wanted, merge=merge, trigger=trig,
                                      running=running, closing=closed)
         pending = self.store.view(src) + self._join_tail(src=src, rows=rows, merge=merge, result=result, trigger=trig)
-        v = validate(pending, src, trigger=trig)
+        v = validate(rows=pending, viewer=src, trigger=trig)
         use = json.loads(merge["content"])
         written = {"use": use, "result": {"tool_use_id": use["id"], "content": MERGED, "is_error": False}} \
             if implicit else None
@@ -1476,7 +1487,7 @@ class Harness:
             if isinstance(x, int):
                 r = by_id.get(x)
                 if r is None:
-                    problems.append(f"row {x} is not in your conversation; point only at messages you hold")
+                    problems.append(f"row {_row(x)} is not in your conversation; point only at messages you hold")
                 elif x in exclude:
                     continue
                 elif r.get("withdrawn"):
@@ -1703,7 +1714,7 @@ class Harness:
                 rows.append(self._virtual(owner=child, role="user", kind="tool_result", content=json.dumps(
                     {"tool_use_id": use.get("id"), "content": "", "is_error": False})))
             if rows:
-                v += validate(rows, child)
+                v += validate(rows=rows, viewer=child)
             else:
                 v.append("it would start from nothing: point it at the messages it needs")
             per_entry.append(v)
@@ -1723,7 +1734,9 @@ class Harness:
                                   scratch={"violations": violations})
             self.trace(f"[{src}] clone refused: {violations}")
             index = ("\n" + self.message_index(src=src, exclude=exclude)) if any(pointed) else ""
-            return ("fork refused; no branch was started:\n- " + "\n- ".join(violations)
+            shown = violations[:MAX_PROBLEMS] + ([f"and {len(violations) - MAX_PROBLEMS} more"]
+                                                  if len(violations) > MAX_PROBLEMS else [])
+            return ("fork refused; no branch was started:\n- " + "\n- ".join(shown)
                     + "\nFix the branches and call fork once more." + index)
         names = self.draw_names(entries)  # only for a call that will be decided: no id is drawn for nothing
         for sc, name in zip(scratch, names):
