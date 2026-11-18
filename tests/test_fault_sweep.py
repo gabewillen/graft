@@ -667,6 +667,8 @@ _DRIVEN = "a turn its caller drives, or a run or wait asked for from outside (be
 _JOINED = "a join raised from outside (do_join) or a background graft whose model calls join: no scenario makes one"
 _ABANDON = "a join whose commit fails three times (abandoned): no scenario makes one"
 _TIMING = "a withdrawal or message that lands at that point of a step (the scenarios' calls are not timed to it)"
+_ONE_TURN = ("reached only while a focus graft holds the conversation across a session restate, or hands back "
+             "a message its source lacks: a focus graft holds it for one turn, for a request its source holds")
 _THIRD = "reached only once a recovery has itself failed (a third raise; the sweep raises twice at most)"
 _CLOSE = "a close edge no scenario makes (a graft made after closing began, a machine that cannot be stopped, a user callback that raises)"
 UNREACHED: dict[str, str] = {
@@ -678,12 +680,16 @@ UNREACHED: dict[str, str] = {
     **dict.fromkeys(["abandon_head", "report_abandoned", "last_attempt", "last_commit_failed", "close_abandoned"],
                     _ABANDON),
     **dict.fromkeys(["drop_message", "request_dropped", "request_held", "withdraws_waiting", "withdraw_and_forward",
-                     "stash_and_engage", "take_handed_and_begin", "take_handed_and_engage", "return_to_source",
+                     "take_handed_and_begin", "take_handed_and_engage", "return_to_source",
                      "s_withdraw", "one_of_pending", "refuse_cancel_call", "refuse_clone_call", "drop_clone",
                      "keep_unstored", "bg_fault_noted", "close_and_release", "tool_row_failed_late",
                      "bg_run_failed_late"], _TIMING),
     **dict.fromkeys(["fold_fault", "give_up_fault", "fault_releasing", "recovery_failed", "restating_again",
-                     "restate_through_focus_again", "_closing_out", "close_out_failed"], _THIRD),
+                     "restate_through_focus_again", "_closing_out", "close_out_failed", "close_out_written"], _THIRD),
+    # a focus graft holds the conversation for one turn: no scenario keeps one live while a call's
+    # step fails during a session restate, or hands back a message only it holds (its source holds
+    # the request it was made for)
+    **dict.fromkeys(["restate_failed_alone", "restate_failed_through_focus", "answer_handback"], _ONE_TURN),
     **dict.fromkeys(["s_shut_late", "s_stop_crashed", "s_take_stop_errors", "s_tell_crashed", "s_keep_lost_line"],
                     _CLOSE),
     # the backstop: a graft that takes a step after its request was withdrawn, before the original

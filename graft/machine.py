@@ -1345,13 +1345,21 @@ def joins_back(ctx, inst, event) -> bool:
 
 def rejoins(ctx, inst, event) -> bool:
     """A focus graft whose turn a fault ended (a run of its model loop had begun since it was last
-    at rest, and it is not shutting down): it joins `failed`. One that never ran, a turn its caller
-    drives, and one being shut down come to rest instead, as without the fault."""
-    return inst.kind == "focus" and inst.focus is None and inst.in_turn and not (inst.closing or inst.final)
+    at rest, its request was not withdrawn, and it is not shutting down): it joins `failed`. One
+    that never ran, a turn its caller drives or a withdrawal already ended, and one being shut down
+    come to rest instead, as without the fault."""
+    return (inst.kind == "focus" and inst.in_turn and not (inst.closing or inst.final)
+            and not _run_withdrawn(inst))
 
 
 def turn_began(ctx, inst, event) -> None:  # entry of a run of the model loop
     inst.in_turn = True
+
+
+def turn_cut_short(ctx, inst, event) -> None:
+    """Entry of `closing_calls`: the run was ended early (a withdrawal, shutdown), not by its own
+    end, so a fault from here on did not end a turn (`rejoins`)."""
+    inst.in_turn = False
 
 
 def run_joined(ctx, inst, event) -> bool:
@@ -3679,7 +3687,7 @@ def _timeline(name: str) -> hsm.Model:
             T(On("shutdown"), S("../closed"), Effect(close_at_rest)),
             # a step failed: what it left open is closed out and the timeline rests (`recovering`)
             T(On(FAULT), S("engaged/recovering"), G(may_recover), Effect(begin_recovery)),
-            T(On(FAULT), S("engaged/rest"), Effect(checked(may_recover, effects=(give_up_fault,), first=True))),
+            T(On(FAULT), S("engaged/given_up"), Effect(checked(may_recover, effects=(give_up_fault,), first=True))),
             T(On("restate"), Call(restating(engaged=False))),  # at rest, or suspended
             T(On(CALL_FAULT), G(restate_failed), Effect(restating_again(engaged=False))),
             T(On(CALL_FAULT), Effect(checked(restate_failed, effects=(recover_call,), first=True))),
@@ -3785,7 +3793,7 @@ def _timeline(name: str) -> hsm.Model:
                     T(On(E), S("../unrecorded"), Effect(focus_failure_not_recorded)),
                 ),
                 hsm.State(
-                    "closing_calls", io(done="calls_closed", work=_close_calls),
+                    "closing_calls", Entry(turn_cut_short), io(done="calls_closed", work=_close_calls),
                     T(On("calls_closed"), S("../withdrawn_choice"), Effect(calls_closed)),
                     T(On(E), S("../withdrawn_choice"), Effect(calls_not_closed)),
                 ),
@@ -3890,6 +3898,13 @@ def _timeline(name: str) -> hsm.Model:
                     T(S("../passing"), G(hands_over), Effect(pass_inbox)),
                     T(S("handing_back"), G(rejoins)),
                     T(S("rest"), Effect(checked(hands_over, rejoins))),
+                ),
+                hsm.Choice(
+                    # past MAX_RECOVERIES: it goes on from rest without closing anything out, but a
+                    # focus graft whose turn the fault ended still joins (it never rests after a turn)
+                    "given_up",
+                    T(S("handing_back"), G(rejoins)),
+                    T(S("rest"), Effect(checked(rejoins))),
                 ),
             ),
             hsm.Choice("shutting", T(S("../closed"), Effect(close_root))),

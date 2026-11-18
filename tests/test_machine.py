@@ -2296,3 +2296,29 @@ def test_a_focus_graft_that_never_ran_rests_after_a_fault_and_does_not_join(monk
         assert not host.logged(prefix=("apply", "c1")) and not host.logged(prefix=("run", "o", "wake"))
         await m.stop()
     run(go)
+
+
+def test_a_focus_graft_whose_turn_a_withdrawal_ended_rests_after_a_fault(monkeypatch):
+    """The withdrawal ended its turn, not the fault: a fault while that run's close-out is written
+    leaves it at rest, as without the fault, and no run of its source starts."""
+    import graft.machine as machine_module
+    real, armed = machine_module.rows_marked, [True]
+
+    def rows_marked(ctx, inst, event):
+        if inst.timeline_id == "c1" and armed:
+            armed.clear()
+            raise RuntimeError("rows_marked bug")
+        return real(ctx=ctx, inst=inst, event=event)
+
+    async def go():
+        monkeypatch.setattr(machine_module, "rows_marked", rows_marked)
+        host, m = await started()
+        first = await say(m=m, text="go")
+        await clone(m=m, pairs=[("c1", True)])
+        recovered = host.next("recover", "c1")
+        await withdraw(m=m, reply=first)  # reaches c1: its run ends, its row is marked (that step faults)
+        await asyncio.wait_for(recovered, GUARD)
+        assert await at_rest(m=m, tl="c1") == "ended" and host.status["c1"] == "active"
+        assert not host.logged(prefix=("apply", "c1")) and not host.logged(prefix=("run", "o", "wake"))
+        await m.stop()
+    run(go)
