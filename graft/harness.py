@@ -74,7 +74,8 @@ from .db import Graft, Store, render, validate
 from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, Cancel, CancelCall, Clone, Machines, Mode,
                       Prepared, QueuedJoin, RunOutcome, ToolCall, TransitionRefused, Unwritten, described)
 from .providers import Provider, prefix_nonce, window_tokens_for
-from .skills import BASE_SYSTEM, BRANCH_ID_PATTERN, BUILTIN, World, load_skill, skill_listing
+from .skills import (BASE_SYSTEM, BRANCH_ID_PATTERN, BUILTIN, MAX_MESSAGES, REASON_CHARS, World, load_skill,
+                     skill_listing)
 
 # Seconds one model call may take before it is abandoned as a mechanical failure (the harness's
 # `call_timeout`; None disables it). Without it a hung call keeps a graft live for ever.
@@ -107,8 +108,6 @@ ERROR_CHARS = 200  # characters of a tool's own error shown in its result
 ECHO_CHARS = 24  # characters of a malformed model-written value shown back, as a repr
 INDEX_CHARS = 100  # characters of each message shown in a refused fork call's list of messages
 INDEX_ROWS = 40  # messages shown in that list: the latest ones, with a count of the rest
-REASON_CHARS = 2000  # the longest `reason` a fork entry or a merge call may give
-MAX_MESSAGES = 50  # the most items a fork entry's `messages` may name
 MAX_PROBLEMS = 12  # violations a refused fork call lists before "and N more"
 MATCH_ROWS = 5  # row ids a quote that matches several messages lists
 
@@ -305,6 +304,7 @@ def _entry(e: object, label: str, focus: bool, v: list[str]) -> CloneEntry | Non
         v.append(f"{label}: skills lists {', '.join(map(_echo, repeated))} more than once")
     messages = _messages(e, label=label, v=v)
     reason = e.get("reason")
+    given = reason is not None  # a reason refused below still counts as given: one violation for it
     if reason is not None and not isinstance(reason, str):
         v.append(f"{label}: reason must be a string (your own words for what this branch is for)")
         reason = None
@@ -312,7 +312,9 @@ def _entry(e: object, label: str, focus: bool, v: list[str]) -> CloneEntry | Non
         v.append(f"{label}: reason is {len(reason)} characters long; give at most {REASON_CHARS}")
         reason = None
     reason = reason if reason and reason.strip() else None
-    if "messages" in e and isinstance(e.get("messages"), list) and not e["messages"] and reason is None:
+    blank = isinstance(e.get("reason"), str) and not e["reason"].strip()
+    if "messages" in e and isinstance(e.get("messages"), list) and not e["messages"] and (reason is None) \
+            and (not given or blank):
         v.append(f"{label}: give it messages, a reason, or both: with neither it would start from nothing")
     return CloneEntry(label=label, raw=e, name=name, skills=skills, focus=focus, messages=messages, reason=reason)
 
