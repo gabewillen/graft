@@ -1,7 +1,8 @@
 """What the model reads calls a graft a branch of itself and a join a merge (spec: What the model is
-told: branch, merge and stop). No model-facing text names a clone, a join, a graft, the original, an
+told: fork, merge and stop). No model-facing text names a clone, a join, a graft, the original, an
 instance, a subagent, a worker, a helper or a delegate, says the assistant will remember something
-for a graft, or says background or cancel (the model's words are detached and stop).
+for a graft, says focus, background or cancel (the model's words are current, detached and stop), or
+uses `branch` as the tool (the tool is `fork`; a branch is what it makes).
 
 Model-facing text is what the harness writes for a model to read: the system prompt of every
 timeline, every tool's name, description and schema, harness notes, and tool results (of the
@@ -63,7 +64,7 @@ def entry(skills, focus, **extra):
 
 
 def branched(*entries):
-    """A branch call's input from entries (the one with focus=True is `current`)."""
+    """A fork call's input from entries (the one with focus=True is `current`)."""
     from _util import branch_input
     return branch_input(*entries)
 
@@ -324,7 +325,7 @@ def test_the_old_tool_names_run_nothing(tmp_path):
     assert results.count("tool 'clone' is not available to you") == 1, results
     assert results.count("tool 'join' is not available to you") == 1, results
     made = [r[0] for r in store.con.execute("SELECT timeline_id FROM timelines WHERE source_id IS NOT NULL")]
-    assert made == ["c1"]  # only the `branch` call made a branch
+    assert made == ["c1"]  # only the `fork` call made a branch
     assert store.timeline("c1")["join_reason"] is None  # `join` did not end it
     assert h.world.log == []
     echoes = {"tool 'clone' is not available to you", "tool 'join' is not available to you"}  # the model's own words
@@ -375,10 +376,10 @@ from graft import compaction as compaction_mod, db as db_mod, harness as harness
 # fails the check (it must be listed again), so a new place that words a note or a refusal is
 # added here, not missed.
 PRODUCERS = {
-    harness_mod: ["said", "merge_head", "check_skill_link", "clone_entries", "_typed_list", "cancel_ids",
+    harness_mod: ["said", "merge_head", "check_skill_link", "clone_entries", "_strings", "cancel_ids",
                   "Harness.cancel_text", "Harness.system", "Harness.load", "Harness._names", "Harness._running_note",
                   "Harness.wake_note", "Harness.default_join_rows", "Harness.fit_join", "Harness.default_join",
-                  "Harness.task_of", "Harness._stop_call", "_entry", "Harness.prepare_clone", "Harness.refuse_clone",
+                  "Harness.task_of", "Harness._stop_call", "_entry", "NOT_A_DRAWN_ID", "NO_FREE_ID", "Harness.prepare_clone", "Harness.refuse_clone",
                   "Harness._prepare_clone", "Harness._loop", "Harness._missing_results",
                   "NOT_RUN_INTERRUPTED", "NOT_RUN_JOINING", "NOT_RUN_BESIDE_CLONE", "CANCELLED_WHILE_RUNNING",
                   "CANCELLED_BY_THE_TOOL", "FAILED_AFTER_INVOKED", "WITHDRAWN_SEED"],
@@ -503,5 +504,5 @@ def test_the_merge_record_of_a_branch_that_wrote_nothing_and_plural_stops_say_br
     h.wake_note(src="o", joined=[("c1", CANCELLED), ("c2", CANCELLED)], handed_back=False, running=[], background=True)
     note = store.view("o")[-1]["content"]
     assert "detached branches c1 (stopped), c2 (stopped) merged" in note and "You stopped c1, c2" in note
-    assert "they were stopped" in note and "forked for again" not in note, note  # no re-fork block
+    assert note.rstrip(")").endswith("Do not describe still-running work as finished.") and "they were stopped" in note, note
     check([("result", stopped), ("note", note)])

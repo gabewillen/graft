@@ -14,7 +14,7 @@ from graft.skills import install
 
 
 def clone_use(skills, focus=True, id="t"):
-    """A branch call (graft's clone call) with one entry."""
+    """A fork call (graft's clone call) with one entry."""
     entry = {"skills": skills}
     return {"id": id, "name": "fork", "input": {"current": entry} if focus else {"detached": [entry]}}
 

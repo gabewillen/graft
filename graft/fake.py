@@ -24,14 +24,9 @@ def _text(t: str) -> list[dict]:
     return [{"type": "text", "text": t}]
 
 
-def _clone(skills: list[str]) -> dict:
-    """One branch of a branch call: the skills it holds (its id is drawn by the harness)."""
-    return {"skills": skills}
-
-
 # A wake note names the merged branches with their reasons ("... your branch c1 (failed) merged; ...");
 # a merge record does not ("... your branch c1 merged, reason=..."). Both carry the harness mark.
-_WAKE_NOTE = re.compile(r"\(harness note: your (detached )?branch(es)? \w+ \(")
+_WAKE_NOTE = re.compile(r"\(harness note: your (detached )?branch(es)? [a-z0-9][a-z0-9-]* \(")
 
 
 def woken(messages: list[dict]) -> str | None:
@@ -85,7 +80,7 @@ def pivot_policy(system: str, messages: list[dict], tools: list[dict]) -> list[d
             return _wake_reply(messages)
         user = [re.sub(r"^\[conversation [^\]]*\]\s*", "", t) for t in texts_of(messages)]
         wants_slides = any("slide" in t.lower() for t in user)
-        return _use(tool="fork", current=_clone(skills=["slides" if wants_slides else "website"]))
+        return _use(tool="fork", current={"skills": ["slides" if wants_slides else "website"]})
     # a clone: load its capability skill first (progressive disclosure)
     skill = "website" if "site_write" in names else "slides" if "slides_create" in names else None
     loaded = any(b["type"] == "tool_use" and b["name"] == "load_skill"
@@ -236,7 +231,7 @@ def bench_graft_policy(system: str, messages: list[dict], tools: list[dict]) -> 
         texts = [_clean(t) for t in _user_texts(messages)]
         texts = [t for t in texts if not t.startswith("(compaction")]
         wants = _wants(texts[-1] if texts else "") or _wants(" ".join(texts)) or ["website"]
-        return _use(tool="fork", current=_clone(skills=wants))
+        return _use(tool="fork", current={"skills": wants})
     return _holder_policy(names, messages)
 
 
@@ -255,8 +250,8 @@ def parallel_graft_policy(system: str, messages: list[dict], tools: list[dict]) 
     texts = [_clean(t) for t in _user_texts(messages)]
     wants = _wants(texts[-1] if texts else "") or ["website"]
     if len(wants) == 1:
-        return _use(tool="fork", current=_clone(skills=wants))
-    return _use(tool="fork", detached=[_clone(skills=[w]) for w in wants])
+        return _use(tool="fork", current={"skills": wants})
+    return _use(tool="fork", detached=[{"skills": [w]} for w in wants])
 
 
 def bench_subagent_policy(system: str, messages: list[dict], tools: list[dict]) -> list[dict]:

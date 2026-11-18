@@ -1982,7 +1982,7 @@ def test_cancelled_is_a_reason_only_the_harness_sets_and_cancel_a_tool_only_the_
             assert "stop" not in {t["name"] for t in store.tools_for(c)}
         script.open()
         await h.settle()
-        # `branch` (which carries cancel) can never be linked to a graft
+        # `fork` (which carries stop) can never be linked to a graft
         children, msg = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["website", "fork"], focus=False)))
         assert children is None and "'fork' cannot be held by a branch" in msg
         await h.close()
@@ -2814,7 +2814,7 @@ def test_a_cancelled_join_wakes_a_full_run_that_clones_another_part(tmp_path):
     assert h.part_of("c3") == {"website"} and h.part_of("c4") == {"calendar"}
     assert h.wakes[0]["joined"] == [("c1", "cancelled")]
     note = [r["content"] for r in store.view("o") if r["harness"] and "c1 (stopped) merged" in r["content"]]
-    assert "forked for again" not in note[0] and "You stopped c1" in note[0]
+    assert "You stopped c1: tell the user it was stopped and what you had already done there." in note[0]
     assert not [r for r in store.view("o") if r["kind"] == "tool_result" and "fork refused" in r["content"]]
 
 

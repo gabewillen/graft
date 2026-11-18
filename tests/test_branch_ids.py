@@ -3,13 +3,14 @@ conversation and never reused; every note, result and refusal names a graft by i
 told it, and `stop` resolves ids only through it, never a timeline id."""
 
 import asyncio
-import itertools
+import random
+import re
 
 import pytest
 
 from _util import clone_in_turn
 from graft.db import Store
-from graft.harness import MAX_NAME_DRAWS, Harness, new_names
+from graft.harness import GRAFT_ID, MAX_NAME_DRAWS, Harness, new_names
 from graft.providers import FakeProvider
 from graft.skills import install
 from test_parallel import REQUEST, text
@@ -29,10 +30,12 @@ def fork(*, current=None, detached=(), id="t"):
     return {"id": id, "name": "fork", "input": inp}
 
 
-def test_the_default_source_draws_six_hex_characters():
-    draw = new_names()  # imported before the tests' counted source replaces it
-    ids = {draw() for _ in range(50)}
-    assert all(len(i) == 6 and int(i, 16) >= 0 for i in ids) and len(ids) > 40
+def test_the_default_source_draws_six_lowercase_hex_characters():
+    draw = new_names(rng=random.Random(7))  # imported before the tests' counted source replaces it
+    ids = [draw() for _ in range(50)]
+    assert all(re.fullmatch(r"[0-9a-f]{6}", i) and GRAFT_ID.fullmatch(i) for i in ids), ids
+    assert ids == [new_names(rng=random.Random(7))() for _ in range(1)] + ids[1:]  # seeded: replayable
+    assert len(set(ids)) > 45
 
 
 def test_ids_given_and_drawn_name_the_branch_everywhere_and_never_its_timeline_id(tmp_path):
@@ -140,3 +143,67 @@ def test_stop_takes_branch_ids_and_a_timeline_id_names_nothing(tmp_path):
     assert store.timeline("c1")["join_reason"] == "cancelled"
     notes = [r["content"] for r in store.view("o") if r["harness"]]
     assert any("site (stopped)" in n and "You stopped site" in n for n in notes), notes
+
+
+def test_error_lines_name_a_branch_by_its_id_even_when_another_branchs_timeline_id_is_that_id(tmp_path):
+    """One namespace for every audience: the user's harness error lines name a branch by the id the
+    model knows (`site`, timeline c1), never by its timeline id, so an id relayed from an error line
+    (here `c1`, the model's name for timeline c2) never names a different branch."""
+    said = []
+    store = Store(str(tmp_path / "err.db"))
+    install(store)
+    h = Harness(store=store, provider=FakeProvider(lambda *a: text("ok")), seeder=None, emit=said.append)
+
+    async def go():
+        await h.start()
+        store.add_turn("o", "user", "text", REQUEST)
+        (site,), _ = await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]}]))
+        (named_c1,), _ = await clone_in_turn(h=h, use=fork(detached=[{"id": "c1", "skills": ["slides"]}]))
+        assert (site, named_c1) == ("c1", "c2") and store.name_of("c2") == "c1"
+        real, failed = store.commit_join, []
+
+        def commit_join(*a, **kw):
+            if not failed:
+                failed.append(True)
+                raise OSError("disk full")
+            return real(*a, **kw)
+        store.commit_join = commit_join
+        store.add_turn(site, "assistant", "text", "Site built.")
+        await h.do_join(child=site, reason="done")
+        await h.drain_and_wake("o")
+        await h.machines.stop()
+
+    asyncio.run(go())
+    lines = [line for line in said if line.startswith("(harness error: committing the merge")]
+    assert lines and "branch site" in lines[0] and "c1" not in lines[0], said
+
+
+def test_a_request_handed_back_any_number_of_times_may_still_be_forked_for(tmp_path):
+    """No hand-back count: a current branch that hands the same request back ten times in a row
+    is forked for again each time (only the host bounds this)."""
+    rounds = 10
+
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "fork" not in names:
+            return [{"type": "tool_use", "id": f"m{len(messages)}", "name": "merge", "input": {"reason": "out_of_scope"}}]
+        forks = sum(1 for m in messages for b in m["content"] if b["type"] == "tool_use" and b["name"] == "fork")
+        if forks >= rounds:
+            return text("I could not route that.")
+        if last["type"] == "tool_result":
+            return text("ok")
+        return [{"type": "tool_use", "id": f"f{forks}", "name": "fork", "input": {"current": {"skills": ["website"]}}}]
+
+    store, h = make(tmp_path, policy=policy)
+
+    async def go():
+        await h.start()
+        out = await h.user_says(REQUEST)
+        assert out[-1] == "I could not route that."
+        await h.close()
+
+    asyncio.run(go())
+    reasons = [store.timeline(f"c{i}")["join_reason"] for i in range(1, rounds + 1)]
+    assert reasons == ["out_of_scope"] * rounds  # each hand-back was forked for again
+    assert store.timeline(f"c{rounds + 1}") is None

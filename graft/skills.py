@@ -1,4 +1,4 @@
-"""Skill catalog: three built-ins (branch, merge, detached: graft's clone skill, and the join skills of
+"""Skill catalog: three built-ins (fork, merge, detached: graft's clone skill, and the join skills of
 a focus graft and a background graft, as the model is told them) and simulated capability skills.
 
 Capability tools act on an in-memory `World` (fake website, slide deck, calendar).
@@ -29,7 +29,7 @@ LOAD_SKILL_TOOL = {
     "input_schema": obj({"name": S}, ["name"])}
 
 # graft's join, as the model is told it: a branch of yourself merging back (spec: What the model is
-# told: branch and merge).
+# told: fork, merge and stop).
 JOIN_TOOL = {
     "name": "merge", "description": "End this branch: done, out_of_scope, or failed. What you did here "
                                     "merges back into your memory.",
@@ -48,7 +48,7 @@ CANCEL_TOOL = {
 # What a branch id looks like: chosen by the model, or drawn by the harness (6 hex characters).
 BRANCH_ID_PATTERN = "^[a-z0-9][a-z0-9-]{0,31}$"
 
-# One entry of the branch call: the skills the branch holds and, optionally, its id.
+# One entry of the fork call: the skills the branch holds and, optionally, its id.
 CLONE_ENTRY = obj({"id": {"type": "string", "pattern": BRANCH_ID_PATTERN}, "skills": STRS}, ["skills"])
 
 BASE_SYSTEM = (
@@ -57,7 +57,7 @@ BASE_SYSTEM = (
     "assistant and you narrow your tools for each task."
 )
 
-# The `branch` skill: graft's clone skill, as the original is told it.
+# The `fork` skill: graft's clone skill, as the original is told it.
 CLONE_INSTRUCTIONS = """\
 You hold only the `fork` skill. You talk with the user and route each request, and you work on
 a request by forking yourself: each branch you fork is you, carrying on with one part of the conversation

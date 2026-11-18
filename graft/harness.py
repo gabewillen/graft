@@ -38,7 +38,7 @@ waiting. After joins that bring news and leave no user message to answer, the or
 once with a closing harness note, for a full run: it tells the user the outcome and may go on
 (clone, cancel, answer a request that was handed back), as any turn.
 
-Cancel is the original's alone: `cancel(cancel=[graft ids])`, while it runs. The cancel calls of
+Cancel is the original's alone: `stop(ids=[branch ids])` as the model is told it, while it runs. The cancel calls of
 one response are one request to its machine, which cancels each graft the graph allows (leaving
 `background` ends its run before anything else) and waits until each one's join, reason
 `cancelled`, is queued; only then are the calls' real results stored, so an interrupted turn
@@ -84,9 +84,16 @@ GRAFT_ID = re.compile(BRANCH_ID_PATTERN)
 MAX_NAME_DRAWS = 16
 
 
-def new_names() -> Callable[[], str]:
-    """The harness's default source of branch ids: 6 random hex characters per draw."""
-    rng = random.Random()
+# What `draw_names` raises (an error of the call's preparation, so the call is refused): its text
+# reaches the model in the refusal.
+NOT_A_DRAWN_ID = "the id source returned {got}, which is not a branch id"
+NO_FREE_ID = "no free branch id after {draws} draws"
+
+
+def new_names(rng: random.Random | None = None) -> Callable[[], str]:
+    """The harness's default source of branch ids: 6 random lowercase hex characters per draw
+    (`rng`: a seeded generator, for tests and experiments)."""
+    rng = rng or random.Random()
     return lambda: f"{rng.getrandbits(24):06x}"
 ERROR_CHARS = 200  # characters of a tool's own error shown in its result
 ECHO_CHARS = 24  # characters of a malformed model-written value shown back, as a repr
@@ -177,13 +184,12 @@ class CloneEntry:
 ENTRY_FIELDS = ("id", "skills")
 
 
-def _typed_list(entry: dict, *, name: str, kind: type, label: str, violations: list[str]) -> list:
+def _strings(entry: dict, *, name: str, label: str, violations: list[str]) -> list[str]:
     value = entry.get(name)
     if value is None:
         return []
-    if not isinstance(value, list) or not all(isinstance(x, kind) and not isinstance(x, bool) for x in value):
-        what = "strings" if kind is str else "integers"
-        violations.append(f"{label}: {name} must be a list of {what}")
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        violations.append(f"{label}: {name} must be a list of strings")
         return []
     return list(value)
 
@@ -201,7 +207,7 @@ def _entry(e: object, label: str, focus: bool, v: list[str]) -> CloneEntry | Non
         v.append(f"{label}: id {_echo(name)} is not a branch id (lowercase letters, digits and -, "
                  "starting with a letter or digit, at most 32 characters)")
         name = None
-    skills = _typed_list(e, name="skills", kind=str, label=label, violations=v)
+    skills = _strings(e, name="skills", label=label, violations=v)
     repeated = sorted({k for k in skills if skills.count(k) > 1})
     if repeated:
         v.append(f"{label}: skills lists {repeated} more than once")
@@ -349,7 +355,7 @@ class Harness:
                  call_timeout: float | None = MODEL_CALL_TIMEOUT,
                  names: Callable[[], str] | None = None):
         self.store = store
-        # The source of the ids a branch call leaves out (seeded in tests and experiments).
+        # The source of the ids a fork call leaves out (seeded in tests).
         self.names = names or new_names()
         self.persona = persona  # user-provided; identical, verbatim, on every timeline
         self.provider = provider
@@ -443,7 +449,8 @@ class Harness:
         are all background grafts (the machine says so: it made them)."""
         err = _described(error)
         record = (src, clones, err)
-        names = self._names(clones=clones, background=background)
+        # the user knows a graft by the id the model gave or drew, never by its timeline id
+        names = self._names(clones=[self.shown(c) for c in clones], background=background)
         if kind == "wake":
             self.wake_errors.append(record)
             line = f"(harness error: {names} merged, but reporting the result failed: {err})"
@@ -763,8 +770,9 @@ class Harness:
     @staticmethod
     def _names(clones: list[str], background: bool, named: bool = True) -> str:
         """'detached branches c1, c2' / 'branch c1'; with named=False just the noun. `background`:
-        all of them are background grafts (detached branches, as the model is told them). Grafts are told to the model, and to the user, as
-        branches (spec: What the model is told: branch and merge)."""
+        all of them are background grafts (detached branches, as the model is told them). Grafts are
+        told to the model, and to the user, as branches, by their names (spec: What the model is told:
+        fork, merge and stop)."""
         if not clones:
             return "a branch"
         word = "detached branch" if background else "branch"
@@ -1015,8 +1023,7 @@ class Harness:
                 if retag:
                     retag(last, f"{self.role(tl)}:clone_tx")
                 # Beside a clone call only cancel calls run, and they run first, wherever the model
-                # put them: a cancelled graft's place is free, and its part blocked, before the
-                # clone call is decided. Every other call is answered without being run.
+                # put them: a cancelled graft is stopped before the clone call is decided. Every other call is answered without being run.
                 cancels = [u for u in uses if u is not clone_use and u["name"] == "stop"]
                 others = [ToolResult(use=u, content=NOT_RUN_BESIDE_CLONE, is_error=True) for u in uses
                           if u is not clone_use and u["name"] != "stop"]
@@ -1193,15 +1200,6 @@ class Harness:
             elif r["role"] == "assistant" and r["kind"] == "text":
                 answered = True
         return answered
-
-    def current_request(self, tl: str) -> int | None:
-        """The last user message in tl's working view (harness notes and withdrawn messages are not
-        requests): a read of the view, for tests and tools. No clone bound reads it: the original's
-        machine keeps its own requests, which no compaction changes."""
-        users = [r["row_id"] for r in self.store.working_view(tl)
-                 if r["role"] == "user" and seeder_mod.is_candidate(r)]
-        return users[-1] if users else None
-
 
     def compute_trigger(self, child: str, reason: str) -> int | None:
         """The user message child did not handle, if any: the last user message in its working
@@ -1422,11 +1420,11 @@ class Harness:
             for _ in range(MAX_NAME_DRAWS):
                 name = self.names()
                 if not (isinstance(name, str) and GRAFT_ID.fullmatch(name)):
-                    raise ValueError(f"the id source returned {_echo(name)}, which is not a branch id")
+                    raise ValueError(NOT_A_DRAWN_ID.format(got=_echo(name)))
                 if name not in taken:
                     break
             else:
-                raise RuntimeError(f"no free branch id after {MAX_NAME_DRAWS} draws")
+                raise RuntimeError(NO_FREE_ID.format(draws=MAX_NAME_DRAWS))
             taken.add(name)
             out.append(name)
         return out

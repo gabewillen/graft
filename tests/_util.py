@@ -41,7 +41,7 @@ def holder(store):
 
 
 def branch_input(*entries):
-    """A branch call's input from test entries: each {"skills", "focus", "id"?}; the one with
+    """A fork call's input from test entries: each {"skills", "focus", "id"?}; the one with
     focus=True is `current`, the others are `detached`, in order. A dict without `focus` is
     passed through as a detached entry (a malformed one, for refusal tests)."""
     current = [e for e in entries if isinstance(e, dict) and e.get("focus") is True]

@@ -5,7 +5,7 @@ unique conversation nonce (--cache-scope run). Metrics per run: pass, scored che
 role, effective total, $ cost (when prices are set), calls, wall-clock latency, clones or
 delegations, output spent on context passing, compactions.
 
-Context passing: graft = output of the original's calls that emitted `branch` (the default
+Context passing: graft = output of the original's calls that emitted `fork` (the default
 join makes no call); subagent = output of the parent calls that wrote handoffs plus the
 subagents' final summary calls. Compaction calls are reported separately in both arms.
 

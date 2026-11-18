@@ -382,7 +382,6 @@ class TimelineSM(hsm.Instance):
         self.held = held  # made in a turn its caller drives: it does not run on its own
         self.queue: list[QueuedJoin] = []  # joins waiting on this timeline, in finish order
         self.grafts: dict[str, bool] = {}  # its grafts whose join has not been applied: id -> focus
-        self.names: dict[str, str] = {}  # graft -> the id the model knows it by (its words use it)
         self.made: dict[str, bool] = {}  # every graft it made -> focus (kept after its join)
         self.mode = TURN  # the mode of its current or next run
         self.inbox: list[Request] = []  # user messages not yet begun, in arrival order
@@ -2506,7 +2505,6 @@ def _register_grafts(inst: TimelineSM, clone: Clone) -> None:
     recovery, for a step that failed after they started: grafts already started stay its own)."""
     for child, focus in clone.pairs:
         inst.grafts[child] = focus
-        inst.names[child] = clone.names.get(child, child)
         inst.made[child] = focus
         if not focus and inst.answering is not None:
             inst.graft_requests[child] = inst.answering
