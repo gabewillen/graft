@@ -185,7 +185,8 @@ def merge_result(*, name: str, reason: str, focus: bool, ran: list[str], dropped
         head = (f"{name} merged without answering the user's last message: that message is yours to "
                 "answer now (answer it here, or fork for it).")
     elif focus:
-        head = f"{name} merged. Its replies{above} already reached the user: do not repeat them."
+        head = (f"{name} merged. Its replies{above} already reached the user: do not repeat them. If it asked the "
+                "user something, end your turn now without saying anything: the answer will come to you.")
     elif empty and dropped:
         head = f"{name} merged."
     elif empty:

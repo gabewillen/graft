@@ -417,7 +417,10 @@ def run(tmp_path, monkeypatch, scenario: str, target: str | None = None, nth: in
     # branch ids drawn c1, c2, ... by this harness itself: the sweep undoes the tests' monkeypatches
     # between its runs, and the scripts stop a branch by the id it is known by (c1)
     count = itertools.count(1)
-    store, h, said = make(tmp_path=tmp_path, policy=script, names=lambda: f"c{next(count)}",
+    # likewise the scripts' fork entries are pointed at the conversation here (`quoting`), not by
+    # the tests' autouse patch, which the sweep undoes
+    from _util import quoting
+    store, h, said = make(tmp_path=tmp_path, policy=quoting(script), names=lambda: f"c{next(count)}",
                           **({"compact_tokens": 400} if scenario == "compaction" else {}))
     case = Case(said=said)
     error = RuntimeError(f"INJECTED {target}#{nth}")
