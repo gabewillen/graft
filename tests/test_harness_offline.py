@@ -194,7 +194,7 @@ def test_silent_done_is_refused_until_the_clone_replies(tmp_path):
 def test_clone_skill_has_only_load_skill_clone_and_cancel(harness):
     s = harness.store
     s.create_timeline(tl="o", source=None, skills=["branch"])
-    assert [t["name"] for t in s.tools_for("o")] == ["load_skill", "branch", "cancel"]
+    assert [t["name"] for t in s.tools_for("o")] == ["load_skill", "branch", "stop"]
 
 
 def test_clone_is_never_linked_to_a_clone(harness):

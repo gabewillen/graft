@@ -346,7 +346,7 @@ class ToolCall:
     use: dict
     reply: asyncio.Future
     interrupted: str
-    cancelled: str = "cancelled by the tool: it may have acted"  # the harness passes its own, marked run
+    cancelled: str = "interrupted by the tool: it may have acted"  # the harness passes its own, marked run
     failed: str = "failed after it was invoked: it may have acted"  # likewise
 
 
@@ -998,9 +998,9 @@ def clone_refusal(inst: TimelineSM, grafts: list[tuple[str, bool]]) -> str | Non
     live = [g for g, is_focus in inst.grafts.items() if not is_focus]
     cap = inst.max_live_background
     if len(live) + sum(1 for _, f in grafts if not f) > cap:
-        return (f"at most {cap} background branches may be live at once "
+        return (f"at most {cap} detached branches may be live at once "
                 f"({', '.join(live) or 'none'} still {'is' if len(live) == 1 else 'are'}); use fewer "
-                "background entries or wait for them to merge")
+                "detached entries or wait for them to merge")
     return None
 
 
@@ -1038,7 +1038,7 @@ def clone_why(inst: TimelineSM, clone: Clone) -> str | None:
     blocked = blocked_parts(inst=inst, clone=clone)
     if blocked:
         return "\n- ".join(
-            f"branch[{i}]: a branch with skills {sorted(part)} for this message already failed, was cancelled, "
+            f"branch[{i}]: a branch with skills {sorted(part)} for this message already failed, was stopped, "
             "or handed it back twice. Do not branch for that part again: leave this entry out and tell "
             "the user, briefly, what could not be done" for i, part in blocked)
     return None
@@ -1052,14 +1052,14 @@ def may_cancel(inst: TimelineSM, child: str) -> bool:
 def cancel_refusal(inst: TimelineSM, child: str) -> str:
     """Why this id is not cancelled, from the original's own record of the grafts it made."""
     if inst.source_id is not None:
-        return "you cancel only from the main conversation; a branch never cancels another branch"
+        return "you stop branches only from the main conversation; a branch never stops another branch"
     if child == inst.timeline_id:
-        return "the main conversation cannot be cancelled"
+        return "the main conversation cannot be stopped"
     if child not in inst.made:
         return "no such branch"
     if inst.made[child]:
-        return "it is a focus branch; only a background branch can be cancelled"
-    return "it has already finished or was already cancelled; nothing to cancel"
+        return "it is the current branch; only a detached branch can be stopped"
+    return "it has already finished or was already stopped; nothing to stop"
 
 
 def _live(inst: TimelineSM, request: Request) -> bool:
@@ -1850,7 +1850,7 @@ def _cancel_rows(inst, event):
     """Each cancel call's real result row. A row that cannot be written is kept for the run's
     closing (it then holds the real result); the run ends with that error."""
     results, failures = [], []
-    again = "it has already finished or was already cancelled; nothing to cancel"
+    again = "it has already finished or was already stopped; nothing to stop"
     for index, call in enumerate(inst.cancel.calls):
         outcomes = {c: inst.outcomes[c] if inst.claims.get(c) == index else again for c in call.ids}
         content, is_error = inst.host.cancel_text(call=call, outcomes=outcomes)
@@ -2266,8 +2266,8 @@ def refuse_cancel_call(ctx, inst, event) -> None:
     """A cancel this timeline may not make at all (it is not the original, or not running): every
     id is refused. The caller stores the results."""
     cancel: Cancel = event.data
-    why = ("you cancel only from the main conversation; a branch never cancels another branch" if inst.source_id is not None
-           else "you can cancel only during your own turn, while you hold the conversation")
+    why = ("you stop branches only from the main conversation; a branch never stops another branch" if inst.source_id is not None
+           else "you can stop branches only during your own turn, while you hold the conversation")
     _resolve(reply=cancel.reply, value=why)  # a str: every id is refused with it
 
 
@@ -2652,7 +2652,7 @@ def take_hand_over(ctx, inst, event) -> None:
 
 def drop_clone(ctx, inst, event) -> None:
     clone, inst.clone = inst.clone, None
-    _resolve(reply=clone.reply, value=(None, None, "branch not executed: the cancel calls beside it could not be recorded"))
+    _resolve(reply=clone.reply, value=(None, None, "branch not executed: the stop calls beside it could not be recorded"))
 
 
 def answer_pending(ctx, inst, event) -> None:  # exit of a run: a request it never answered is refused
@@ -2667,18 +2667,18 @@ def answer_pending(ctx, inst, event) -> None:  # exit of a run: a request it nev
     if clone is not None:
         _resolve(reply=clone.reply, value=(None, None, "branch not executed: the turn ended before it ran"))
         if clone.cancels is not None and clone.cancels is not cancel:
-            _resolve(reply=clone.cancels.reply, value="the turn ended before the cancel ran")
+            _resolve(reply=clone.cancels.reply, value="the turn ended before the stop ran")
     if cancel is not None:
-        _resolve(reply=cancel.reply, value="the turn ended before the cancel ran")
+        _resolve(reply=cancel.reply, value="the turn ended before the stop ran")
 
 
 def _cut_outcome(inst: TimelineSM, child: str, index: int) -> str:
     """What became of an id of a cancel call whose step was cut short: decided (cancelled, its join
     landed, or refused), stopped with its join still to come, or never reached."""
     if inst.claims.get(child) != index:
-        return "the turn ended before the cancel ran" if child not in inst.claims else (
-            "it has already finished or was already cancelled; nothing to cancel")
-    return inst.outcomes.get(child, CANCELLED if child in inst.pending else "the turn ended before the cancel ran")
+        return "the turn ended before the stop ran" if child not in inst.claims else (
+            "it has already finished or was already stopped; nothing to stop")
+    return inst.outcomes.get(child, CANCELLED if child in inst.pending else "the turn ended before the stop ran")
 
 
 def pass_inbox(ctx, inst, event) -> None:

@@ -13,7 +13,7 @@ from test_parallel import (REQUEST, WAIT_TIMEOUT, clone_entry, clone_use, is_wak
                            violations)
 
 STOP = "stop the website"
-CANCELLED_WHILE_RUNNING = "cancelled while running: it may have acted, or may still act"
+CANCELLED_WHILE_RUNNING = "stopped while running: it may have acted, or may still act"
 
 
 def use(id, name, **args):
@@ -55,7 +55,7 @@ def background_original(entries):
         if is_wake(last):
             return text("Report.")
         if last["text"] == STOP:
-            return [use(f"x{len(messages)}", "cancel", cancel=["c1"])]
+            return [use(f"x{len(messages)}", "stop", ids=["c1"])]
         return [clone_use(*entries, id=f"c{len(messages)}") | {"type": "tool_use"}]
     return respond
 
@@ -323,7 +323,7 @@ def test_a_cancelled_graft_whose_close_out_cannot_be_written_still_names_the_run
     asyncio.run(go())
     assert world.cancelled and store.timeline("c1")["join_reason"] == "cancelled"
     assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_WHILE_RUNNING, True)]
-    record = [r["content"] for r in store.view("o") if "was cancelled before it finished" in r["content"]]
+    record = [r["content"] for r in store.view("o") if "was stopped before it finished" in r["content"]]
     assert len(record) == 1 and "site_write (returned an error)" in record[0]
     assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
 
@@ -482,7 +482,7 @@ def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_r
 
 
 # ------------------------------------------------------------------ a tool cancelled by something other than its graft
-CANCELLED_BY_THE_TOOL = "cancelled by the tool: it may have acted"
+CANCELLED_BY_THE_TOOL = "interrupted by the tool: it may have acted"
 
 
 class SelfCancel(World):

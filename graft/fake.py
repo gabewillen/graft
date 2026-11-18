@@ -31,7 +31,7 @@ def _clone(purpose: str, skills: list[str], seed_quotes: list[str], focus: bool 
 
 # A wake note names the merged branches with their reasons ("... your branch c1 (failed) merged; ...");
 # a merge record does not ("... your branch c1 merged, reason=..."). Both carry the harness mark.
-_WAKE_NOTE = re.compile(r"\(harness note: your (background )?branch(es)? \w+ \(")
+_WAKE_NOTE = re.compile(r"\(harness note: your (detached )?branch(es)? \w+ \(")
 
 
 def woken(messages: list[dict]) -> str | None:

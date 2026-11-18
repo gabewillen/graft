@@ -278,7 +278,7 @@ def test_clone_is_decided_by_the_graph():
         assert "refused" in text and not host.logged(prefix=("commit",))
         for pairs, refusal in (([("c1", True), ("c2", True)], "at most one branch may carry the conversation"),
                                ([(f"g{i}", False) for i in range(MAX_LIVE_BACKGROUND + 1)],
-                                f"at most {MAX_LIVE_BACKGROUND} background branches")):
+                                f"at most {MAX_LIVE_BACKGROUND} detached branches")):
             await driven_turn(m=m)
             _, _, text = await clone(m=m, pairs=pairs)
             assert refusal in text and not host.logged(prefix=("commit",))
@@ -351,7 +351,7 @@ def test_a_queued_graft_counts_toward_the_live_cap_until_its_join_is_applied():
         await m.ask(tl="g0", name="join", build=lambda r: (QueuedJoin(child="g0", reason="done", trigger=None), r))
         assert host.status["g0"] == "queued" and not host.logged(prefix=("apply",))  # finished, not joined
         _, _, text = await clone(m=m, pairs=[("n1", False)])
-        assert f"at most {MAX_LIVE_BACKGROUND} background branches" in text  # g0 still counts
+        assert f"at most {MAX_LIVE_BACKGROUND} detached branches" in text  # g0 still counts
         waking = host.next("run", "o", "wake")
         await end_driven_turn(m=m)
         await waking  # g0's join is applied
@@ -686,7 +686,7 @@ def test_the_original_cancels_a_running_background_graft_and_waits_for_its_join(
         assert results == [(repr([("c1", CANCELLED)]), False)] and host.status["c1"] == "queued"
         assert "o" in host.runs and not host.logged(prefix=("apply", "c1"))  # queued: applied at rest
         _, _, text = await clone(m=m, pairs=[("n9", False)], parts=[{"web"}])
-        assert "was cancelled" in text  # its part is blocked for this request
+        assert "was stopped" in text  # its part is blocked for this request
         _, _, text = await clone(m=m, pairs=[(f"n{i}", False) for i in range(MAX_LIVE_BACKGROUND)])
         assert text == "cloned"  # its place under the cap was free at once
         waking = host.next("run", "o", "wake")
@@ -709,10 +709,10 @@ def test_cancel_is_refused_for_anything_but_a_running_background_graft_of_the_or
         await queued
         results = await cancel(m=m, tl="o", ids=["o", "c9", "c2"])
         outcomes = dict(ast.literal_eval(results[0][0]))
-        assert outcomes == {"o": "the main conversation cannot be cancelled", "c9": "no such branch",
-                            "c2": "it has already finished or was already cancelled; nothing to cancel"}
+        assert outcomes == {"o": "the main conversation cannot be stopped", "c9": "no such branch",
+                            "c2": "it has already finished or was already stopped; nothing to stop"}
         assert results[0][1] and host.status["c1"] == "background"  # nothing was touched
-        assert "you cancel only from the main conversation" in await cancel(m=m, tl="c1", ids=["c2"])  # a graft never cancels
+        assert "you stop branches only from the main conversation" in await cancel(m=m, tl="c1", ids=["c2"])  # a graft never cancels
         waking = host.next("run", "o", "wake")
         host.end("o")
         await waking  # the wake that reports c2
@@ -1192,7 +1192,7 @@ def test_a_cancel_that_loses_the_race_to_a_finish_blocks_nothing(order):
         assert await at_rest(m) == "ended"
         await m.ask(tl="o", name="turn_request", build=lambda r: (Mode(name="external"), r))  # the same request
         _, _, text = await clone(m=m, pairs=[("c2", False)], parts=[{"web"}])
-        assert ("was cancelled" in text) == cancelled  # a part is blocked only by a real cancel
+        assert ("was stopped" in text) == cancelled  # a part is blocked only by a real cancel
         await asyncio.wait_for(m.ask(tl="session", name="shutdown", build=lambda r: r), timeout=GUARD)
         await m.stop()
     run(go)

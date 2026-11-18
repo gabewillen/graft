@@ -182,7 +182,7 @@ async def run(live: bool, trace: bool, gate: bool = False) -> dict:
             kinds[g.get("child")] = g.get("focus")
     clones = []
     for tl, status, reason in rows:
-        skills = [k["name"] for k in store.skills_for(tl) if k["name"] not in ("merge", "background")]
+        skills = [k["name"] for k in store.skills_for(tl) if k["name"] not in ("merge", "detached")]
         replied = any(r["role"] == "assistant" and r["kind"] == "text" for r in store.view(tl)
                       if r["owner_timeline"] == tl)
         clones.append({"clone": tl, "skills": skills, "status": status, "join_reason": reason,

@@ -1,5 +1,5 @@
-"""Skill catalog: three built-ins (branch, merge, background: graft's clone and join skills, as the
-model is told them) and simulated capability skills.
+"""Skill catalog: three built-ins (branch, merge, detached: graft's clone skill, and the join skills of
+a focus graft and a background graft, as the model is told them) and simulated capability skills.
 
 Capability tools act on an in-memory `World` (fake website, slide deck, calendar).
 Tool names use underscores because API tool names cannot contain dots.
@@ -38,20 +38,21 @@ JOIN_TOOL = {
                         ["reason"])}
 
 def cancel_limit(max_live_background: int) -> int:
-    """Graft ids one cancel call takes: twice the live cap (anything longer is noise)."""
+    """Graft ids one cancel call (the model's `stop`) takes: twice the live cap (anything longer is noise)."""
     return 2 * max_live_background
 
 
 # Graft ids in one cancel call at the default cap; a harness with another cap takes twice its cap.
 MAX_CANCEL_IDS = cancel_limit(MAX_LIVE_BACKGROUND)
 
-# `cancelled` is not a reason a graft can give: only the harness sets it, when the original cancels.
+# graft's cancel, as the model is told it: `stop`. `cancelled` is not a reason a graft can give: only the
+# harness sets it, when the original stops a graft.
 CANCEL_TOOL = {
-    "name": "cancel",
-    "description": "Stop background branches of yours that are still running, by id. Each one is "
+    "name": "stop",
+    "description": "Stop detached branches of yours that are still running, by id. Each one is "
                    "stopped where it is and what you did in it so far merges back when your turn ends.",
-    "input_schema": obj(props={"cancel": {"type": "array", "minItems": 1, "maxItems": MAX_CANCEL_IDS, "items": S}},
-                        required=["cancel"])}
+    "input_schema": obj(props={"ids": {"type": "array", "minItems": 1, "maxItems": MAX_CANCEL_IDS, "items": S}},
+                        required=["ids"])}
 
 MAX_CLONE_ENTRIES = 4  # entries (branches) in one branch call
 
@@ -75,18 +76,22 @@ website, slides, or a calendar booking), call `branch` right away, in that same 
 Do not gather requirements, draft content, or plan the work here; you do that in the branch. Only
 answer here when no catalog skill applies.
 
+CURRENT AND DETACHED. Think of it as git: the conversation with the user is your HEAD. A current
+branch takes HEAD: the user talks to it until it merges and HEAD comes back to you here. A
+detached branch works off to the side with no line to the user, while you keep HEAD here.
+
 BRANCH (one call per user message). `branch(branch=[...])` takes a list of one to four branches and
-starts them all at once. At most four background branches of yours may be live at a time. Each entry has:
+starts them all at once. At most four detached branches of yours may be live at a time. Each entry has:
 - `purpose`: what this branch is for.
-- `skills`: catalog skill names the branch holds (never `branch`, `merge` or `background`).
+- `skills`: catalog skill names the branch holds (never `branch`, `merge` or `detached`).
 - `focus` (required): true or false. At most one entry may have `focus: true`.
-  - `focus: true`: in this branch you carry on the conversation with the user; here you are
-    paused until it merges. Use it when the task needs the user: requirements are still
+  - `focus: true`: a current branch. In it you carry on the conversation with the user; here you
+    are paused until it merges. Use it when the task needs the user: requirements are still
     open, or the user will want to iterate on the result.
-  - `focus: false`: in this branch you work out of sight and never talk to the user; here you keep
-    the conversation. Use it when the task is fully specified by what the user already said and
-    is independent of the other branches. A request with several independent parts is one `branch`
-    call with one background entry per part.
+  - `focus: false`: a detached branch. In it you work out of sight and never talk to the user;
+    here you keep the conversation. Use it when the task is fully specified by what the user
+    already said and is independent of the other branches. A request with several independent
+    parts is one `branch` call with one detached entry per part.
 - the seed: the messages already in your conversation that this branch needs, as pointers (never
   copies). Name each one either by `seed_quotes` (a short verbatim excerpt of that message, e.g.
   its first words; each must match exactly one message) or by `seed_row_ids` (the row ids that
@@ -97,31 +102,31 @@ its seed is the whole message. So a request with several parts needs one entry p
 with no entry is done by nobody.
 If any entry is invalid the whole call is refused, with the violations per entry and an index of
 your messages, and no branch is started; fix it and call `branch` once more.
-Background branches do not share locks: never give two branches work that changes the same thing.
-After a call with no focus branch, tell the user briefly what you started. While background
+Detached branches do not share locks: never give two branches work that changes the same thing.
+After a call with no current branch, tell the user briefly what you started. While detached
 branches run you keep talking to the user; a running branch cannot be steered from here.
 
-CANCEL. `cancel(cancel=["c2", ...])` stops background branches of yours that are still running;
-harness notes and the branch result give their ids. Use it when the user asks you to stop a part,
-or when a part is no longer needed. You cancel only from here: in a branch you never cancel another
-branch. A cancelled branch is stopped where it is and merges like any other when your turn ends:
+STOP. `stop(ids=["c2", ...])` stops detached branches of yours that are still running; harness
+notes and the branch result give their ids. Use it when the user asks you to stop a part, or when
+a part is no longer needed. You stop branches only from here: in a branch you never stop another
+branch. A stopped branch is stopped where it is and merges like any other when your turn ends:
 you get the messages you had written in it and a note naming the tools you had already run there.
 Nothing you already did there outside the conversation (a page written, a booking made) is undone,
-so tell the user what was left behind. An id that is unknown, is a focus branch, or has already
-finished is reported in the result and nothing happens for it. To replace a part with different
-work, call `cancel` and `branch` in the same response: the cancel runs first, so the cancelled
-branch's place is free for the new one. Do not branch again for the same part you cancelled unless
-the user asks for it in a new message; that entry is refused. Any tool call other than `cancel`
+so tell the user what was left behind. An id that is unknown, is the current branch, or has
+already finished is reported in the result and nothing happens for it. To replace a part with
+different work, call `stop` and `branch` in the same response: the stop runs first, so the stopped
+branch's place is free for the new one. Do not branch again for the same part you stopped unless
+the user asks for it in a new message; that entry is refused. Any tool call other than `stop`
 beside a `branch` call is skipped.
 
 MERGE (automatic). When a branch merges, what you did there becomes your memory here, with no
 decision on your part: the harness appends a note listing the row ids, then the text messages
 (user and assistant) of that branch's conversation that you do not already have. If you left a
-focus branch because the user asked for something else, that message is the last one; route it
+current branch because the user asked for something else, that message is the last one; route it
 (usually: branch again, seeding from the rows you now hold). Harness notes list which of your
-branches are still running. If a focus branch hands a request back while background branches from
+branches are still running. If a current branch hands a request back while detached branches from
 the same call are still running, do not branch again for the parts those branches are doing:
-branch only for what nobody is doing. Background branches merge when you are free: what you did in
+branch only for what nobody is doing. Detached branches merge when you are free: what you did in
 them appears the same way, followed by a harness note asking you to tell the user the outcome. Tell
 the user what you did, in your own words and in the first person (you did it; never say a branch
 did), report only what has merged, and never describe still-running work as finished. Then go on
@@ -153,9 +158,9 @@ listed here. You talk to the user directly. Do the task with your tools.
 """
 
 
-# The `background` skill: linked to every background graft, with the same `merge` tool.
+# The `detached` skill: linked to every background graft, with the same `merge` tool.
 BACKGROUND_INSTRUCTIONS = """\
-You are working on one part of the conversation in a background branch of yourself, holding only
+You are working on one part of the conversation in a detached branch of yourself, holding only
 the skills listed here: nothing you write here reaches the user, and you cannot ask them
 anything. Do the task with your tools, using only what this conversation already contains.
 - YOUR PART. The messages you start with may ask for several things. Do only the part your
@@ -175,10 +180,10 @@ CATALOG: list[Skill] = [
     Skill(name="branch",
           description="Built-in. When a user request needs any catalog skill, call branch(branch=[...]) right "
           "away, with no text, instead of doing or planning the work here. Each entry is a branch "
-          "of yourself holding only the skills its part needs: in one with focus=true you carry the "
-          "conversation with the user; entries with focus=false work out of sight. "
-          "cancel(cancel=[ids]) stops background branches that are still running. Load this skill "
-          "for the focus and seed rules, cancelling, and how branches merge.",
+          "of yourself holding only the skills its part needs: in the current one (focus=true) you "
+          "carry the conversation with the user; detached ones (focus=false) work out of sight. "
+          "stop(ids=[ids]) stops detached branches that are still running. Load this skill "
+          "for the current and detached branches, seeds, stopping, and how branches merge.",
           instructions=CLONE_INSTRUCTIONS, tools=[
         LOAD_SKILL_TOOL,
         {"name": "branch", "description": "Branch yourself, one branch per entry, in one call. Each entry "
@@ -201,8 +206,8 @@ CATALOG: list[Skill] = [
         LOAD_SKILL_TOOL,
         JOIN_TOOL,
     ]),
-    Skill(name="background",
-          description="Built-in. You are working on one part of the conversation in a background branch of "
+    Skill(name="detached",
+          description="Built-in. You are working on one part of the conversation in a detached branch of "
           "yourself: you cannot reach the user, so never ask questions. The messages you start with "
           "may ask for several things: do only the part your skills cover and say nothing about the "
           "rest; you are doing it in other branches. Write your result as a final reply, then call "
@@ -266,7 +271,7 @@ CATALOG: list[Skill] = [
     ]),
 ]
 
-BUILTIN = ("branch", "merge", "background")
+BUILTIN = ("branch", "merge", "detached")
 
 
 def load_skill(store: Store, linked: set[str], name: str) -> tuple[str, bool]:
@@ -283,7 +288,7 @@ def skill_listing(store: Store, names: list[str], heading: str) -> str:
     return heading + "\n" + "\n".join(f"- {r[0]}: {r[1]}" for r in rows if r)
 
 
-LIVE_CAP_SENTENCE = "At most four background branches of yours may be live at a time."
+LIVE_CAP_SENTENCE = "At most four detached branches of yours may be live at a time."
 
 
 def catalog(max_live_background: int = MAX_LIVE_BACKGROUND) -> list[Skill]:
@@ -295,7 +300,7 @@ def catalog(max_live_background: int = MAX_LIVE_BACKGROUND) -> list[Skill]:
         raise ValueError("the branch skill no longer says the live cap as LIVE_CAP_SENTENCE")
     if max_live_background == MAX_LIVE_BACKGROUND:
         return CATALOG
-    said = (f"At most {max_live_background} background branches of yours may be live at a time"
+    said = (f"At most {max_live_background} detached branches of yours may be live at a time"
             + (" (across branch calls: one call takes at most four)." if max_live_background > MAX_CLONE_ENTRIES
                else "."))
     out = []
@@ -303,8 +308,8 @@ def catalog(max_live_background: int = MAX_LIVE_BACKGROUND) -> list[Skill]:
         if skill.name == "branch":
             tools = copy.deepcopy(skill.tools)
             for t in tools:
-                if t["name"] == "cancel":
-                    t["input_schema"]["properties"]["cancel"]["maxItems"] = cancel_limit(max_live_background)
+                if t["name"] == "stop":
+                    t["input_schema"]["properties"]["ids"]["maxItems"] = cancel_limit(max_live_background)
             skill = replace(skill, instructions=skill.instructions.replace(LIVE_CAP_SENTENCE, said), tools=tools)
         out.append(skill)
     return out
@@ -315,11 +320,11 @@ def says_live_cap(store: Store, max_live_background: int) -> bool:
     `install` wrote them? True if no clone skill is installed: a store a host fills itself (tests,
     a bare harness) has no text that could say another cap, so there is nothing to disagree."""
     row = store.con.execute("SELECT instructions FROM skills WHERE name='branch'").fetchone()
-    tool = store.con.execute("SELECT input_schema FROM tools WHERE name='cancel'").fetchone()
+    tool = store.con.execute("SELECT input_schema FROM tools WHERE name='stop'").fetchone()
     if row is None or tool is None:
         return True
     want = next(s.instructions for s in catalog(max_live_background=max_live_background) if s.name == "branch")
-    taken = json.loads(tool[0])["properties"]["cancel"].get("maxItems")
+    taken = json.loads(tool[0])["properties"]["ids"].get("maxItems")
     return row[0] == want and taken == cancel_limit(max_live_background)
 
 

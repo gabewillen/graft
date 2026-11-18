@@ -1,6 +1,7 @@
 """What the model reads calls a graft a branch of itself and a join a merge (spec: What the model is
-told: branch and merge). No model-facing text names a clone, a join, a graft, the original, an
-instance, a subagent, a worker, a helper or a delegate, or says the assistant will remember something for a graft.
+told: branch, merge and stop). No model-facing text names a clone, a join, a graft, the original, an
+instance, a subagent, a worker, a helper or a delegate, says the assistant will remember something
+for a graft, or says background or cancel (the model's words are detached and stop).
 
 Model-facing text is what the harness writes for a model to read: the system prompt of every
 timeline, every tool's name, description and schema, harness notes, and tool results (of the
@@ -11,11 +12,16 @@ harness row and tool result left in the store after them. Paths these runs do no
 internal-error refusals, shutdown races) are covered only by review of their text. The
 user's own messages and the model's own replies are not the harness's words and are left out;
 the scripted user and model avoid the banned words, so the capability tools' results (which echo
-them) can be scanned too."""
+them) can be scanned too. A static check covers the paths no run reaches: the string constants of
+every function that writes model-facing text (PRODUCERS) are scanned, and each producer is shown
+to be scanned by a mutation of its own text that the check catches."""
 
+import ast
 import asyncio
+import inspect
 import json
 import re
+import textwrap
 import threading
 
 import pytest
@@ -31,7 +37,7 @@ from graft.skills import BACKGROUND_INSTRUCTIONS, BUILTIN, CATALOG, CLONE_INSTRU
 
 # Stems, so every inflection is caught (clone, clones, cloned, cloning; join, joins, joined, ...).
 BANNED = re.compile(r"\bclon|\bjoin|\binstances?\b|\bsub-?agents?\b|\bworkers?\b|\bhelpers?\b|\bdelegat"
-                    r"|\bgrafts?\b|\boriginal\b|the assistant will", re.IGNORECASE)
+                    r"|\bgrafts?\b|\boriginal\b|the assistant will|\bbackground|\bcancel", re.IGNORECASE)
 REQUEST = "Build a website and a slide deck for the dental practice."
 GATE_TIMEOUT = 10
 
@@ -110,10 +116,10 @@ def check(found: list[tuple[str, str]]):
 # ------------------------------------------------------------------ the text itself
 def test_the_built_in_skills_and_tools_say_branch_and_merge():
     names = {s.name for s in CATALOG}
-    assert {"branch", "merge", "background"} <= names and not {"clone", "join"} & names
-    assert set(BUILTIN) == {"branch", "merge", "background"}
+    assert {"branch", "merge", "detached"} <= names and not {"clone", "join"} & names
+    assert set(BUILTIN) == {"branch", "merge", "detached"}
     tools = {t["name"] for s in CATALOG for t in s.tools}
-    assert {"branch", "merge", "cancel", "load_skill"} <= tools and not {"clone", "join"} & tools
+    assert {"branch", "merge", "stop", "load_skill"} <= tools and not {"clone", "join"} & tools
     branch_tool = next(t for s in CATALOG for t in s.tools if t["name"] == "branch")
     assert set(branch_tool["input_schema"]["properties"]) == {"branch"}
     merge_tool = next(t for s in CATALOG for t in s.tools if t["name"] == "merge")
@@ -121,7 +127,7 @@ def test_the_built_in_skills_and_tools_say_branch_and_merge():
     # the first-person framing: a branch is you, and what you did there is your memory
     focus, background, original = (" ".join(t.split()) for t in (JOIN_INSTRUCTIONS, BACKGROUND_INSTRUCTIONS,
                                                                    CLONE_INSTRUCTIONS))
-    assert "in a branch of yourself" in focus and "in a background branch of yourself" in background
+    assert "in a branch of yourself" in focus and "in a detached branch of yourself" in background
     assert "other branches of yourself" in focus and "other branches of yourself" in background
     assert "what you will remember of this work when the branch merges" in background
     assert "branching yourself: a branch is you" in original and "in the first person" in original
@@ -151,9 +157,9 @@ def test_the_banned_words_are_caught():
     """The check itself: each word the framing rules out is caught, in any inflection."""
     for t in ("a clone", "Cloned ->", "joined", "join(reason", "another instance", "the subagent",
               "a sub-agent", "workers", "a helper", "delegates", "the assistant will remember", "a graft",
-              "background grafts", "the original"):
+              "background grafts", "the original", "cancel", "Cancelled", "a background branch", "cancelling"):
         assert banned(t), t
-    for t in ("your branch c2 merged", "cancel", "out_of_scope", "the same assistant", "rejoice", "grafted",
+    for t in ("your branch c2 merged", "stop", "a detached branch", "the current branch", "out_of_scope", "the same assistant", "rejoice", "grafted",
               "originally"):
         assert not banned(t), t
 
@@ -179,16 +185,16 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
             if last["type"] == "tool_result" and "b1" == last["tool_use_id"]:
                 return [use(tool="branch", use_id="b2", branch=[entry(skills=["website"], focus=False), entry(skills=["slides"], focus=False)])]
             if last["type"] == "text" and not last.get("harness") and last["text"] == "Stop the slides.":
-                return [use(tool="cancel", use_id="x1", cancel=["c2", "c9", "o", 5])]
+                return [use(tool="stop", use_id="x1", ids=["c2", "c9", "o", 5])]
             if last["type"] == "tool_result" and last["tool_use_id"] == "x1":
                 website_gate.set()
                 return text("Okay.")
-            if last["type"] == "text" and last.get("harness") and "c2 (cancelled)" in last["text"]:
+            if last["type"] == "text" and last.get("harness") and "c2 (stopped)" in last["text"]:
                 return [use(tool="branch", use_id="b3", branch=[entry(skills=["slides"], focus=False, quotes=("Stop the slides.",))])]
             return text("Okay.")
         if "site_write" in names:
             if not any(b["type"] == "tool_result" for m in messages for b in m["content"]):
-                return [use(tool="cancel", use_id="g1", cancel=["c2"]), use(tool="merge", use_id="g2", reason="done")]
+                return [use(tool="stop", use_id="g1", ids=["c2"]), use(tool="merge", use_id="g2", reason="done")]
             waits.append(("website", website_gate.wait(GATE_TIMEOUT)))
             return [{"type": "text", "text": "Website built."}, use(tool="site_write", use_id="g3", page="home", content="hi"),
                     use(tool="merge", use_id="g4", reason="done")]
@@ -211,15 +217,15 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
     assert any(t.startswith("branch refused") and "'merge' is linked by the harness" in t
                and "'branch' cannot be held by a branch" in t for t in results), results
     assert any(t.startswith("branched -> ") for t in results), results
-    cancel = sorted({t for t in results if t.startswith("cancelled -> ")})  # seen once per later model call
-    assert len(cancel) == 1 and cancel[0].startswith("cancelled -> c2 (stopped;"), results
-    assert "c9: not cancelled: no such branch" in cancel[0] and "o: not cancelled:" in cancel[0], cancel
-    assert "cancel[3]: not cancelled: a int is not a branch id" in cancel[0], cancel
-    assert any("already failed, was cancelled" in t for t in results), results  # the re-branch block
+    cancel = sorted({t for t in results if t.startswith("stopped -> ")})  # seen once per later model call
+    assert len(cancel) == 1 and cancel[0].startswith("stopped -> c2 (what you did in it"), results
+    assert "c9: not stopped: no such branch" in cancel[0] and "o: not stopped:" in cancel[0], cancel
+    assert "ids[3]: not stopped: a int is not a branch id" in cancel[0], cancel
+    assert any("already failed, was stopped" in t for t in results), results  # the re-branch block
     assert any("merge(reason='done') refused" in t for t in results), results
     notes = [t for w, t in rec.seen if w == "note"]
-    assert any(t.startswith("(harness note: your background branch") and "c2 (cancelled)" in t
-               and "You cancelled c2" in t for t in notes), notes
+    assert any(t.startswith("(harness note: your detached branch") and "c2 (stopped)" in t
+               and "You stopped c2" in t for t in notes), notes
     check(rec.seen + store_texts(store))
 
 
@@ -284,7 +290,7 @@ def test_caps_and_spent_calls_say_branch(tmp_path):
 
     asyncio.run(go())
     results = [t for w, t in rec.seen if w == "result"]
-    assert any("at most 1 background branches may be live" in t for t in results), results
+    assert any("at most 1 detached branches may be live" in t for t in results), results
     assert any("a branch call takes at most 4 entries" in t for t in results), results
     assert any("no branch calls left" in t for t in results), results
     check(rec.seen + store_texts(store))
@@ -408,3 +414,143 @@ def test_a_merge_whose_view_would_be_invalid_says_branch(tmp_path, monkeypatch):
     assert forced, "the merge's validation was never forced to fail"
     assert any("its rows were skipped (invalid view)" in t for t in notes), notes
     check(rec.seen + store_texts(store))
+
+
+# ------------------------------------------------------------------ the producers, statically
+from graft import compaction as compaction_mod, db as db_mod, harness as harness_mod, machine as machine_mod, \
+    skills as skills_mod
+
+# Every function or constant that writes text a model reads. A producer that is renamed or removed
+# fails the check (it must be listed again), so a new place that words a note or a refusal is
+# added here, not missed.
+PRODUCERS = {
+    harness_mod: ["said", "merge_head", "check_skill_link", "clone_entries", "_typed_list", "cancel_ids",
+                  "Harness.cancel_text", "Harness.system", "Harness.load", "Harness._names", "Harness._running_note",
+                  "Harness.wake_note", "Harness.default_join_rows", "Harness.fit_join", "Harness.default_join",
+                  "Harness.resolve_seed", "Harness.seed_index", "Harness.prepare_clone", "Harness.refuse_clone",
+                  "Harness._prepare_clone", "Harness._loop", "Harness._missing_results",
+                  "NOT_RUN_INTERRUPTED", "NOT_RUN_JOINING", "NOT_RUN_BESIDE_CLONE", "CANCELLED_WHILE_RUNNING",
+                  "CANCELLED_BY_THE_TOOL", "FAILED_AFTER_INVOKED", "WITHDRAWN_SEED"],
+    machine_mod: ["clone_refusal", "decline_why", "clone_why", "cancel_refusal", "_cancel_rows", "refuse_clone_call",
+                  "refuse_cancel_call", "clone_refusal_not_written", "decline", "decline_failed_step",
+                  "preparation_crashed", "drop_clone", "answer_pending", "_cut_outcome", "ToolCall"],
+    db_mod: ["WITHDRAWN_NOTE"],
+    compaction_mod: ["COMPACT_TOOL", "EXTRACT_INSTRUCTION", "WITHDRAWN_INDEX", "index_text", "extract_request",
+                     "SUMMARY_HEADER", "COMPACT_INSTRUCTION", "summary_turn"],
+    seeder_mod: ["NOUL_TRUE", "NOUL_FALSE", "reduced_state", "reduced_question", "jev_request"],
+    skills_mod: ["LOAD_SKILL_TOOL", "JOIN_TOOL", "CANCEL_TOOL", "CLONE_INSTRUCTIONS", "JOIN_INSTRUCTIONS",
+                 "BACKGROUND_INSTRUCTIONS", "load_skill", "skill_listing"],
+}
+# graft's own identifiers (store and transaction kinds, a graft's kind, its reason, the keys of the
+# harness's logs) and its audit records: compared and stored, never shown to a model.
+INTERNAL = {"clone", "join", "joined", "background", "focus", "cancelled", ":clone_tx", "DEFAULT JOIN ", "CLONE ",
+            "BACKGROUND", "FOCUS"}
+# Calls whose text is never shown to a model: the host's trace and the lines the user's callbacks get.
+NOT_MODEL_FACING = {"trace", "_report", "_report_failure", "emit", "DecisionFault", "Aborted", "RuntimeError",
+                    "TransitionRefused", "AssertionError", "ValueError", "TypeError"}
+
+
+def _lookup(module, name: str):
+    obj = module
+    for part in name.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _strings(node: ast.AST) -> list[str]:
+    """The string constants of a function's or a value's source, but its docstring and the text of
+    calls that never reach a model (NOT_MODEL_FACING)."""
+    out: list[str] = []
+
+    def visit(n: ast.AST) -> None:
+        if isinstance(n, ast.Call):
+            f = n.func
+            called = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else None
+            if called in NOT_MODEL_FACING:
+                return
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.body \
+                and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant):
+            for child in n.body[1:]:
+                visit(child)
+            for child in [*getattr(n, "decorator_list", []), getattr(n, "args", None)]:
+                if child is not None:
+                    visit(child)
+            return
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value not in INTERNAL:
+            out.append(n.value)
+        for child in ast.iter_child_nodes(n):
+            visit(child)
+
+    visit(node)
+    return out
+
+
+def _source_node(module, name: str) -> ast.AST:
+    obj = _lookup(module, name)
+    if callable(obj) and not isinstance(obj, str):
+        return ast.parse(textwrap.dedent(inspect.getsource(obj)))
+    tree = ast.parse(inspect.getsource(module))
+    for n in tree.body:  # a module-level value: its assignment
+        targets = n.targets if isinstance(n, ast.Assign) else [n.target] if isinstance(n, ast.AnnAssign) else []
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            return n
+    raise LookupError(f"{module.__name__}.{name} is not assigned at module level")
+
+
+def scanned(source: ast.AST) -> list[tuple[str, list[str]]]:
+    return [(t, banned(t)) for t in _strings(source) if banned(t)]
+
+
+@pytest.mark.parametrize("module,name", [(m, n) for m, names in PRODUCERS.items() for n in names],
+                         ids=lambda x: x if isinstance(x, str) else x.__name__.split(".")[-1])
+def test_every_model_facing_producer_uses_no_banned_word(module, name):
+    """The string constants of each producer (its notes, results, refusals and prompts, whether or
+    not a run reaches them), and a mutation of its own text is caught: the producer is scanned."""
+    source = _source_node(module, name)
+    strings = _strings(source)
+    assert strings, f"{name}: no text found to scan"
+    assert scanned(source) == [], f"{name} uses a banned word"
+    target = next(t for t in strings if t.strip())
+    mutated = ast.parse(ast.unparse(source).replace(repr(target), repr(target + " a clone"), 1)) \
+        if repr(target) in ast.unparse(source) else None
+    if mutated is None:  # an f-string part: mutate the constant node itself
+        mutated = ast.parse(ast.unparse(source))
+        for n in ast.walk(mutated):
+            if isinstance(n, ast.Constant) and n.value == target:
+                n.value = target + " a clone"
+                break
+    assert scanned(mutated), f"{name}: a banned word put in its text was not caught"
+
+
+# ------------------------------------------------------------------ wordings no other run reaches
+def test_the_merge_record_of_a_branch_that_wrote_nothing_and_plural_stops_say_branch(tmp_path):
+    """A branch that brings back no rows the conversation lacks, and a stop of two branches (its
+    result and the wake note that reports them)."""
+    from _util import clone_in_turn
+    store, h, rec = make(tmp_path=tmp_path, policy=lambda **_: text(t="Reporting."), name="h")
+
+    async def go():
+        await h.start()
+        store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
+        store.add_turn(tl="o", role="assistant", kind="text", content="Started.")
+        (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "branch",
+                                                 "input": {"branch": [entry(skills=["website"], focus=False)]}})
+        await h.do_join(child=c1, reason="done")  # it wrote nothing
+        await h.drain_and_wake("o")
+        await h.machines.stop()
+
+    asyncio.run(go())
+    notes = [t for w, t in store_texts(store) if w == "stored note"]
+    assert any("it brings back no rows you do not already hold" in t for t in notes), notes
+    check(rec.seen + store_texts(store))
+
+    from graft.machine import CANCELLED, CancelCall
+    stopped, _ = h.cancel_text(call=CancelCall(use={"id": "x"}, ids=["c1", "c2"], problems=[]),
+                               outcomes={"c1": CANCELLED, "c2": CANCELLED})
+    assert stopped.startswith("stopped -> c1, c2 (what you did in them so far merges"), stopped
+    store.add_turn(tl="o", role="assistant", kind="text", content="Okay.")
+    h.wake_note(src="o", joined=[("c1", CANCELLED), ("c2", CANCELLED)], handed_back=False, running=[], background=True)
+    note = store.view("o")[-1]["content"]
+    assert "detached branches c1 (stopped), c2 (stopped) merged" in note and "You stopped c1, c2" in note
+    assert "they were stopped" in note and "The parts you were doing" in note, note
+    check([("result", stopped), ("note", note)])

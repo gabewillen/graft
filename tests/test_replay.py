@@ -329,7 +329,7 @@ def test_arm_g_clones_runs_and_joins_offline(tmp_path, monkeypatch):
     (tmp_path / "repo").mkdir()
     sb = sandbox.Sandbox(str(tmp_path / "repo"))
     res = asyncio.run(replay_run.arm_g(e, sb, max_steps=4, workdir=str(tmp_path)))
-    assert res["clone"] == "c1" and res["clone_text"].startswith("branched -> c1 (focus, active")
+    assert res["clone"] == "c1" and res["clone_text"].startswith("branched -> c1 (current")
     assert res["forced_join"] is True  # the clone answered and stopped: no live user, so the harness joins it
     assert res["returned"] == "Report: parse_token lacks bounds checks." and res["joined_rows"] == 1
     assert res["seed_rows"] == 3 and res["candidates"] == 3 and res["seeder"]["fallback"] is None

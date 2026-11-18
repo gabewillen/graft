@@ -109,10 +109,10 @@ NOT_RUN_BESIDE_CLONE = NotRun("not executed: call branch on its own")
 # A host tool call cut short while it ran (its run was left: a cancel, a withdrawal, shutdown).
 # It may have acted, or may still act (cancellation is cooperative: work it handed to a thread, or
 # shielded, can go on after the cancel), so it is recorded as run, with an error.
-CANCELLED_WHILE_RUNNING = Ran("cancelled while running: it may have acted, or may still act")
+CANCELLED_WHILE_RUNNING = Ran("stopped while running: it may have acted, or may still act")
 # A host tool call whose tool was cancelled by something other than its graft (the host cancelled a
 # future or task the tool awaited, while the graft still ran): it ran, with an error.
-CANCELLED_BY_THE_TOOL = Ran("cancelled by the tool: it may have acted")
+CANCELLED_BY_THE_TOOL = Ran("interrupted by the tool: it may have acted")
 # A host tool call that failed after the tool was invoked in a way that gave no result of its own.
 FAILED_AFTER_INVOKED = Ran("failed after it was invoked: it may have acted")
 _NONCE_TAG = re.compile(r"^\[conversation [^\]]*\]\s*")
@@ -120,9 +120,16 @@ _NONCE_TAG = re.compile(r"^\[conversation [^\]]*\]\s*")
 WITHDRAWN_SEED = "row {row} is a message the user withdrew; it is not a request and cannot be seeded"
 
 
+def said(reason: str) -> str:
+    """A join reason as the model is told it (the one place it is worded): the harness's own
+    `cancelled` is said `stopped`, the model's word for graft's cancel; the others are the
+    `merge` tool's own reasons."""
+    return "stopped" if reason == CANCELLED else reason
+
+
 def merge_head(*, child: str, reason: str) -> str:
     """The head of every merge record a source is given (the one place it is worded)."""
-    return f"(harness note: your branch {child} merged, reason={reason}; "
+    return f"(harness note: your branch {child} merged, reason={said(reason)}; "
 
 
 def check_skill_link(store: Store, source: str, skills: list[str]) -> list[str]:
@@ -136,9 +143,9 @@ def check_skill_link(store: Store, source: str, skills: list[str]) -> list[str]:
     for s in skills:
         if s not in known:
             v.append(f"unknown skill '{s}'")
-        elif s in ("merge", "background"):
-            v.append(f"'{s}' is linked by the harness (merge to a focus branch, background to a "
-                     "background branch); do not select it")
+        elif s in ("merge", "detached"):
+            v.append(f"'{s}' is linked by the harness (merge to a current branch, detached to a "
+                     "detached branch); do not select it")
         elif s == "branch":
             v.append("'branch' cannot be held by a branch (you branch only from the main conversation)")
     return v
@@ -234,16 +241,16 @@ def cancel_ids(args: object, limit: int) -> tuple[list[str], list[str]]:
     (GRAFT_ID). The input is model-written: nothing about its shape is assumed. A call that is
     not such a list names no graft at all; an item that is not shaped like an id is reported by
     its index, shown as a short repr, and the others stand."""
-    raw = args.get("cancel") if isinstance(args, dict) else None
+    raw = args.get("ids") if isinstance(args, dict) else None
     if not isinstance(raw, list) or not raw:
-        return [], ["`cancel` must be a list of one or more branch ids, for example [\"c2\"]"]
+        return [], ["`ids` must be a list of one or more branch ids, for example [\"c2\"]"]
     if len(raw) > limit:
-        return [], [f"a cancel call takes at most {limit} branch ids (got {len(raw)})"]
+        return [], [f"a stop call takes at most {limit} branch ids (got {len(raw)})"]
     ids: list[str] = []
     problems: list[str] = []
     for i, x in enumerate(raw):
         if not isinstance(x, str) or not GRAFT_ID.fullmatch(x):
-            problems.append(f"cancel[{i}]: not cancelled: {_echo(x)} is not a branch id (ids look like \"c2\")")
+            problems.append(f"ids[{i}]: not stopped: {_echo(x)} is not a branch id (ids look like \"c2\")")
         elif x not in ids:
             ids.append(x)
     return ids, problems
@@ -697,15 +704,15 @@ class Harness:
             if outcome == CANCELLED:
                 continue
             if outcome in ("done", "failed", "out_of_scope"):
-                outcome = "it had already finished; nothing to cancel"
-            lines.append(f"{c}: not cancelled: {outcome}")
+                outcome = "it had already finished; nothing to stop"
+            lines.append(f"{c}: not stopped: {outcome}")
         if stopped:
-            head = (f"cancelled -> {', '.join(stopped)} (stopped; "
-                    f"what you did in {'it' if len(stopped) == 1 else 'them'} so far merges when this turn ends, "
-                    "and nothing already done outside this conversation is undone)")
+            head = (f"stopped -> {', '.join(stopped)} (what you did in {'it' if len(stopped) == 1 else 'them'} "
+                    "so far merges when this turn ends, and nothing already done outside this conversation "
+                    "is undone)")
             lines = [head, *lines]
         self.trace(f"cancel {call.ids}: stopped {stopped}")
-        return "\n".join(lines) or "nothing to cancel", not stopped
+        return "\n".join(lines) or "nothing to stop", not stopped
 
     def system(self, tl: str) -> str:
         """Persona (same on every timeline) + skill listing (the only per-timeline part)."""
@@ -739,12 +746,12 @@ class Harness:
 
     @staticmethod
     def _names(clones: list[str], background: bool, named: bool = True) -> str:
-        """'background branches c1, c2' / 'branch c1'; with named=False just the noun. `background`:
-        all of them are background grafts. Grafts are told to the model, and to the user, as
+        """'detached branches c1, c2' / 'branch c1'; with named=False just the noun. `background`:
+        all of them are background grafts (detached branches, as the model is told them). Grafts are told to the model, and to the user, as
         branches (spec: What the model is told: branch and merge)."""
         if not clones:
             return "a branch"
-        word = "background branch" if background else "branch"
+        word = "detached branch" if background else "branch"
         word += "es" if len(clones) != 1 else ""
         return f"{word} {', '.join(clones)}" if named else word
 
@@ -994,9 +1001,9 @@ class Harness:
                 # Beside a clone call only cancel calls run, and they run first, wherever the model
                 # put them: a cancelled graft's place is free, and its part blocked, before the
                 # clone call is decided. Every other call is answered without being run.
-                cancels = [u for u in uses if u is not clone_use and u["name"] == "cancel"]
+                cancels = [u for u in uses if u is not clone_use and u["name"] == "stop"]
                 others = [ToolResult(use=u, content=NOT_RUN_BESIDE_CLONE, is_error=True) for u in uses
-                          if u is not clone_use and u["name"] != "cancel"]
+                          if u is not clone_use and u["name"] != "stop"]
                 self._store_results(tl=tl, results=others)
                 # one request carries the response's cancels and its clone: the machine runs the
                 # cancels first, then decides the clone
@@ -1019,7 +1026,7 @@ class Harness:
                                "their last message. First tell the user, in one or two sentences, what "
                                "you did; then call merge(reason='done').")
                     self._store_results(tl=tl, results=[ToolResult(use=u, content=msg, is_error=True)])
-                elif u["name"] == "cancel":  # whoever calls it, whatever tools it was shown: the machine decides
+                elif u["name"] == "stop":  # graft's cancel: whoever calls it, whatever tools it was shown, the machine decides
                     cancels.append(u)
                 elif u["name"] not in allowed:
                     absent = NotRun(f"tool '{u['name']}' is not available to you")
@@ -1125,7 +1132,7 @@ class Harness:
         forbids nothing: the wake is a full run. `handed_back`: a focus graft failed or handed its
         request back, so that request is src's to answer (the machine says so). `running`: src's
         grafts still running; `background`: the joined grafts are all background grafts."""
-        names = ", ".join(f"{c} ({r})" for c, r in joined)
+        names = ", ".join(f"{c} ({said(r)})" for c, r in joined)
         dropped = [c for c, _ in joined if c in self.join_dropped]
         kept = [c for c, _ in joined if c not in self.join_dropped]
         where = "what you did there is in the rows above." if kept else ""
@@ -1139,7 +1146,7 @@ class Harness:
         cancelled = [c for c, r in joined if r == CANCELLED]
         if cancelled:
             many = len(cancelled) > 1
-            task = (f"You cancelled {', '.join(cancelled)}: tell the user {'they were' if many else 'it was'} "
+            task = (f"You stopped {', '.join(cancelled)}: tell the user {'they were' if many else 'it was'} "
                     f"stopped and what you had already done there. The part{'s' if many else ''} you were doing "
                     f"in {', '.join(cancelled)} cannot be branched for again until the user's next message. ") + task
         self.store.add_turn(tl=src, role="user", kind="text", harness=True, content=(
@@ -1217,7 +1224,7 @@ class Harness:
                  if reason == "failed" else None)
         if reason == CANCELLED:
             ran = self.tools_run(child, closing=closing)
-            error = (f"(harness note: your branch {child} was cancelled before it finished; its timeline is "
+            error = (f"(harness note: your branch {child} was stopped before it finished; its timeline is "
                      f"frozen. Before it was stopped you had run there: {', '.join(ran) if ran else 'no tools'}. "
                      "Nothing you did there outside this conversation was undone; a tool that returned an "
                      "error may still have acted before it failed.)")
@@ -1556,14 +1563,14 @@ class Harness:
             tail = ("Fix the entries and call branch once more.\n" + self.seed_index(src)) if retry_left \
                 else "No retries left for this message; answer the user instead."
             return "branch refused; no branch was started:\n- " + "\n- ".join(violations) + "\n" + tail
-        grafts = [Graft(child=child, seed=seed, skills=e.skills + ["merge" if e.focus else "background"],
+        grafts = [Graft(child=child, seed=seed, skills=e.skills + ["merge" if e.focus else "detached"],
                         focus=e.focus)
                   for child, e, (seed, _) in zip(ids, entries, resolved)]
         parts, audits = [], []
         for tx, sc, g in zip(txs, scratch, grafts):
             mode = "FOCUS" if g.focus else "BACKGROUND"
             audits.append((tx, f"CLONE {g.child} {mode} SEED {g.seed} SKILLS {g.skills}", sc))
-            parts.append(f"{g.child} ({'focus, active' if g.focus else 'background, running'}; "
+            parts.append(f"{g.child} ({'current' if g.focus else 'detached, running'}; "
                          f"seed rows {g.seed}; skills {g.skills})")
         batch = CloneBatch(grafts=grafts, audits=audits, text="branched -> " + ", ".join(parts), txs=list(txs),
                            retry_left=retry_left)
