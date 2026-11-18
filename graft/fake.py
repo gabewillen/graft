@@ -25,7 +25,7 @@ def _text(t: str) -> list[dict]:
 
 
 def _clone(purpose: str, skills: list[str], seed_quotes: list[str], focus: bool = True) -> dict:
-    """One entry of a branch call."""
+    """One entry of a fork call."""
     return {"purpose": purpose, "skills": skills, "focus": focus, "seed_quotes": seed_quotes}
 
 
@@ -78,14 +78,14 @@ def _ids_from_sql(out: str) -> list[int]:
 def pivot_policy(system: str, messages: list[dict], tools: list[dict]) -> list[dict]:
     names = {t["name"] for t in tools}
     last = _last_block(messages)
-    if "branch" in names:  # the original: route with one branch call
+    if "fork" in names:  # the original: route with one fork call
         if last["type"] == "tool_result":
             return _text("(waiting)")
         if woken(messages):
             return _wake_reply(messages)
         user = [re.sub(r"^\[conversation [^\]]*\]\s*", "", t) for t in texts_of(messages)]
         wants_slides = any("slide" in t.lower() for t in user)
-        return _use(tool="branch", branch=[_clone(purpose="handle the user's request",
+        return _use(tool="fork", branch=[_clone(purpose="handle the user's request",
                                              skills=["slides" if wants_slides else "website"], seed_quotes=user)])
     # a clone: load its capability skill first (progressive disclosure)
     skill = "website" if "site_write" in names else "slides" if "slides_create" in names else None
@@ -229,7 +229,7 @@ def bench_graft_policy(system: str, messages: list[dict], tools: list[dict]) -> 
         return _summary(messages)
     if names == {"compact"}:
         return _fake_compact(messages)
-    if "branch" in names:  # the original
+    if "fork" in names:  # the original
         if _last_block(messages)["type"] == "tool_result":
             return _text("(waiting)")
         if woken(messages):
@@ -238,7 +238,7 @@ def bench_graft_policy(system: str, messages: list[dict], tools: list[dict]) -> 
         texts = [t for t in texts if not t.startswith("(compaction")]
         wants = _wants(texts[-1] if texts else "") or _wants(" ".join(texts)) or ["website"]
         uniq = [t for t in dict.fromkeys(texts) if texts.count(t) == 1]
-        return _use(tool="branch", branch=[_clone(purpose="handle the user's request", skills=wants,
+        return _use(tool="fork", branch=[_clone(purpose="handle the user's request", skills=wants,
                                              seed_quotes=uniq or texts[-1:])])
     return _holder_policy(names, messages)
 
@@ -248,7 +248,7 @@ def parallel_graft_policy(system: str, messages: list[dict], tools: list[dict]) 
     with one background entry per skill; the original keeps the conversation and reports when
     the harness wakes it (experiments/parallel.py)."""
     names = {t["name"] for t in tools}
-    if "branch" not in names:
+    if "fork" not in names:
         return _holder_policy(names, messages)
     last = _last_block(messages)
     if last["type"] == "tool_result":
@@ -258,8 +258,8 @@ def parallel_graft_policy(system: str, messages: list[dict], tools: list[dict]) 
     texts = [_clean(t) for t in _user_texts(messages)]
     wants = _wants(texts[-1] if texts else "") or ["website"]
     if len(wants) == 1:
-        return _use(tool="branch", branch=[_clone(purpose="handle the user's request", skills=wants, seed_quotes=texts)])
-    return _use(tool="branch", branch=[_clone(purpose=f"the {w} part of the user's request", skills=[w],
+        return _use(tool="fork", branch=[_clone(purpose="handle the user's request", skills=wants, seed_quotes=texts)])
+    return _use(tool="fork", branch=[_clone(purpose=f"the {w} part of the user's request", skills=[w],
                                          seed_quotes=texts, focus=False)
                                 for w in wants])
 

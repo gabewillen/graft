@@ -320,7 +320,7 @@ def test_arm_g_clones_runs_and_joins_offline(tmp_path, monkeypatch):
                                    input_tokens=50)
 
     def policy(system, messages, tools):
-        assert "branch" not in {t["name"] for t in tools}  # only the clone is ever called
+        assert "fork" not in {t["name"] for t in tools}  # only the clone is ever called
         return [{"type": "text", "text": "Report: parse_token lacks bounds checks."}]
 
     monkeypatch.setattr(replay_run, "OpenAIProvider", lambda model: FakeProvider(policy))
@@ -329,7 +329,7 @@ def test_arm_g_clones_runs_and_joins_offline(tmp_path, monkeypatch):
     (tmp_path / "repo").mkdir()
     sb = sandbox.Sandbox(str(tmp_path / "repo"))
     res = asyncio.run(replay_run.arm_g(e, sb, max_steps=4, workdir=str(tmp_path)))
-    assert res["clone"] == "c1" and res["clone_text"].startswith("branched -> c1 (current")
+    assert res["clone"] == "c1" and res["clone_text"].startswith("forked -> c1 (current")
     assert res["forced_join"] is True  # the clone answered and stopped: no live user, so the harness joins it
     assert res["returned"] == "Report: parse_token lacks bounds checks." and res["joined_rows"] == 1
     assert res["seed_rows"] == 3 and res["candidates"] == 3 and res["seeder"]["fallback"] is None

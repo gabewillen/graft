@@ -991,7 +991,7 @@ def clone_refusal(inst: TimelineSM, grafts: list[tuple[str, bool]]) -> str | Non
     """The focus rule and the cap on live background grafts (a graft whose join is queued but not
     yet applied is still live)."""
     if not grafts:
-        return "a branch call needs at least one branch"
+        return "a fork call needs at least one branch"
     focus = [g for g, f in grafts if f]
     if len(focus) > 1:
         return f"at most one branch may carry the conversation, got {focus}"
@@ -1016,14 +1016,14 @@ def decline_why(inst: TimelineSM, clone: Clone) -> str | None:
     if _run_withdrawn(inst):
         return "the user's call this turn answers was withdrawn"
     if inst.source_id is not None:
-        return "you branch only from the main conversation (branches are one level deep)"
+        return "you fork only from main (branches are one level deep)"
     if inst.clone_tries >= CLONE_TRIES:
-        return "no branch calls left for this message; answer the user instead"
+        return "no fork calls left for this message; answer the user instead"
     if inst.clone_calls.get(clone.request, NONE_YET) >= MAX_CLONE_CALLS_PER_MESSAGE:
-        return (f"the {MAX_CLONE_CALLS_PER_MESSAGE} branch calls for this user message are used up. Do not "
-                "branch again: answer the user yourself, briefly saying what could not be done")
+        return (f"the {MAX_CLONE_CALLS_PER_MESSAGE} fork calls for this user message are used up. Do not "
+                "fork again: answer the user yourself, briefly saying what could not be done")
     if inst.handbacks.get(clone.request, NONE_YET) >= MAX_REQUEST_HANDBACKS:
-        return ("branches for this message have failed or handed it back too many times. Do not branch "
+        return ("branches for this message have failed or handed it back too many times. Do not fork "
                 "for it again: answer the user yourself, briefly saying what could not be done")
     return None
 
@@ -1034,12 +1034,12 @@ def clone_why(inst: TimelineSM, clone: Clone) -> str | None:
         return f"branch ids must be new: {[g for g, _ in clone.pairs]}"
     rule = clone_refusal(inst=inst, grafts=clone.pairs)
     if rule is not None:
-        return f"branching is not possible now: {rule}"
+        return f"forking is not possible now: {rule}"
     blocked = blocked_parts(inst=inst, clone=clone)
     if blocked:
         return "\n- ".join(
             f"branch[{i}]: a branch with skills {sorted(part)} for this message already failed, was stopped, "
-            "or handed it back twice. Do not branch for that part again: leave this entry out and tell "
+            "or handed it back twice. Do not fork for that part again: leave this entry out and tell "
             "the user, briefly, what could not be done" for i, part in blocked)
     return None
 
@@ -1052,9 +1052,9 @@ def may_cancel(inst: TimelineSM, child: str) -> bool:
 def cancel_refusal(inst: TimelineSM, child: str) -> str:
     """Why this id is not cancelled, from the original's own record of the grafts it made."""
     if inst.source_id is not None:
-        return "you stop branches only from the main conversation; a branch never stops another branch"
+        return "you stop branches only from main; a branch never stops another branch"
     if child == inst.timeline_id:
-        return "the main conversation cannot be stopped"
+        return "main cannot be stopped"
     if child not in inst.made:
         return "no such branch"
     if inst.made[child]:
@@ -2256,17 +2256,17 @@ def refuse_clone_call(ctx, inst, event) -> None:
     """A clone call this timeline may not make at all (it is not running): refused, and so are
     the cancel calls carried with it. The caller stores the results."""
     clone: Clone = event.data
-    why = Unwritten(f"branch refused; no branch was started: {inst.timeline_id} is not running a turn that may branch")
+    why = Unwritten(f"fork refused; no branch was started: {inst.timeline_id} is not running a turn that may fork")
     _resolve(reply=clone.reply, value=(None, None, why))
     if clone.cancels is not None:
-        _resolve(reply=clone.cancels.reply, value="the branch call they came with was not run")
+        _resolve(reply=clone.cancels.reply, value="the fork call they came with was not run")
 
 
 def refuse_cancel_call(ctx, inst, event) -> None:
     """A cancel this timeline may not make at all (it is not the original, or not running): every
     id is refused. The caller stores the results."""
     cancel: Cancel = event.data
-    why = ("you stop branches only from the main conversation; a branch never stops another branch" if inst.source_id is not None
+    why = ("you stop branches only from main; a branch never stops another branch" if inst.source_id is not None
            else "you can stop branches only during your own turn, while you hold the conversation")
     _resolve(reply=cancel.reply, value=why)  # a str: every id is refused with it
 
@@ -2488,7 +2488,7 @@ def clone_refusal_not_written(ctx, inst, event) -> None:
     The user is told, and the call's caller, the run, gets that error, so it ends (its closing
     writes the row) instead of calling the model on a view without it."""
     clone, inst.clone = inst.clone, None
-    text = f"branch refused; no branch was started ({described(event.data)})"
+    text = f"fork refused; no branch was started ({described(event.data)})"
     if clone.store:
         inst.unstored[clone.use["id"]] = (text, True)
     inst.close_out = [*inst.close_out, _close_out_of(inst)]  # its audit, left open, is rolled back first
@@ -2521,14 +2521,14 @@ def decline(ctx, inst, event) -> None:
     why, error = inst.declined
     if error is not None:
         raise error
-    inst.rejection = f"branch not executed: {why}"
+    inst.rejection = f"fork not executed: {why}"
 
 
 def decline_failed_step(ctx, inst, event) -> None:
     """The step that brought the call failed: the call is not tried, and its result names the error
     (its rules were not worked out on what the step left)."""
     error = _pending(inst)
-    inst.rejection = f"branch not executed: internal error ({described(error)})"
+    inst.rejection = f"fork not executed: internal error ({described(error)})"
 
 
 def refuse_prepared(ctx, inst, event) -> None:
@@ -2550,7 +2550,7 @@ def take_prepared(ctx, inst, event) -> None:
 
 def preparation_crashed(ctx, inst, event) -> None:
     error = event.data
-    inst.rejection = f"branch refused; no branch was started: internal error ({described(error)})"
+    inst.rejection = f"fork refused; no branch was started: internal error ({described(error)})"
 
 
 def committed(ctx, inst, event) -> None:
@@ -2652,7 +2652,7 @@ def take_hand_over(ctx, inst, event) -> None:
 
 def drop_clone(ctx, inst, event) -> None:
     clone, inst.clone = inst.clone, None
-    _resolve(reply=clone.reply, value=(None, None, "branch not executed: the stop calls beside it could not be recorded"))
+    _resolve(reply=clone.reply, value=(None, None, "fork not executed: the stop calls beside it could not be recorded"))
 
 
 def answer_pending(ctx, inst, event) -> None:  # exit of a run: a request it never answered is refused
@@ -2665,7 +2665,7 @@ def answer_pending(ctx, inst, event) -> None:  # exit of a run: a request it nev
         inst.cut_cancels = [(call, {c: _cut_outcome(inst=inst, child=c, index=index) for c in call.ids})
                             for index, call in enumerate(cancel.calls)]
     if clone is not None:
-        _resolve(reply=clone.reply, value=(None, None, "branch not executed: the turn ended before it ran"))
+        _resolve(reply=clone.reply, value=(None, None, "fork not executed: the turn ended before it ran"))
         if clone.cancels is not None and clone.cancels is not cancel:
             _resolve(reply=clone.cancels.reply, value="the turn ended before the stop ran")
     if cancel is not None:

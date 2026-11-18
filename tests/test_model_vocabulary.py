@@ -37,7 +37,11 @@ from graft.skills import BACKGROUND_INSTRUCTIONS, BUILTIN, CATALOG, CLONE_INSTRU
 
 # Stems, so every inflection is caught (clone, clones, cloned, cloning; join, joins, joined, ...).
 BANNED = re.compile(r"\bclon|\bjoin|\binstances?\b|\bsub-?agents?\b|\bworkers?\b|\bhelpers?\b|\bdelegat"
-                    r"|\bgrafts?\b|\boriginal\b|the assistant will|\bbackground|\bcancel", re.IGNORECASE)
+                    r"|\bgrafts?\b|\boriginal\b|the assistant will|\bbackground|\bcancel"
+                    # `branch` as the tool (the model's tool is `fork`); the noun, a branch, stays
+                    r"|\bbranch\(|`branch`|\"name\": \"branch\"|\bbranch(?:ed|ing)\b"
+                    r"|\b(?:call|may|you|not|to) branch\b|\bbranch (?:again|calls?|refused|not executed|once more|on its own)\b",
+                    re.IGNORECASE)
 REQUEST = "Build a website and a slide deck for the dental practice."
 GATE_TIMEOUT = 10
 
@@ -116,11 +120,11 @@ def check(found: list[tuple[str, str]]):
 # ------------------------------------------------------------------ the text itself
 def test_the_built_in_skills_and_tools_say_branch_and_merge():
     names = {s.name for s in CATALOG}
-    assert {"branch", "merge", "detached"} <= names and not {"clone", "join"} & names
-    assert set(BUILTIN) == {"branch", "merge", "detached"}
+    assert {"fork", "merge", "detached"} <= names and not {"clone", "join"} & names
+    assert set(BUILTIN) == {"fork", "merge", "detached"}
     tools = {t["name"] for s in CATALOG for t in s.tools}
-    assert {"branch", "merge", "stop", "load_skill"} <= tools and not {"clone", "join"} & tools
-    branch_tool = next(t for s in CATALOG for t in s.tools if t["name"] == "branch")
+    assert {"fork", "merge", "stop", "load_skill"} <= tools and not {"clone", "join"} & tools
+    branch_tool = next(t for s in CATALOG for t in s.tools if t["name"] == "fork")
     assert set(branch_tool["input_schema"]["properties"]) == {"branch"}
     merge_tool = next(t for s in CATALOG for t in s.tools if t["name"] == "merge")
     assert merge_tool["input_schema"]["properties"]["reason"]["enum"] == ["done", "out_of_scope", "failed"]
@@ -130,7 +134,7 @@ def test_the_built_in_skills_and_tools_say_branch_and_merge():
     assert "in a branch of yourself" in focus and "in a detached branch of yourself" in background
     assert "other branches of yourself" in focus and "other branches of yourself" in background
     assert "what you will remember of this work when the branch merges" in background
-    assert "branching yourself: a branch is you" in original and "in the first person" in original
+    assert "forking yourself: each branch you fork is you" in original and "in the first person" in original
 
 
 @pytest.mark.parametrize("cap", [1, 4, 7])
@@ -157,9 +161,10 @@ def test_the_banned_words_are_caught():
     """The check itself: each word the framing rules out is caught, in any inflection."""
     for t in ("a clone", "Cloned ->", "joined", "join(reason", "another instance", "the subagent",
               "a sub-agent", "workers", "a helper", "delegates", "the assistant will remember", "a graft",
-              "background grafts", "the original", "cancel", "Cancelled", "a background branch", "cancelling"):
+              "background grafts", "the original", "cancel", "Cancelled", "a background branch", "cancelling", "call branch", "branch(branch=", "`branch`", "branched ->", "branch refused",
+              "you branch only", "no branch calls left", "branching is not possible"):
         assert banned(t), t
-    for t in ("your branch c2 merged", "stop", "a detached branch", "the current branch", "out_of_scope", "the same assistant", "rejoice", "grafted",
+    for t in ("your branch c2 merged", "stop", "a detached branch", "fork", "forked ->", "each branch you fork", "a branch never stops another branch", "the current branch", "out_of_scope", "the same assistant", "rejoice", "grafted",
               "originally"):
         assert not banned(t), t
 
@@ -176,21 +181,21 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = last_block(messages)
-        if "branch" in names:
+        if "fork" in names:
             if last["type"] == "text" and not last.get("harness") and last["text"] == REQUEST:
-                return [use(tool="branch", use_id="b1", branch=[
-                            entry(skills=["merge"], focus=False), entry(skills=["branch"], focus=False), {"purpose": "p", "skills": ["website"]},
+                return [use(tool="fork", use_id="b1", branch=[
+                            entry(skills=["merge"], focus=False), entry(skills=["fork"], focus=False), {"purpose": "p", "skills": ["website"]},
                             entry(skills=["slides"], focus=False, quotes=("no such words anywhere",), seed_row_ids=[999])]),
                         use(tool="load_skill", use_id="l1", name="website")]
             if last["type"] == "tool_result" and "b1" == last["tool_use_id"]:
-                return [use(tool="branch", use_id="b2", branch=[entry(skills=["website"], focus=False), entry(skills=["slides"], focus=False)])]
+                return [use(tool="fork", use_id="b2", branch=[entry(skills=["website"], focus=False), entry(skills=["slides"], focus=False)])]
             if last["type"] == "text" and not last.get("harness") and last["text"] == "Stop the slides.":
                 return [use(tool="stop", use_id="x1", ids=["c2", "c9", "o", 5])]
             if last["type"] == "tool_result" and last["tool_use_id"] == "x1":
                 website_gate.set()
                 return text("Okay.")
             if last["type"] == "text" and last.get("harness") and "c2 (stopped)" in last["text"]:
-                return [use(tool="branch", use_id="b3", branch=[entry(skills=["slides"], focus=False, quotes=("Stop the slides.",))])]
+                return [use(tool="fork", use_id="b3", branch=[entry(skills=["slides"], focus=False, quotes=("Stop the slides.",))])]
             return text("Okay.")
         if "site_write" in names:
             if not any(b["type"] == "tool_result" for m in messages for b in m["content"]):
@@ -214,9 +219,9 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
     asyncio.run(go())
     assert ("website", True) in waits and all(released for _, released in waits), waits
     results = [t for w, t in rec.seen if w == "result"]
-    assert any(t.startswith("branch refused") and "'merge' is linked by the harness" in t
-               and "'branch' cannot be held by a branch" in t for t in results), results
-    assert any(t.startswith("branched -> ") for t in results), results
+    assert any(t.startswith("fork refused") and "'merge' is linked by the harness" in t
+               and "'fork' cannot be held by a branch" in t for t in results), results
+    assert any(t.startswith("forked -> ") for t in results), results
     cancel = sorted({t for t in results if t.startswith("stopped -> ")})  # seen once per later model call
     assert len(cancel) == 1 and cancel[0].startswith("stopped -> c2 (what you did in it"), results
     assert "c9: not stopped: no such branch" in cancel[0] and "o: not stopped:" in cancel[0], cancel
@@ -235,11 +240,11 @@ def test_focus_hand_back_and_failure_say_branch_and_merge(tmp_path):
         names = {t["name"] for t in tools}
         last = last_block(messages)
         user = last["type"] == "text" and not last.get("harness")
-        if "branch" in names:
+        if "fork" in names:
             if user and last["text"] == "Build me a website.":
-                return [use(tool="branch", use_id="f1", branch=[entry(skills=["website"], focus=True, quotes=("Build me a website.",))])]
+                return [use(tool="fork", use_id="f1", branch=[entry(skills=["website"], focus=True, quotes=("Build me a website.",))])]
             if user and last["text"] == "Make slides.":
-                return [use(tool="branch", use_id="f2", branch=[entry(skills=["slides"], focus=True, quotes=("Make slides.",))])]
+                return [use(tool="fork", use_id="f2", branch=[entry(skills=["slides"], focus=True, quotes=("Make slides.",))])]
             return text("Okay.")
         if "site_write" in names:
             if user and last["text"] == "Build me a website.":
@@ -269,14 +274,14 @@ def test_caps_and_spent_calls_say_branch(tmp_path):
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = last_block(messages)
-        if "branch" in names:
+        if "fork" in names:
             n = sum(1 for m in messages for b in m["content"] if b["type"] == "tool_result")
             if n == 0:
-                return [use(tool="branch", use_id="k1", branch=[entry(skills=["website"], focus=False), entry(skills=["slides"], focus=False)])]
+                return [use(tool="fork", use_id="k1", branch=[entry(skills=["website"], focus=False), entry(skills=["slides"], focus=False)])]
             if n == 1:
-                return [use(tool="branch", use_id="k2", branch=[entry(skills=["website"], focus=False)] * 5)]
+                return [use(tool="fork", use_id="k2", branch=[entry(skills=["website"], focus=False)] * 5)]
             if n == 2:
-                return [use(tool="branch", use_id="k3", branch=[entry(skills=["website"], focus=False)])]
+                return [use(tool="fork", use_id="k3", branch=[entry(skills=["website"], focus=False)])]
             return text("Okay.")
         return text("Done here.")
 
@@ -291,8 +296,8 @@ def test_caps_and_spent_calls_say_branch(tmp_path):
     asyncio.run(go())
     results = [t for w, t in rec.seen if w == "result"]
     assert any("at most 1 detached branches may be live" in t for t in results), results
-    assert any("a branch call takes at most 4 entries" in t for t in results), results
-    assert any("no branch calls left" in t for t in results), results
+    assert any("a fork call takes at most 4 entries" in t for t in results), results
+    assert any("no fork calls left" in t for t in results), results
     check(rec.seen + store_texts(store))
 
 
@@ -300,11 +305,11 @@ def test_the_per_message_cap_says_branch(tmp_path):
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = last_block(messages)
-        if "branch" in names:
+        if "fork" in names:
             if last["type"] == "tool_result" and ("not executed" in str(last["content"])
-                                                  or "branch refused" in str(last["content"])):
+                                                  or "fork refused" in str(last["content"])):
                 return text("Okay.")
-            return [use(tool="branch", use_id=f"p{len(messages)}", branch=[entry(skills=["website"], focus=False)])]
+            return [use(tool="fork", use_id=f"p{len(messages)}", branch=[entry(skills=["website"], focus=False)])]
         return text("Site finished.")
 
     store, h, rec = make(tmp_path=tmp_path, policy=policy, name="d")
@@ -329,7 +334,7 @@ def test_a_merge_too_large_for_the_context_says_branch(tmp_path):
         await h.start()
         store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
         store.add_turn(tl="o", role="assistant", kind="text", content="Started.")
-        (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "branch",
+        (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork",
                                                  "input": {"branch": [entry(skills=["website"], focus=False)]}})
         store.add_turn(tl=c1, role="assistant", kind="text", content="Site built. " + "x" * 4000)
         await h.do_join(child=c1, reason="done")
@@ -349,9 +354,9 @@ def test_the_old_tool_names_run_nothing(tmp_path):
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = last_block(messages)
-        if "branch" in names:
+        if "fork" in names:
             if last["type"] == "tool_result" and last["tool_use_id"] == "old":
-                return [use(tool="branch", use_id="new", branch=[entry(skills=["website"], focus=True,
+                return [use(tool="fork", use_id="new", branch=[entry(skills=["website"], focus=True,
                                                                      quotes=("Build me a website.",))])]
             if last["type"] == "tool_result":
                 return text("Okay.")
@@ -401,7 +406,7 @@ def test_a_merge_whose_view_would_be_invalid_says_branch(tmp_path, monkeypatch):
         await h.start()
         store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
         store.add_turn(tl="o", role="assistant", kind="text", content="Started.")
-        (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "branch",
+        (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork",
                                                  "input": {"branch": [entry(skills=["website"], focus=False)]}})
         store.add_turn(tl=c1, role="assistant", kind="text", content="Site built.")
         monkeypatch.setattr(harness_mod, "validate", failing)
@@ -533,7 +538,7 @@ def test_the_merge_record_of_a_branch_that_wrote_nothing_and_plural_stops_say_br
         await h.start()
         store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
         store.add_turn(tl="o", role="assistant", kind="text", content="Started.")
-        (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "branch",
+        (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork",
                                                  "input": {"branch": [entry(skills=["website"], focus=False)]}})
         await h.do_join(child=c1, reason="done")  # it wrote nothing
         await h.drain_and_wake("o")

@@ -54,8 +54,8 @@ def test_the_default_cap_still_refuses_a_fifth_live_background_graft(tmp_path):
 
 def test_the_default_cap_leaves_the_clone_skill_and_cancel_tool_bytes_as_they_were(tmp_path):
     store, _ = make(tmp_path=tmp_path)
-    clone = next(s for s in CATALOG if s.name == "branch")
-    row = store.con.execute("SELECT instructions FROM skills WHERE name='branch'").fetchone()[0]
+    clone = next(s for s in CATALOG if s.name == "fork")
+    row = store.con.execute("SELECT instructions FROM skills WHERE name='fork'").fetchone()[0]
     assert row == CLONE_INSTRUCTIONS == clone.instructions
     assert "At most four detached branches of yours may be live at a time." in row
     assert stored_cancel(store) == {**CANCEL_TOOL["input_schema"], "description": CANCEL_TOOL["description"]}
@@ -68,7 +68,7 @@ def stored_cancel(store):
 
 def test_a_configured_cap_is_said_in_the_clone_skill_and_bounds_the_cancel_call(tmp_path):
     store, h = make(tmp_path=tmp_path, cap=5)
-    row = store.con.execute("SELECT instructions FROM skills WHERE name='branch'").fetchone()[0]
+    row = store.con.execute("SELECT instructions FROM skills WHERE name='fork'").fetchone()[0]
     assert "At most 5 detached branches of yours may be live at a time" in row and "At most four" not in row
     ids = [f"c{i}" for i in range(1, 12)]
     assert cancel_ids({"ids": ids[:10]}, limit=10)[1] == []

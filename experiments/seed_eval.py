@@ -202,7 +202,7 @@ LUNA_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["ro
                                                        "confidence": {"type": "number"}}}}}}
 # The alternative selectors below (luna, needle, ...) are eval-only and keep the prompts the committed
 # results in experiments/results/ were made with; NOUL_TRUE, NOUL_FALSE and the question above match
-# graft/seeder.py, which the harness uses, and say "branch" as the model is told it.
+# graft/seeder.py, which the harness uses, and say "fork" as the model is told it.
 LUNA_SYSTEM = ("You choose which messages of a conversation a focused clone needs for its new task. The "
                "clone sees only the messages you choose. It needs every message that carries facts, names, "
                "numbers, requirements or preferences the task should use, and the request for the task. "

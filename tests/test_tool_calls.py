@@ -68,7 +68,7 @@ def test_a_tool_that_awaits_another_clones_tool_lets_both_run_and_finish(tmp_pat
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
-        if "branch" in names:
+        if "fork" in names:
             return original(last, messages)
         if last["type"] == "tool_result":
             return text("done")
@@ -119,7 +119,7 @@ def graft_writes(original):
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
-        if "branch" in names:
+        if "fork" in names:
             return original(last, messages)
         if last["type"] == "tool_result":
             return text("done")
@@ -200,7 +200,7 @@ def test_a_turns_awaited_tool_calls_run_one_at_a_time_and_are_stored_in_call_ord
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
-        if "branch" in names:
+        if "fork" in names:
             return original(last, messages)
         if last["type"] == "tool_result":
             return text("done")
@@ -560,7 +560,7 @@ def test_a_graft_whose_tool_awaits_work_a_cancelled_sibling_shared_goes_on(tmp_p
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
-        if "branch" in names:
+        if "fork" in names:
             return original(last, messages)
         if last["type"] == "tool_result":
             return text("done")
@@ -750,7 +750,7 @@ def test_a_withdrawal_stops_several_background_grafts_whose_tools_await(tmp_path
     def policy(system, messages, tool_list):
         names = {t["name"] for t in tool_list}
         last = messages[-1]["content"][-1]
-        if "branch" in names:
+        if "fork" in names:
             if last["type"] == "tool_result":
                 assert gate.wait(WAIT_TIMEOUT)
                 return text("Started.")
@@ -862,7 +862,7 @@ def test_a_tool_that_raises_a_base_exception_ends_as_run_with_an_error(tmp_path)
 
 def test_a_run_whose_model_call_raises_a_base_exception_fails_and_does_not_wedge(tmp_path):
     def policy(system, messages, tools):
-        if "branch" in {t["name"] for t in tools}:
+        if "fork" in {t["name"] for t in tools}:
             return background_original([clone_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
                                                                                          messages)
         raise Abort("provider abort")
@@ -912,7 +912,7 @@ def test_a_withdrawal_stops_every_waiting_graft_even_when_one_stop_fails_once(tm
     def policy(system, messages, tool_list):
         names = {t["name"] for t in tool_list}
         last = messages[-1]["content"][-1]
-        if "branch" in names:
+        if "fork" in names:
             if last["type"] == "tool_result":
                 assert gate.wait(WAIT_TIMEOUT)
                 return text("Started.")
@@ -1048,7 +1048,7 @@ def withdraw_three(tmp_path, monkeypatch, failing):
     def policy(system, messages, tool_list):
         names = {t["name"] for t in tool_list}
         last = messages[-1]["content"][-1]
-        if "branch" in names:
+        if "fork" in names:
             if last["type"] == "tool_result":
                 assert gate.wait(WAIT_TIMEOUT)
                 return text("Started.")
@@ -1217,7 +1217,7 @@ def test_a_model_call_raising_a_stop_iteration_with_a_bad_message_fails_its_run_
     """The worker thread delivers an outcome whatever its call raises, so with no call timeout
     (call_timeout=None) nothing waits for ever."""
     def policy(system, messages, tools):
-        if "branch" in {t["name"] for t in tools}:
+        if "fork" in {t["name"] for t in tools}:
             return background_original([clone_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
                                                                                          messages)
         raise BadStop()
@@ -1268,7 +1268,7 @@ def test_a_seeder_that_raises_a_base_exception_refuses_the_clone_call_and_leaves
 # ------------------------------------------------------------------ a CancelledError is a leaving only when the state is left
 def test_a_background_model_call_that_raises_cancelled_error_fails_its_run(tmp_path):
     def policy(system, messages, tools):
-        if "branch" in {t["name"] for t in tools}:
+        if "fork" in {t["name"] for t in tools}:
             return background_original([clone_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
                                                                                          messages)
         raise asyncio.CancelledError()  # a provider SDK's own cancellation surfacing

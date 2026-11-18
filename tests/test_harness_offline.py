@@ -15,7 +15,7 @@ from graft.skills import install
 
 def clone_use(skills, focus=True, id="t", **seed):
     """A branch call (graft's clone call) with one entry."""
-    return {"id": id, "name": "branch",
+    return {"id": id, "name": "fork",
             "input": {"branch": [{"purpose": "p", "skills": skills, "focus": focus, **seed}]}}
 
 
@@ -59,7 +59,7 @@ def test_pivot_flow_offline(harness):
     # the clone only had its linked tools
     c2_tools = {c["tools"][i]["name"] for c in h.provider.calls if "slides_create" in str(c["tools"])
                 for i in range(len(c["tools"]))}
-    assert "site_write" not in c2_tools and "branch" not in c2_tools
+    assert "site_write" not in c2_tools and "fork" not in c2_tools
 
 
 def test_one_shot_clone_refused_with_violations_then_retry(harness):
@@ -70,8 +70,8 @@ def test_one_shot_clone_refused_with_violations_then_retry(harness):
         s = h.store
         s.add_turn("o", "user", "text", "hello")
         s.add_turn("o", "assistant", "text", "hi")
-        use = {"id": "t1", "name": "branch", "input": {"branch": [{
-            "purpose": "p", "skills": ["branch"], "focus": True, "seed_quotes": ["hello", "hi", "nope"]}]}}
+        use = {"id": "t1", "name": "fork", "input": {"branch": [{
+            "purpose": "p", "skills": ["fork"], "focus": True, "seed_quotes": ["hello", "hi", "nope"]}]}}
         child, text = await clone_in_turn(h=h, use=use)
         assert child is None
         assert "cannot be held by a branch" in text and "matches no message" in text
@@ -178,8 +178,8 @@ def test_silent_done_is_refused_until_the_clone_replies(tmp_path):
         await h.start()
         seed = store.add_turn("o", "user", "text", "Make a deck.")
         (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["slides"], seed_row_ids=[seed]))
-        store.add_turn(tl="o", role="assistant", kind="tool_use", content={"id": "t", "input": {}}, tool_name="branch")
-        store.add_turn(tl="o", role="user", kind="tool_result", content={"tool_use_id": "t", "content": "branched"}, tool_name="branch")
+        store.add_turn(tl="o", role="assistant", kind="tool_use", content={"id": "t", "input": {}}, tool_name="fork")
+        store.add_turn(tl="o", role="user", kind="tool_result", content={"tool_use_id": "t", "content": "branched"}, tool_name="fork")
         await h.run(child)
         assert h.silent_done_refusals == [child]
         refusal = [r for r in store.view(child) if r["kind"] == "tool_result"][0]
@@ -193,24 +193,24 @@ def test_silent_done_is_refused_until_the_clone_replies(tmp_path):
 
 def test_clone_skill_has_only_load_skill_clone_and_cancel(harness):
     s = harness.store
-    s.create_timeline(tl="o", source=None, skills=["branch"])
-    assert [t["name"] for t in s.tools_for("o")] == ["load_skill", "branch", "stop"]
+    s.create_timeline(tl="o", source=None, skills=["fork"])
+    assert [t["name"] for t in s.tools_for("o")] == ["load_skill", "fork", "stop"]
 
 
 def test_clone_is_never_linked_to_a_clone(harness):
     s = harness.store
-    s.create_timeline(tl="o", source=None, skills=["branch"])
+    s.create_timeline(tl="o", source=None, skills=["fork"])
     assert check_skill_link(s, "o", ["slides"]) == []
-    assert any("cannot be held by a branch" in v for v in check_skill_link(store=s, source="o", skills=["branch", "slides"]))
+    assert any("cannot be held by a branch" in v for v in check_skill_link(store=s, source="o", skills=["fork", "slides"]))
 
 
 def test_progressive_disclosure_system_prompt(harness):
     s = harness.store
-    s.create_timeline(tl="o", source=None, skills=["branch"])
+    s.create_timeline(tl="o", source=None, skills=["fork"])
     rid = s.add_turn("o", "user", "text", "x")
     s.commit_clone(source="o", grafts=[Graft(child="c1", seed=[rid], skills=["website", "merge"], focus=True)])
     sys_o, sys_c = harness.system("o"), harness.system("c1")
-    for name in ("branch", "merge", "website", "slides"):
+    for name in ("fork", "merge", "website", "slides"):
         instr = s.con.execute("SELECT instructions FROM skills WHERE name=?", (name,)).fetchone()[0]
         assert instr not in sys_o and instr not in sys_c
     assert "website: Build and edit a small website" in sys_c  # name + description only
@@ -223,7 +223,7 @@ def test_progressive_disclosure_system_prompt(harness):
 def test_load_skill_scoped_to_linked_skills(harness):
     h = harness
     s = h.store
-    s.create_timeline(tl="o", source=None, skills=["branch"])
+    s.create_timeline(tl="o", source=None, skills=["fork"])
     rid = s.add_turn("o", "user", "text", "x")
     s.commit_clone(source="o", grafts=[Graft(child="c1", seed=[rid], skills=["website", "merge"], focus=True)])
     content, err = h.load("c1", "website")
@@ -232,7 +232,7 @@ def test_load_skill_scoped_to_linked_skills(harness):
     assert err and "not linked" in content
     content, err = h.load("o", "website")  # the original holds only clone
     assert err and "not linked" in content
-    assert not h.load(tl="o", name="branch")[1]
+    assert not h.load(tl="o", name="fork")[1]
 
 
 def test_load_skill_result_is_an_ordinary_row(tmp_path):
@@ -335,11 +335,11 @@ def _always_fails_policy(system, messages, tools):
     loops on a tool until its step budget runs out (join failed)."""
     names = {t["name"] for t in tools}
     last = messages[-1]["content"]
-    if "branch" in names:
+    if "fork" in names:
         if any(b["type"] == "tool_result" and "already failed" in str(b["content"]) for b in last):
             return [{"type": "text", "text": "Sorry, I could not build that."}]
         user = [b["text"] for m in messages if m["role"] == "user" for b in m["content"] if b["type"] == "text"][-1]
-        return [{"type": "tool_use", "id": f"c{len(messages)}", "name": "branch",
+        return [{"type": "tool_use", "id": f"c{len(messages)}", "name": "fork",
                  "input": {"branch": [{"purpose": "p", "skills": ["website"], "focus": True, "seed_quotes": [user]}]}}]
     return [{"type": "tool_use", "id": f"r{len(messages)}", "name": "site_read", "input": {"page": "home"}}]
 
@@ -374,8 +374,8 @@ def test_a_request_that_bounces_back_twice_is_not_recloned(harness):
         s.add_turn(c1, "assistant", "text", "Hm.")  # then the same request comes back, unhandled
         h.provider.policy = lambda *a: [{"type": "text", "text": "I could not do that."}]
         await h.do_join(child=c1, reason="out_of_scope")  # the first arrival: the source answers the request itself
-        s.add_turn(tl="o", role="assistant", kind="tool_use", content={"id": "b", "input": {}}, tool_name="branch")
-        s.add_turn(tl="o", role="user", kind="tool_result", content={"tool_use_id": "b", "content": "ok"}, tool_name="branch")
+        s.add_turn(tl="o", role="assistant", kind="tool_use", content={"id": "b", "input": {}}, tool_name="fork")
+        s.add_turn(tl="o", role="user", kind="tool_result", content={"tool_use_id": "b", "content": "ok"}, tool_name="fork")
         # after one arrival the part may be cloned for again
         (c2,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"], seed_row_ids=[trig], id="b"))
         await h.do_join(c2, "out_of_scope")  # the same request comes back a second time

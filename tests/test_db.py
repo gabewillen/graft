@@ -11,7 +11,7 @@ from graft.skills import install
 def store(tmp_path):
     s = Store(str(tmp_path / "t.db"))
     install(s)
-    s.create_timeline(tl="o", source=None, skills=["branch"])
+    s.create_timeline(tl="o", source=None, skills=["fork"])
     return s
 
 

@@ -126,7 +126,7 @@ def build_history(store: Store, tl: str) -> None:
 def build(path: str, provider):
     store = Store(path)
     install(store)
-    store.create_timeline(tl="o", source=None, skills=["branch"])
+    store.create_timeline(tl="o", source=None, skills=["fork"])
     build_history(store, "o")
     task_row = store.add_turn("o", "user", "text", TASK)
     # clone arm: graft clone seeded only with the task-relevant user row
