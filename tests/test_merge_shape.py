@@ -229,3 +229,22 @@ def test_an_entry_with_no_messages_and_no_reason_is_refused_in_the_model_loop(tm
     run(h, REQUEST)
     assert results and "current: give it messages, a reason, or both" in results[0]
     assert store.con.execute("SELECT count(*) FROM timelines WHERE source_id IS NOT NULL").fetchone()[0] == 0
+
+
+def test_main_text_beside_its_fork_call_is_no_reply_of_the_branch(tmp_path):
+    """The branch's view holds main's fork turn, text and all; only the branch's own text is a reply
+    to the user, so a current branch that merges without one hands the request back."""
+    script = Script(entry=SITE, branch=lambda m: [{"type": "tool_use", "id": "m1", "name": "merge", "input": {}}],
+                    after=lambda m: text("Let me handle that here."))
+    real = script.__call__
+
+    def with_text(system, messages, tools):
+        blocks = real(system, messages, tools)
+        if any(b.get("name") == "fork" for b in blocks if isinstance(b, dict)):
+            return text("On it.") + blocks
+        return blocks
+
+    store, h, said = make(tmp_path, with_text)
+    run(h, REQUEST)
+    assert store.timeline("c1")["join_reason"] == "out_of_scope"
+    assert merge_results(store)[0].startswith("site merged without answering the user's last message")

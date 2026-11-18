@@ -1268,8 +1268,8 @@ class Harness:
         for r in self.store.working_view(tl):
             if r["role"] == "user" and seeder_mod.is_candidate(r):
                 answered = False
-            elif r["role"] == "assistant" and r["kind"] == "text":
-                answered = True
+            elif r["role"] == "assistant" and r["kind"] == "text" and r["owner_timeline"] == tl:
+                answered = True  # its own text: its source's fork turn, in its view, is no reply of its
         return answered
 
     def compute_trigger(self, child: str, reason: str) -> int | None:
@@ -1282,7 +1282,7 @@ class Harness:
         for r in rows:
             if r["role"] == "user" and seeder_mod.is_candidate(r):
                 last_user, answered = r["row_id"], False
-            elif r["role"] == "assistant" and r["kind"] == "text":
+            elif r["role"] == "assistant" and r["kind"] == "text" and r["owner_timeline"] == child:
                 answered = True
         if last_user is None:
             return None
