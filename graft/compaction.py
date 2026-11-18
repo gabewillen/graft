@@ -91,8 +91,8 @@ EXTRACT_INSTRUCTION = (
     "redundant rows (tool noise, superseded drafts, chit-chat). Keep every fact, requirement and "
     "preference the user gave and the results of work you still need.\n"
     "Windows and kept rows may not overlap or skip rows. A kept tool_use row needs its kept "
-    "tool_result row (or put both inside one window). The result, followed by the user's latest "
-    "message (kept automatically), must start with a user turn.")
+    "tool_result row (or put both inside one window). The result is followed by the user's latest "
+    "message (kept automatically).")
 
 
 WITHDRAWN_INDEX = " (withdrawn by the user: not a request; keep this row)"
