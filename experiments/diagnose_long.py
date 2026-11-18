@@ -59,7 +59,7 @@ def diagnose(path: str) -> dict:
     deck = deck_rows(s, sl)
     seed = [r for r in s.view(sl) if r["owner_timeline"] != sl]
     first_sl_row = min((r["row_id"] for r in s.view(sl) if r["owner_timeline"] == sl), default=10 ** 9)
-    # harness notes (join records index row snippets) are not seedable carriers of a fact
+    # harness rows (merge results, notes) are not seedable carriers of a fact
     o_wv = [r for r in s.working_view("o") if r["row_id"] < first_sl_row
             and not r["harness"]]
     joined = [r for r in s.view("o") if r["owner_timeline"] in web]

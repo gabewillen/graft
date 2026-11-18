@@ -362,9 +362,10 @@ class Store:
                 self.create_timeline(g.child, source, g.skills,
                                      status="active" if g.focus else "background", name=g.name)
                 for rid in [*g.seed, *g.turn]:
-                    self.append(g.child, rid)
+                    self.append(tl=g.child, row_id=rid)
                 if g.result is not None:
-                    self.add_turn(g.child, "user", "tool_result", g.result, tool_name="fork", harness=True)
+                    self.add_turn(tl=g.child, role="user", kind="tool_result", content=g.result, tool_name="fork",
+                                  harness=True)
             for tx, sql, scratch in audits:
                 self.end_tx(tx, status="committed", committed_sql=sql, scratch=scratch)
             self.con.execute("COMMIT")
@@ -385,24 +386,27 @@ class Store:
         were skipped, a note instead of both (`note`), the trigger pointer, and the outcome of the
         join's audit record `tx`. All of it or none of it, so a join that failed halfway leaves
         nothing and can be retried. Returns the merge result's (or the note's) row id."""
+        if (note is None) == (result is None) or (result is not None and merge is None and implicit is None):
+            raise ValueError("a join appends a note, or a merge result with a merge call (its own or the harness's)")
         self.con.execute("BEGIN")
         try:
             for tl, tool_name, block in closing:
-                self.add_turn(tl, "user", "tool_result", block, tool_name=tool_name)
+                self.add_turn(tl=tl, role="user", kind="tool_result", content=block, tool_name=tool_name)
             if implicit is not None:
-                written = self.add_turn(child, "assistant", "tool_use", implicit["use"], tool_name="merge", harness=True)
-                self.add_turn(child, "user", "tool_result", implicit["result"], tool_name="merge", harness=True)
+                written = self.add_turn(tl=child, role="assistant", kind="tool_use", content=implicit["use"],
+                                        tool_name="merge", harness=True)
+                self.add_turn(tl=child, role="user", kind="tool_result", content=implicit["result"], tool_name="merge",
+                              harness=True)
                 merge = written if merge is None else merge
-            rec = None
             if note is not None:
-                rec = self.add_turn(source, "user", "text", note, harness=True)
+                rec = self.add_turn(tl=source, role="user", kind="text", content=note, harness=True)
             else:
-                for rid in rows:
-                    self.append(source, rid)
-                self.append(source, merge)
-                rec = self.add_turn(source, "user", "tool_result", result, tool_name="merge", harness=True)
+                for rid in [*rows, merge]:
+                    self.append(tl=source, row_id=rid)
+                rec = self.add_turn(tl=source, role="user", kind="tool_result", content=result, tool_name="merge",
+                                    harness=True)
             if trigger is not None:
-                self.append(source, trigger)
+                self.append(tl=source, row_id=trigger)
             self.end_tx(tx, status=status, committed_sql=committed_sql, scratch=scratch)
             self.con.execute("COMMIT")
             return rec

@@ -49,7 +49,7 @@ class Meeting(World):
 
 def background_original(entries):
     """An original that clones `entries` in the background, says "Started." after the clone
-    result, reports on a wake note, and cancels c1 when the user says STOP."""
+    result, reports on a merge result, and cancels c1 when the user says STOP."""
     def respond(last, messages):
         if ran(last):
             return text("Stopped." if last["tool_use_id"].startswith("x") else "Started.")

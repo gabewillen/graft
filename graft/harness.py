@@ -34,8 +34,8 @@ Every turn of a graft ends in its join: its `merge` call (`merge(reason?)`, the 
 words, never read here), or, when the turn ends without one, the harness's argument-less `merge()`
 written into its timeline in the join's transaction. Join is deterministic (no model call): the
 harness appends pointers to the text rows of the clone's working view that the source lacks, then
-to its merge call, then the source's own merge result (what the join record and wake note used to
-say). Every join is a queue entry on the original's
+to its merge call, then the source's own merge result (which branch merged, which are still
+running, and to go on or end the turn). Every join is a queue entry on the original's
 machine, applied only when the original holds the conversation and is at rest: before a new user
 message (which waits on the machine meanwhile), at the end of a run, when a graft finishes while
 the original is idle, and, when a focus graft joins back, behind the background joins that were
@@ -106,6 +106,9 @@ def new_names(rng: random.Random | None = None) -> Callable[[], str]:
 ERROR_CHARS = 200  # characters of a tool's own error shown in its result
 ECHO_CHARS = 24  # characters of a malformed model-written value shown back, as a repr
 INDEX_CHARS = 100  # characters of each message shown in a refused fork call's list of messages
+INDEX_ROWS = 40  # messages shown in that list: the latest ones, with a count of the rest
+REASON_CHARS = 2000  # the longest `reason` a fork entry or a merge call may give
+MATCH_ROWS = 5  # row ids a quote that matches several messages lists
 
 
 class NotRun(str):
@@ -149,27 +152,40 @@ WITHDRAWN_SEED = "row {row} is a message the user withdrew; it is not a request 
 MERGED = "merged"  # a merge call's result in the branch's own timeline
 
 
+def merge_input_problem(args: object) -> str | None:
+    """Why a merge call's input is not the one main reads, or None: it is `{}` or `{"reason":
+    <a string of at most REASON_CHARS characters>}` and nothing else (model-written: nothing about
+    it is assumed, and main reads it whole)."""
+    if isinstance(args, dict) and set(args) <= {"reason"} and (
+            "reason" not in args or (isinstance(args["reason"], str) and len(args["reason"]) <= REASON_CHARS)):
+        return None
+    return (f"merged without your reason: merge takes only an optional `reason`, a string of at most "
+            f"{REASON_CHARS} characters")
+
+
 def merge_result(*, name: str, reason: str, focus: bool, ran: list[str], dropped: str | None,
                  running: str, empty: bool = False) -> str:
-    """Main's result of a branch's merge call (the one place it is worded): what the join record
-    and the wake note used to say. `reason` is graft's own and never said; `ran`: the tools a stopped
-    branch had run; `dropped`: what the size fit left out, if anything; `running`: the still-running
-    sentence; `empty`: no messages of the branch's are above (it brought none main lacks, or the
-    size fit left them all out). It forbids nothing: main may
-    fork for what is still to do, or end its turn."""
+    """Main's result of a branch's merge call (the one place it is worded): which branch merged,
+    whether the user already saw its replies, which branches are still running, for a stopped
+    branch the tools it had run, and to go on or end the turn. `reason` is graft's own and never
+    said; `ran`: the tools a stopped branch had run; `dropped`: what the size fit left out, if
+    anything; `running`: the still-running sentence; `empty`: no messages of the branch's are above
+    (it brought none main lacks, or the size fit left them all out), so no head points at them. It
+    forbids nothing: main may fork for what is still to do, or end its turn."""
+    above = "" if empty else " above"
     if reason == CANCELLED:
         head = (f"{name} was stopped before it finished. Before it was stopped you had run there: "
                 f"{', '.join(ran) if ran else 'no tools'}. Nothing you did there outside this conversation was "
                 "undone; a tool that returned an error may still have acted before it failed. Tell the user it "
                 "was stopped and what you had already done there.")
     elif reason == "failed":
-        head = (f"{name} merged after it failed: what you did there before it failed is in the messages "
-                "above. Tell the user, in your own words, what happened.")
+        head = (f"{name} merged after it failed" + ("." if empty else ": what you did there before it failed is "
+                "in the messages above.") + " Tell the user, in your own words, what happened.")
     elif reason == "out_of_scope":
         head = (f"{name} merged without answering the user's last message: that message is yours to "
                 "answer now (answer it here, or fork for it).")
     elif focus:
-        head = f"{name} merged. Its replies above already reached the user: do not repeat them."
+        head = f"{name} merged. Its replies{above} already reached the user: do not repeat them."
     elif empty and dropped:
         head = f"{name} merged."
     elif empty:
@@ -209,7 +225,7 @@ def check_skill_link(store: Store, source: str, skills: list[str]) -> list[str]:
         v.append("select at least one skill")
     for s in skills:
         if s not in known:
-            v.append(f"unknown skill '{s}'")
+            v.append(f"unknown skill {_echo(s)}")
         elif s in ("merge", "detached"):
             v.append(f"'{s}' is linked by the harness (merge to a current branch, detached to a "
                      "detached branch); do not select it")
@@ -279,11 +295,14 @@ def _entry(e: object, label: str, focus: bool, v: list[str]) -> CloneEntry | Non
     skills = _strings(e, name="skills", label=label, violations=v)
     repeated = sorted({k for k in skills if skills.count(k) > 1})
     if repeated:
-        v.append(f"{label}: skills lists {repeated} more than once")
+        v.append(f"{label}: skills lists {', '.join(map(_echo, repeated))} more than once")
     messages = _messages(e, label=label, v=v)
     reason = e.get("reason")
     if reason is not None and not isinstance(reason, str):
         v.append(f"{label}: reason must be a string (your own words for what this branch is for)")
+        reason = None
+    if reason is not None and len(reason) > REASON_CHARS:
+        v.append(f"{label}: reason is {len(reason)} characters long; give at most {REASON_CHARS}")
         reason = None
     reason = reason if reason and reason.strip() else None
     if "messages" in e and isinstance(e.get("messages"), list) and not e["messages"] and reason is None:
@@ -448,7 +467,7 @@ class Harness:
         if call_timeout is not None and call_timeout <= 0:
             raise ValueError(f"call_timeout must be positive or None, got {call_timeout!r}")
         self.call_timeout = call_timeout
-        # Decisions client (graft/seeder.py) that picks a graft's seed; None: the conversation so far
+        # Decisions client (graft/seeder.py) that picks a graft's seed; None: the messages its fork entry points at
         self.seeder = seeder_mod.make_seeder() if seeder is ... else seeder
         self.seeder_log: list[dict] = []  # per clone: Jev latency, tokens, scores, selection, fallback
         self.out: list[str] = []  # user-facing texts: only the conversation holder's
@@ -861,8 +880,8 @@ class Harness:
         return texts
 
     @staticmethod
-    def _names(clones: list[str], background: bool, named: bool = True) -> str:
-        """'detached branches c1, c2' / 'branch c1'; with named=False just the noun. `background`:
+    def _names(clones: list[str], background: bool) -> str:
+        """'detached branches c1, c2' / 'branch c1'. `background`:
         all of them are background grafts (detached branches, as the model is told them). Grafts are
         told to the model, and to the user, as branches, by their names (spec: What the model is told:
         fork, merge and stop)."""
@@ -870,7 +889,7 @@ class Harness:
             return "a branch"
         word = "detached branch" if background else "branch"
         word += "es" if len(clones) != 1 else ""
-        return f"{word} {', '.join(clones)}" if named else word  # clones: names, as the caller shows them
+        return f"{word} {', '.join(clones)}"  # clones: names, as the caller shows them
 
 
     # ------------------------------------------------------------ main loop
@@ -1102,7 +1121,10 @@ class Harness:
             clone_use = next((u for u in uses if u["name"] == "fork" and "fork" in allowed), None)
             if join_use:  # the merge call ends the turn; its `reason` is the branch's own words, never read here
                 results = [ToolResult(use=u, content=NOT_RUN_JOINING, is_error=True) for u in uses if u is not join_use]
-                results.append(ToolResult(use=join_use, content=MERGED, is_error=False))
+                bad = merge_input_problem(join_use.get("input"))
+                # a malformed merge call still ends the turn, but is not the one main reads: its
+                # result is a refusal, so the join writes the harness's own merge() instead
+                results.append(ToolResult(use=join_use, content=bad or MERGED, is_error=bad is not None))
                 self._store_results(tl=tl, results=results)
                 return RunOutcome(kind="join", reason="done")
             if clone_use:
@@ -1301,7 +1323,7 @@ class Harness:
         """The rows a join appends to src, in order: remembered rows, the merge call, its result
         (main's), the trigger."""
         tail = [self.store.turn(r) for r in rows]
-        tail += [merge, self._virtual(src, "user", "tool_result", json.dumps(
+        tail += [merge, self._virtual(owner=src, role="user", kind="tool_result", content=json.dumps(
             {"tool_use_id": json.loads(merge["content"])["id"], "content": result, "is_error": False}))]
         if trigger is not None:
             tail.append(self.store.turn(trigger))
@@ -1334,9 +1356,9 @@ class Harness:
             tiers.append((2, [], merge_result(empty=True, dropped=(
                 f"What you did in {name} did not fit in your context and stays in that branch's frozen "
                 "timeline; say so if asked."), **said)))
-        before = compaction.estimate_tokens(render(base + self._join_tail(src, rows, merge, full[1], trigger)))
+        before = compaction.estimate_tokens(render(base + self._join_tail(src=src, rows=rows, merge=merge, result=full[1], trigger=trigger)))
         for i, (tier, kept, result) in enumerate(tiers):
-            size = compaction.estimate_tokens(render(base + self._join_tail(src, kept, merge, result, trigger)))
+            size = compaction.estimate_tokens(render(base + self._join_tail(src=src, rows=kept, merge=merge, result=result, trigger=trigger)))
             if size <= limit or i == len(tiers) - 1:
                 if tier:
                     self.join_fallbacks.append({"clone": child, "tier": tier, "before": before, "after": size})
@@ -1372,7 +1394,7 @@ class Harness:
         wanted = self.default_join_rows(src=src, child=child, trigger=trigger)
         rows, result = self.fit_join(src=src, child=child, reason=reason, rows=wanted, merge=merge, trigger=trig,
                                      running=running, closing=closed)
-        pending = self.store.view(src) + self._join_tail(src, rows, merge, result, trig)
+        pending = self.store.view(src) + self._join_tail(src=src, rows=rows, merge=merge, result=result, trigger=trig)
         v = validate(pending, src, trigger=trig)
         use = json.loads(merge["content"])
         written = {"use": use, "result": {"tool_use_id": use["id"], "content": MERGED, "is_error": False}} \
@@ -1481,17 +1503,20 @@ class Harness:
                 problems.append(f"quote {_echo(quote)} matches no message")
             else:
                 problems.append(f"quote {_echo(quote)} matches {len(hits)} messages (rows "
-                                f"{[r['row_id'] for r in hits]}); quote more of one, or give its row id")
+                                f"{[r['row_id'] for r in hits][:MATCH_ROWS]}{', ...' if len(hits) > MATCH_ROWS else ''}); "
+                                "quote more of one, or give its row id")
         order = {r["row_id"]: i for i, r in enumerate(view)}
         return sorted(set(out), key=order.__getitem__), problems
 
     def message_index(self, src: str, exclude: set[int]) -> str:
         """The messages a fork entry may point at, with their row ids, for a refused call's retry
         (the start of each, on one line)."""
+        rows = [r for r in self.store.working_view(src) if seeder_mod.is_candidate(r) and r["row_id"] not in exclude]
         lines = ["Your messages (row id, role: start of the text):"]
-        for r in self.store.working_view(src):
-            if seeder_mod.is_candidate(r) and r["row_id"] not in exclude:
-                lines.append(f"  {r['row_id']} {r['role']}: {' '.join(r['content'].split())[:INDEX_CHARS]}")
+        if len(rows) > INDEX_ROWS:
+            lines.append(f"  ({len(rows) - INDEX_ROWS} earlier messages not shown)")
+        for r in rows[-INDEX_ROWS:]:
+            lines.append(f"  {r['row_id']} {r['role']}: {' '.join(r['content'].split())[:INDEX_CHARS]}")
         return "\n".join(lines)
 
     def task_of(self, skills: list[str]) -> str:
@@ -1657,7 +1682,7 @@ class Harness:
         if self.seeder is not None and not shape and not given and not any(pointed):
             try:  # all entries, or none left running: a failure cancels and awaits the others
                 async with asyncio.TaskGroup() as group:
-                    calls = [group.create_task(self.seed_with_actor(src, e.skills, fallback=seed, exclude=exclude))
+                    calls = [group.create_task(self.seed_with_actor(src=src, skills=e.skills, fallback=seed, exclude=exclude))
                              for e, seed in zip(entries, seeds)]
             except ExceptionGroup as failed:
                 raise failed.exceptions[0] from None
@@ -1673,7 +1698,7 @@ class Harness:
             v += check_skill_link(store=self.store, source=src, skills=e.skills)
             rows = [t for t in (self.store.turn(r) for r in seed) if t] + turn_rows + other_results
             if turn is not None:  # its own fork result ends its view (the text is worded once its id is drawn)
-                rows.append(self._virtual(child, "user", "tool_result", json.dumps(
+                rows.append(self._virtual(owner=child, role="user", kind="tool_result", content=json.dumps(
                     {"tool_use_id": use.get("id"), "content": "", "is_error": False})))
             if rows:
                 v += validate(rows, child)

@@ -195,7 +195,7 @@ def test_a_request_handed_back_any_number_of_times_may_still_be_forked_for(tmp_p
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" not in names:
-            return [{"type": "tool_use", "id": f"m{len(messages)}", "name": "merge", "input": {"reason": "out_of_scope"}}]
+            return [{"type": "tool_use", "id": f"m{len(messages)}", "name": "merge", "input": {}}]
         forks = sum(1 for m in messages for b in m["content"] if b["type"] == "tool_use" and b["name"] == "fork")
         if forks >= rounds:
             return text("I could not route that.")
@@ -213,7 +213,7 @@ def test_a_request_handed_back_any_number_of_times_may_still_be_forked_for(tmp_p
 
     asyncio.run(go())
     reasons = [store.timeline(f"c{i}")["join_reason"] for i in range(1, rounds + 1)]
-    assert reasons == ["out_of_scope"] * rounds  # each hand-back was forked for again
+    assert reasons == ["out_of_scope"] * rounds  # each merged without a reply (a hand-back) and was forked for again
     assert store.timeline(f"c{rounds + 1}") is None
 
 

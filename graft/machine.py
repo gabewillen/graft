@@ -232,7 +232,8 @@ TURN = Mode(name="turn", user=True)
 class RunOutcome(NamedTuple):
     """How a run of the model loop ended, as its activity reports it; each graph routes it.
     `kind`: replied (a reply with no tool call), empty (a response with nothing in it), join (the
-    model called join, with `reason`), exhausted (the step budget ran out). A run whose request
+    model called merge; `reason` is graft's own, `done`: the model's merge takes none), exhausted
+    (the step budget ran out). A run whose request
     is withdrawn does not report an outcome: its machine leaves the run's state, which ends it."""
     kind: str
     reason: str | None = None
@@ -409,6 +410,9 @@ class TimelineSM(hsm.Instance):
         self.focus: str | None = None
         self.closing = False  # nothing is woken from now on
         self.final = False  # shut down: once nothing is left to apply, close
+        # A run of its model loop has begun since it was last at rest: a focus graft's turn, which
+        # ends in its join, a fault's included (`rejoins`)
+        self.in_turn = False
         self.hold = False  # a join commit just failed: retried at the next commit point
         self.attempts: dict[str, int] = {}  # graft -> failed attempts to commit its join here
         self.news: list[tuple[str, str]] = []  # joins applied in this drain that the source must act on
@@ -1126,12 +1130,6 @@ def request_withdrawn_meanwhile(ctx, inst, event) -> bool:
     return not _live(inst=inst, request=inst.request)
 
 
-def answering_live(ctx, inst, event) -> bool:
-    """A run may start: it answers no user request (a wake for grafts that finished while it
-    was idle), or at least one it answers is live."""
-    return not _run_withdrawn(inst)
-
-
 def _withdrawn_rows(inst: TimelineSM) -> list[int]:
     """The row of the request its run answers, if its caller withdrew it after its row was written
     (a reply answered with an error, by a recovery, is not a withdrawal: its row is not marked)."""
@@ -1346,8 +1344,14 @@ def joins_back(ctx, inst, event) -> bool:
 
 
 def rejoins(ctx, inst, event) -> bool:
-    """A focus graft that recovered from a fault: its turn ended in it, so it joins `failed`."""
-    return inst.kind == "focus" and inst.focus is None
+    """A focus graft whose turn a fault ended (a run of its model loop had begun since it was last
+    at rest, and it is not shutting down): it joins `failed`. One that never ran, a turn its caller
+    drives, and one being shut down come to rest instead, as without the fault."""
+    return inst.kind == "focus" and inst.focus is None and inst.in_turn and not (inst.closing or inst.final)
+
+
+def turn_began(ctx, inst, event) -> None:  # entry of a run of the model loop
+    inst.in_turn = True
 
 
 def run_joined(ctx, inst, event) -> bool:
@@ -2330,7 +2334,7 @@ def come_to_rest(ctx, inst, event) -> None:
     _returned(inst=inst, requests=[w.request for w in waiters
                                    if w.request is not None and not _withdrawn(inst=inst, request=w.request)])
     _drop_dead(inst)
-    inst.answering, inst.woken_for = None, []
+    inst.answering, inst.woken_for, inst.in_turn = None, [], False
     _prune(inst)
     _session(inst=inst, name="rested", data=inst.timeline_id)
 
@@ -2776,10 +2780,6 @@ def wake_run(ctx, inst, event) -> None:
     inst.mode = Mode(name="wake", answers=_handed_back(inst), about=tuple(c for c, _ in inst.news))
 
 
-def note_written(ctx, inst, event) -> None:
-    closed_out(inst)
-
-
 # ------------------------------------------------------------------ effects: a focus graft's join
 def _hand_back_of(event: hsm.Event | None) -> tuple[QueuedJoin | None, list[Waiter]]:
     """The join a focus graft's hand-back step carries, and the caller waiting on it: the join
@@ -3177,6 +3177,10 @@ def _end_recovery(inst: TimelineSM, errors: list[BaseException]) -> None:
     _restate_and_fail(inst=inst, fault=inst.handling, errors=errors, engaged=True)
     inst.recovery, inst.unstored, inst.unmarked, inst.cut_cancels = [], {}, [], []
     inst.faulted = inst.handling = None
+
+
+def close_out_written(ctx, inst, event) -> None:
+    closed_out(inst)
 
 
 def recovered(ctx, inst, event) -> None:
@@ -3756,7 +3760,8 @@ def _timeline(name: str) -> hsm.Model:
                     T(On("inbox_handed"), S("../closing_calls"), G(handed_withdraws_run), Effect(take_handed)),
                     T(On("inbox_handed"), Call(checked(handed_withdraws_run, effects=(take_handed,)))),
                     T(On("shutdown"), S("../closing_calls"), Effect(interrupted_closing)),
-                    _work("run", Activity(work=busy_activity, done="run"), T(On("turn_done"), S("../../ran"), Effect(end_run))),
+                    _work("run", Entry(turn_began), Activity(work=busy_activity, done="run"),
+                          T(On("turn_done"), S("../../ran"), Effect(end_run))),
                     _work("driven", T(On("driven_done"), S("../../rest"), Effect(end_driven))),
                 ),
                 hsm.State(
@@ -3875,7 +3880,7 @@ def _timeline(name: str) -> hsm.Model:
                 hsm.State(
                     # closing with a close-out a recovery could not write: it is written first
                     "closing_out", io(done="closed_out", work=_closing_out),
-                    T(On("closed_out"), S("../../shutting"), Effect(note_written), into("active")),
+                    T(On("closed_out"), S("../../shutting"), Effect(close_out_written), into("active")),
                     T(On(E), S("../../shutting"), Effect(close_out_failed), into("active")),
                 ),
                 hsm.Choice(

@@ -25,7 +25,7 @@ def _text(t: str) -> list[dict]:
 
 
 # Main's result of a branch's merge call starts with the branch's id ("site merged. ...", "deck was
-# stopped before it finished. ..."); a wake run's view ends on one (there is no wake note).
+# stopped before it finished. ..."); a wake run's view ends on one.
 _MERGED = re.compile(r"[a-z0-9][a-z0-9-]* (merged\b|was stopped before it finished)")
 
 
@@ -97,7 +97,7 @@ def pivot_policy(system: str, messages: list[dict], tools: list[dict]) -> list[d
             return _text("(waiting)")
         user = [re.sub(r"^\[conversation [^\]]*\]\s*", "", t) for t in texts_of(messages)]
         wants_slides = any("slide" in t.lower() for t in user)
-        return _use(tool="fork", current=_entry(messages, ["slides" if wants_slides else "website"]))
+        return _use(tool="fork", current=_entry(messages=messages, skills=["slides" if wants_slides else "website"]))
     # a clone: load its capability skill first (progressive disclosure)
     skill = "website" if "site_write" in names else "slides" if "slides_create" in names else None
     loaded = any(b["type"] == "tool_use" and b["name"] == "load_skill"
@@ -249,7 +249,7 @@ def bench_graft_policy(system: str, messages: list[dict], tools: list[dict]) -> 
         texts = [_clean(t) for t in _user_texts(messages)]
         texts = [t for t in texts if not t.startswith("(compaction")]
         wants = _wants(texts[-1] if texts else "") or _wants(" ".join(texts)) or ["website"]
-        return _use(tool="fork", current=_entry(messages, wants))
+        return _use(tool="fork", current=_entry(messages=messages, skills=wants))
     return _holder_policy(names, messages)
 
 
@@ -268,8 +268,8 @@ def parallel_graft_policy(system: str, messages: list[dict], tools: list[dict]) 
     texts = [_clean(t) for t in _user_texts(messages)]
     wants = _wants(texts[-1] if texts else "") or ["website"]
     if len(wants) == 1:
-        return _use(tool="fork", current=_entry(messages, wants))
-    return _use(tool="fork", detached=[_entry(messages, [w]) for w in wants])
+        return _use(tool="fork", current=_entry(messages=messages, skills=wants))
+    return _use(tool="fork", detached=[_entry(messages=messages, skills=[w]) for w in wants])
 
 
 def bench_subagent_policy(system: str, messages: list[dict], tools: list[dict]) -> list[dict]:

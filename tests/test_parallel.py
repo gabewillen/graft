@@ -48,7 +48,7 @@ def user_texts(messages):
 
 class Script:
     """A scripted original plus scripted grafts. The original clones `entries` for the request,
-    says "Started." after the clone result, and reports on a wake note. A graft waits for its
+    says "Started." after the clone result, and reports on a merge result. A graft waits for its
     gate, then writes one text reply (which, in the background, joins it `done`)."""
 
     def __init__(self, entries, graft=None):
@@ -91,7 +91,7 @@ def make(tmp_path, policy, **kw):
 
 def join_records(store, tl="o"):
     """tl's merge results (its own results of its branches' merge calls), as their texts: what the
-    join record and the wake note said, in order."""
+    which branch merged and what to do next, in order."""
     return [json.loads(r["content"])["content"] for r in store.view(tl)
             if r["kind"] == "tool_result" and r["tool_name"] == "merge" and r["owner_timeline"] == tl]
 
@@ -117,7 +117,7 @@ async def returned(thread):
 
 def is_wake(block):
     """Is this message block what a wake run's view ends on: main's result of a branch's merge call
-    (spec: Join; there is no wake note)? Its text is at "text" too, as a note's was."""
+    (spec: Join)? Its text is at "text" too."""
     if merged(block):
         block.setdefault("text", block["content"])
         return True
@@ -851,7 +851,7 @@ def test_clone_entries_validates_model_written_fields_and_keeps_raw_indexes():
     assert [e.label for e in es] == ["detached[1]", "detached[2]"]  # the index in the model's list, not in the filtered one
     assert v == ["detached[0]: must be an object {id?, skills, messages, reason?}",
                  "detached[1]: skills must be a list of strings",
-                 "detached[2]: skills lists ['website'] more than once"]
+                 "detached[2]: skills lists 'website' more than once"]
     assert es[0].skills == []  # nothing unusable kept
     es, v = clone_entries({"detached": [{"skills": ["website"], "id": f"w{i}", "messages": ["q"]} for i in range(300)]})
     assert v == [] and len(es) == 300  # a call may name any number of branches: no harness limit
@@ -1360,7 +1360,7 @@ def test_a_graft_starts_from_the_conversation_and_never_from_rows_the_source_doe
         (c3,), _ = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["calendar"], focus=False)))
         seeded = [r["row_id"] for r in store.view(c3)]
         assert said in seeded and secret not in seeded and seeded[-1] == nxt  # its text merged; its tool output never did
-        assert not any(store.turn(r)["harness"] for r in seeded)  # the merge record and the wake note are not seeded
+        assert not any(store.turn(r)["harness"] for r in seeded)  # the merge results are not seeded
         assert all(store.turn(r)["kind"] == "text" for r in seeded)
         await h.settle()
         await h.machines.stop()
@@ -1382,7 +1382,7 @@ def _focus_script(reply="Routing that."):
             return [] if merged(last) else text(reply)
         if len(user_texts(messages)) > 1:
             return [{"type": "tool_use", "id": f"j{len(messages)}", "name": "merge",
-                     "input": {"reason": "out_of_scope"}}]
+                     "input": {}}]
         return text("Site built.")
     return policy
 
@@ -1864,7 +1864,7 @@ def said_errors(said):
 class CancelScript:
     """A scripted original that clones `entries` for the request and, when the user says STOP,
     calls cancel with `ids`. It says "Started." after a clone result and "Stopped." after a cancel
-    result (kept in `results`), and reports on a wake note. A graft waits for its gate, then
+    result (kept in `results`), and reports on a merge result. A graft waits for its gate, then
     writes one text reply. `entered[skill]` is set when that graft's model call has started, and
     `threads[skill]` is the worker thread of its latest call."""
 
@@ -2126,7 +2126,7 @@ class Probe(CancelScript):
     def work(self, skill, messages):
         if skill == "calendar":
             return [{"type": "text", "text": "Booked."},
-                    {"type": "tool_use", "id": "j1", "name": "merge", "input": {"reason": "done"}}]
+                    {"type": "tool_use", "id": "j1", "name": "merge", "input": {}}]
         return self.finish(skill=skill, messages=messages)
 
     def __call__(self, system, messages, tools):
@@ -2345,7 +2345,7 @@ def test_a_cancelled_graft_leaves_the_still_running_list(tmp_path):
         assert status(store=store, tl="c1") == "queued" and not turn.done()  # queued, not yet joined
         script.open("cancel")
         out = await turn
-        # the wake note names what is still running: not c1 any more
+        # the merge result names what is still running: not c1 any more
         assert "Still running: c2 (skills: slides), c3 (skills: calendar), c4 (skills: newsletter)." in out[1]
         children, msg = await clone_in_turn(h=h, use=one_more)
         assert children == ["c5"], msg
@@ -3319,7 +3319,7 @@ def _focus_then_root(gate, entered=None):
             entered.set()
         assert gate.wait(GATE_TIMEOUT)
         return [{"type": "text", "text": "Site done."},
-                {"type": "tool_use", "id": "j1", "name": "merge", "input": {"reason": "done"}}]
+                {"type": "tool_use", "id": "j1", "name": "merge", "input": {}}]
     return policy
 
 
@@ -3836,7 +3836,7 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
                 return [load]
             return text(f"answer to {request}")
         if request.startswith("FOCUS-OOS"):  # a focus graft that hands the request back at once
-            return [{"type": "tool_use", "id": "j", "name": "merge", "input": {"reason": "out_of_scope"}}]
+            return [{"type": "tool_use", "id": "j", "name": "merge", "input": {}}]
         if request.startswith("FOCUS"):
             entered["c1"].set()
             assert gates["c1"].wait(GATE_TIMEOUT)
@@ -4034,7 +4034,7 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
                 and r["tool_name"] != "merge"] == [], point  # only the harness's merge call
         assert store.timeline("c1")["join_reason"] == "cancelled" and h.wakes == [], point
     # a withdrawn request is marked in the view whose run never answered it; one its turn answered
-    # before the cancel (the joins, wake note and wake that follow the turn) is not
+    # before the cancel (the joins and the wake that follow the turn) is not
     marks = {r["content"]: r["withdrawn"] for r in store.view("o") if r["kind"] == "text" and not r["harness"]}
     if point in ("requesting", "requesting behind a run", "running", "returning", "saying", "hand-back",
                  *BACKGROUND_POINTS):
@@ -4473,7 +4473,7 @@ def _clones_on(entry_for, seen):
 
 @pytest.mark.parametrize("focus", [False, True])
 def test_a_message_the_user_withdrew_is_never_in_a_grafts_seed(tmp_path, focus, mark):
-    """default_seed: a graft starts from the conversation, which leaves out a message the user
+    """A graft pointed at the conversation by quotes, which leave out a message the user
     withdrew; the graft never sees it."""
     seen = {}
     store, h, said = make(tmp_path=tmp_path, policy=_clones_on(
@@ -4932,7 +4932,7 @@ def test_a_cancel_row_that_cannot_be_written_beside_a_clone_ends_the_run_with_th
     def graft(skill, messages):
         if skill == "slides":
             return [{"type": "text", "text": "Deck made."},
-                    {"type": "tool_use", "id": "j1", "name": "merge", "input": {"reason": "done"}}]
+                    {"type": "tool_use", "id": "j1", "name": "merge", "input": {}}]
         return script.finish(skill=skill, messages=messages)
 
     script = Replace(entries=ONE, response=[cancel_use(ids=["c1"], id="x1"),
@@ -4977,7 +4977,7 @@ def test_a_focus_clone_whose_result_row_cannot_be_written_has_it_written_before_
                 return [clone_use(clone_entry(skills=["website"], focus=True)) | {"type": "tool_use"}]
             return text("here")
         return [{"type": "text", "text": "Site built."},
-                {"type": "tool_use", "id": "j", "name": "merge", "input": {"reason": "done"}}]
+                {"type": "tool_use", "id": "j", "name": "merge", "input": {}}]
 
     store, h, said = make(tmp_path=tmp_path, policy=policy)
 
@@ -5051,7 +5051,7 @@ def test_until_rest_answers_only_what_is_true_and_close_stops_every_machine(tmp_
                     | {"type": "tool_use"}]
         if "site_write" in names:
             return [{"type": "text", "text": "Site built."},
-                    {"type": "tool_use", "id": "j", "name": "merge", "input": {"reason": "done"}}]
+                    {"type": "tool_use", "id": "j", "name": "merge", "input": {}}]
         return text("slides finished")
 
     store, h, said = make(tmp_path=tmp_path, policy=policy)
@@ -5083,7 +5083,7 @@ def test_a_focus_graft_whose_join_can_never_be_applied_ends_abandoned(tmp_path, 
                 return [clone_use(clone_entry(skills=["website"], focus=True)) | {"type": "tool_use"}]
             return text("Original here.")
         return [{"type": "text", "text": "Site done."}, {"type": "tool_use", "id": "j", "name": "merge",
-                                                          "input": {"reason": "done"}}]
+                                                          "input": {}}]
 
     store, h, said = make(tmp_path=tmp_path, policy=policy)
 
@@ -5269,7 +5269,7 @@ class FaultScript:
             return text(f"answer to {request}")
         if request == FOCUS:
             return [{"type": "text", "text": "site done"},
-                    {"type": "tool_use", "id": f"j{len(messages)}", "name": "merge", "input": {"reason": "done"}}]
+                    {"type": "tool_use", "id": f"j{len(messages)}", "name": "merge", "input": {}}]
         return text("site done" if request in (BG, STAY) else f"answer to {request}")
 
 

@@ -290,7 +290,7 @@ def test_focus_merges_hand_back_and_failure_say_branch_and_merge(tmp_path):
 
 
 def test_a_merge_too_large_for_the_context_says_branch(tmp_path):
-    """The size backstop's records and the wake note that says a result did not fit."""
+    """The size backstop's merge result, which says a result did not fit."""
     from _util import clone_in_turn
     store, h, rec = make(tmp_path=tmp_path, policy=lambda **_: text(t="Reporting."), name="e", window_tokens=120)
 

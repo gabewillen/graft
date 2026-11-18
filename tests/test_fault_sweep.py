@@ -197,7 +197,7 @@ class Policy(FaultScript):
                 return text("Reported." if is_wake(last) else "Started.")
             if ran(last) and request == TOOL_FOCUS:
                 return [{"type": "text", "text": "site done"},
-                        {"type": "tool_use", "id": f"j{len(messages)}", "name": "merge", "input": {"reason": "done"}}]
+                        {"type": "tool_use", "id": f"j{len(messages)}", "name": "merge", "input": {}}]
             if ran(last):
                 return text("site done")
             return [{"type": "tool_use", "id": f"w{len(messages)}", "name": "site_write",

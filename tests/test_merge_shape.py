@@ -1,7 +1,7 @@
 """Every branch turn ends in a merge, and a merge is messages (spec: Join; What the model is told,
 Fork and merge are messages): the branch's merge call (its own, or the harness's when the turn ends
 without one) comes back to main as an assistant message, followed by main's merge result, which
-says what the wake note said; main always runs once after a merge, and may end that run silently."""
+says which branch merged and what to do next; main always runs once after a merge, and may end that run silently."""
 
 import asyncio
 import json
@@ -100,7 +100,7 @@ def test_a_current_branch_that_replies_merges_at_the_end_of_its_turn_and_main_ru
     result = merge_results(store)[0]
     assert result.startswith("site merged. Its replies above already reached the user: do not repeat them.")
     assert "end your turn without saying anything" in result
-    # no user-role harness note: the merge result carries what the wake note carried
+    # no user-role harness note: the merge result says it
     assert not [r for r in store.view("o") if r["harness"] and r["kind"] == "text"]
     assert store.timeline("c1")["join_reason"] == "done" and holder(store) == "o"
     assert validate(store.view("o"), "o") == []
@@ -120,9 +120,11 @@ def test_the_next_message_goes_to_main_never_to_the_merged_branch(tmp_path):
     store, h, said = make(tmp_path, script)
     run(h, REQUEST, "Home and contact.")
     assert len(seen) == 1  # the branch ran one turn
-    assert store.view("o")[-1]["content"] == "Home and contact." or any(
-        r["content"] == "Home and contact." and r["owner_timeline"] == "o" for r in store.view("o"))
-    assert store.timeline("c1")["status"] == "joined"
+    # main ran after the merge, then on the next message, which is its own row
+    assert len(script.main_after_merge) == 2
+    assert script.main_after_merge[1][-1]["content"][-1]["text"].endswith("Home and contact.")
+    owners = [r["owner_timeline"] for r in store.view("o") if r["content"] == "Home and contact."]
+    assert owners == ["o"] and store.timeline("c1")["status"] == "joined"
 
 
 def test_merge_with_a_reason_and_no_reply_hands_the_request_back_and_main_reads_the_reason(tmp_path):
@@ -182,3 +184,48 @@ def test_a_detached_branch_merges_and_main_is_told_the_user_has_not_seen_it(tmp_
     assert main_sees(store)[-4:] == [("assistant", "text", None, 0), ("assistant", "tool_use", "merge", 1),
                                      ("user", "tool_result", "merge", 1), ("assistant", "text", None, 0)]
     assert validate(store.view("o"), "o", require_user_end=False) == []
+
+
+def test_a_malformed_or_oversized_merge_call_still_ends_the_turn_but_main_reads_the_harness_merge(tmp_path):
+    """A merge call's input is model-written and main reads it whole: anything but `{}` or a
+    `reason` string of at most REASON_CHARS characters gets a refusal result (not "merged"), the
+    turn still ends, and the join writes the harness's argument-less merge() for main to read."""
+    from graft.harness import REASON_CHARS
+    for bad in ({"reason": "x" * (REASON_CHARS + 1)}, {"reason": "ok", "extra": {"a": 1}}, {"reason": 7}):
+        branch = lambda m, bad=bad: [{"type": "tool_use", "id": "m1", "name": "merge", "input": bad}]
+        script = Script(entry=SITE, branch=branch)
+        (tmp_path / f"b{len(json.dumps(bad))}").mkdir()
+        store = Store(str(tmp_path / f"b{len(json.dumps(bad))}" / "m.db"))
+        install(store)
+        h = Harness(store, FakeProvider(script), seeder=None)
+        run(h, REQUEST)
+        refusal = [json.loads(r["content"]) for r in store.view("c1") if r["kind"] == "tool_result"
+                   and r["tool_name"] == "merge" and not r["harness"]][0]
+        assert refusal["is_error"] and refusal["content"].startswith("merged without your reason")
+        merges = [json.loads(r["content"]) for r in store.view("o") if r["kind"] == "tool_use" and r["tool_name"] == "merge"]
+        assert merges == [{"id": "merge-site", "input": {}}]  # the harness's own, never the malformed one
+        assert validate(store.view("o"), "o", require_user_end=False) == []
+
+
+def test_a_fork_entry_reason_over_the_bound_refuses_the_call():
+    from graft.harness import REASON_CHARS, clone_entries
+    _, v = clone_entries({"current": {"skills": ["website"], "messages": [], "reason": "x" * (REASON_CHARS + 1)}})
+    assert v[0] == f"current: reason is {REASON_CHARS + 1} characters long; give at most {REASON_CHARS}"
+
+
+def test_an_entry_with_no_messages_and_no_reason_is_refused_in_the_model_loop(tmp_path):
+    """Through the model loop, with the test default that quotes the conversation switched off."""
+    results = []
+
+    def policy(system, messages, tools):
+        last = messages[-1]["content"][-1]
+        if ran(last):
+            results.append(last["content"])
+            return text("Sorry.")
+        return [fork_use(current={"skills": ["website"], "messages": []})]
+
+    store, h, said = make(tmp_path, policy)
+    h.provider.policy = policy  # the raw policy: no quotes filled in
+    run(h, REQUEST)
+    assert results and "current: give it messages, a reason, or both" in results[0]
+    assert store.con.execute("SELECT count(*) FROM timelines WHERE source_id IS NOT NULL").fetchone()[0] == 0

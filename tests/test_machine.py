@@ -63,9 +63,9 @@ class Host:
 
     async def run_busy(self, tl, kind, woken=None):
         # a wake run is told the joins it is for (`woken`); its view ends on their merge results,
-        # so no note is written for it: ("note", ...) logs that a wake run began
+        # so no note is written for it: ("wake", ...) logs that a wake run began
         if woken is not None:
-            self.record("note", tuple(c for c, _ in woken), False)
+            self.record("wake", tuple(c for c, _ in woken), False)
         self.record("run", tl, "wake" if woken is not None else "turn")
         return await self._run(tl)
 
@@ -349,7 +349,7 @@ def test_a_focus_clone_hands_the_conversation_over_and_its_join_goes_last():
         host.end("c2")  # the focus graft answers the user: its turn ends in its join
         await waking  # the original runs once after the merges: c1's work is reported
         assert [e[1] for e in host.logged(prefix=("apply",))] == ["c1", "c2"]  # the focus join last
-        assert host.logged(prefix=("note",)) == [("note", ("c1", "c2"), False)]
+        assert host.logged(prefix=("wake",)) == [("wake", ("c1", "c2"), False)]
         host.end("o")
         assert await reply == "ended"  # the user's call is answered once the original is at rest
         assert (host.status["o"], host.status["c1"], host.status["c2"]) == ("active", "joined", "joined")
@@ -402,7 +402,7 @@ def test_joins_wait_while_the_original_runs_and_are_applied_when_it_is_at_rest()
         host.end("o")
         await waking
         assert [e[1] for e in host.logged(prefix=("apply",))] == ["c2", "c1"]  # finish order
-        assert ("note", ("c2", "c1"), False) in host.log  # one wake for both
+        assert ("wake", ("c2", "c1"), False) in host.log  # one wake for both
         host.end("o")
         assert await first == "ended" and await at_rest(m) == "ended"
         assert host.status["c1"] == host.status["c2"] == "joined"
@@ -478,7 +478,7 @@ def test_the_original_cancels_a_running_background_graft_and_waits_for_its_join(
         waking = host.next("run", "o", "wake")
         host.end("o")
         await waking
-        assert ("apply", "c1", CANCELLED) in host.log and ("note", ("c1",), False) in host.log
+        assert ("apply", "c1", CANCELLED) in host.log and ("wake", ("c1",), False) in host.log
         host.end("o")
         assert await reply == "ended" and host.status["c1"] == "joined"
         await m.stop()
@@ -799,7 +799,7 @@ def test_a_fault_after_a_focus_graft_hands_its_request_back_fails_that_call(monk
         await asyncio.wait_for(applied, GUARD)
         with pytest.raises(machine_module.DecisionFault, match="wakes_to_run held"):
             await asyncio.wait_for(reply, GUARD)
-        assert host.logged(prefix=("note",)) == [] and host.logged(prefix=("run", "o")) == [("run", "o", "turn")]
+        assert host.logged(prefix=("wake",)) == [] and host.logged(prefix=("run", "o")) == [("run", "o", "turn")]
         assert await at_rest(m) == "ended"
         await m.stop()
     run(go)
@@ -1077,7 +1077,7 @@ def test_no_wake_runs_for_a_turn_whose_request_was_withdrawn(method):
         assert await first == "ended" and await at_rest(m) == "ended"
         assert ("apply", "c1", "done") in host.log and not host.logged(prefix=("run", "o", "wake"))
         if method == "apply_join":
-            assert not host.logged(prefix=("note",))  # no wake note is written either
+            assert not host.logged(prefix=("wake",))  # no wake run either
         await m.stop()
     run(go)
 
@@ -1269,7 +1269,7 @@ def test_a_background_clone_carried_out_while_its_request_is_withdrawn_starts_no
         assert await at_rest(m) == "ended"
         assert host.logged(prefix=("close", "o")) and ("reason", "c1", CANCELLED) in host.log
         assert ("apply", "c1", CANCELLED) in host.log and host.status["c1"] == "joined"
-        assert host.logged(prefix=("run", "c1")) == [] and host.logged(prefix=("note",)) == []  # it never ran; no wake
+        assert host.logged(prefix=("run", "c1")) == [] and host.logged(prefix=("wake",)) == []  # it never ran; no wake
         assert host.logged(prefix=("run", "o")) == [("run", "o", "turn")]
         await m.stop()
     run(go)
@@ -1293,7 +1293,7 @@ def test_a_background_graft_stops_when_the_request_it_was_made_for_is_withdrawn_
         await m.send(tl="o", name="withdraw", data=REQUESTS[reply])
         assert await at_rest(m) == "ended"
         assert ("reason", "c1", CANCELLED) in host.log and ("apply", "c1", CANCELLED) in host.log
-        assert host.logged(prefix=("note",)) == [] and host.logged(prefix=("run", "o")) == [("run", "o", "turn")]
+        assert host.logged(prefix=("wake",)) == [] and host.logged(prefix=("run", "o")) == [("run", "o", "turn")]
         # a graft made for a request that its turn answered goes on and wakes its source
         second = await say(m=m, text="again")
         ran = host.next("run", "c2")
@@ -1306,7 +1306,7 @@ def test_a_background_graft_stops_when_the_request_it_was_made_for_is_withdrawn_
         host.end("c2")
         await asyncio.wait_for(waking, GUARD)
         host.end("o")
-        assert await at_rest(m) == "ended" and ("note", ("c2",), False) in host.log
+        assert await at_rest(m) == "ended" and ("wake", ("c2",), False) in host.log
         await m.stop()
     run(go)
 
@@ -1351,7 +1351,7 @@ def test_a_background_graft_made_before_a_withdrawal_mid_spawn_stops_and_the_nex
         assert (await asyncio.wait_for(asking, GUARD))[0] == ["c1", "c2"]
         assert await at_rest(m) == "ended"
         assert ("reason", "c1", CANCELLED) in host.log and ("reason", "c2", CANCELLED) in host.log
-        assert host.logged(prefix=("run", "c2")) == [] and host.logged(prefix=("note",)) == []
+        assert host.logged(prefix=("run", "c2")) == [] and host.logged(prefix=("wake",)) == []
         await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
         await m.stop()
     run(go)
@@ -1401,7 +1401,7 @@ def test_a_graft_that_joined_at_once_in_a_clone_call_undone_at_its_start_is_neve
         assert (await asyncio.wait_for(asking, GUARD))[0] is None  # refused: the call was undone
         assert await at_rest(m) == "ended"
         assert host.logged(prefix=("apply",)) == [] and ("abandoned", ("c1", "c2")) in host.log
-        assert host.logged(prefix=("run", "c1")) == [] and host.logged(prefix=("note",)) == []
+        assert host.logged(prefix=("run", "c1")) == [] and host.logged(prefix=("wake",)) == []
         await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
         await m.stop()
     run(go)
@@ -1544,7 +1544,7 @@ def test_the_withdrawal_record_holds_only_requests_still_held():
         host.hold.set_result(None)  # its run ends now, and it joins
         await asyncio.wait_for(applied, GUARD)
         assert await at_rest(m) == "ended"
-        assert host.logged(prefix=("note",)) == []  # its join wakes nothing: its request was withdrawn
+        assert host.logged(prefix=("wake",)) == []  # its join wakes nothing: its request was withdrawn
         again = await say_as(m=m, text="after the join", id=REQUESTS[reply])
         assert ("request", "o", "after the join") in host.log  # the id was dropped with the join
         await answered(host=host, m=m, reply=again)
@@ -1792,7 +1792,7 @@ def _in_order(monkeypatch, order):
 @pytest.mark.parametrize("order", ORDERS)
 def test_a_withdrawn_hand_back_wakes_nothing_whatever_order_the_branches_are_declared_in(monkeypatch, order):
     """A focus graft hands its request back, and the request is withdrawn as it does: after the
-    joins, no wake note is written and no run answers it (its row is marked instead), with the
+    joins, no run answers it (its row is marked instead), with the
     branches of the choices in either order."""
     async def go():
         _in_order(monkeypatch=monkeypatch, order=order)
@@ -1811,7 +1811,7 @@ def test_a_withdrawn_hand_back_wakes_nothing_whatever_order_the_branches_are_dec
         host.end(tl="c1", result=RunOutcome(kind="join", reason="done"))
         await asyncio.wait_for(host.next("apply", "c1"), GUARD)
         assert await at_rest(m) == "ended"
-        assert host.logged(prefix=("note",)) == [] and host.logged(prefix=("run", "o")) == [("run", "o", "turn")]
+        assert host.logged(prefix=("wake",)) == [] and host.logged(prefix=("run", "o")) == [("run", "o", "turn")]
         assert host.logged(prefix=("withdrawn",)) == [("withdrawn", ("o",), [row])]
         await m.stop()
     run(go)
@@ -2267,5 +2267,32 @@ def test_a_focus_graft_whose_turn_a_fault_ended_joins_failed(monkeypatch):
         await asyncio.wait_for(waking, GUARD)
         host.end("o")
         assert await at_rest(m) == "ended" and holders(host) == ["o"] and host.status["c1"] == "joined"
+        await m.stop()
+    run(go)
+
+
+def test_a_focus_graft_that_never_ran_rests_after_a_fault_and_does_not_join(monkeypatch):
+    """A fault while a focus graft never ran (its request was withdrawn before it could act) ended no
+    turn: the recovery leaves it at rest holding the conversation, as without the fault, and no run
+    of its source starts."""
+    import graft.machine as machine_module
+    real, armed = machine_module.rows_marked, [True]
+
+    def rows_marked(ctx, inst, event):
+        if inst.timeline_id == "c1" and armed:
+            armed.clear()
+            raise RuntimeError("rows_marked bug")
+        return real(ctx=ctx, inst=inst, event=event)
+
+    async def go():
+        monkeypatch.setattr(machine_module, "rows_marked", rows_marked)
+        host, m = await started()
+        first = await say(m=m, text="A")
+        _withdraws_inside(host=host, m=m, method="commit_clone", reply=first)
+        recovered = host.next("recover", "c1")
+        await clone(m=m, pairs=[("c1", True)])
+        await asyncio.wait_for(recovered, GUARD)
+        assert await at_rest(m=m, tl="c1") == "ended" and host.status["c1"] == "active"
+        assert not host.logged(prefix=("apply", "c1")) and not host.logged(prefix=("run", "o", "wake"))
         await m.stop()
     run(go)

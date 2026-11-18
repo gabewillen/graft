@@ -124,8 +124,9 @@ def score_failure(ctx: RunContext) -> tuple[bool, dict, dict]:
         s = ctx.agent.store
         diag["joins"] = [(r[0], r[1]) for r in s.con.execute(
             "SELECT timeline_id, join_reason FROM timelines WHERE source_id IS NOT NULL ORDER BY created_at")]
-        diag["error_record"] = bool(s.con.execute(
-            "SELECT 1 FROM turns WHERE harness=1 AND content LIKE '(harness note: your branch % failed%'").fetchone())
+        diag["error_record"] = bool(s.con.execute(  # main's merge result for a branch that failed
+            "SELECT 1 FROM turns WHERE harness=1 AND kind='tool_result' AND tool_name='merge' "
+            "AND content LIKE '%merged after it failed%'").fetchone())
     return all(checks.values()), checks, diag
 
 

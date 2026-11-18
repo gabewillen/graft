@@ -60,7 +60,7 @@ EDIT_SKILL = Skill(name="code_edit", description="Read, search and edit the repo
                    instructions="Code editing skill: Read, Grep, Glob, Edit, Write and a restricted Bash (ls, cat, rg, grep, find, "
                    "wc, head, tail, git log/show/diff/ls-files/status, and `uv run pytest`, offline). Make the change "
                    "the task asks for, run the tests, then reply with your final report (what you changed and the "
-                   "test result) and call merge(reason='done').", tools=sandbox.TOOLS + sandbox.WRITE_TOOLS)
+                   "test result); the end of your turn merges it back.", tools=sandbox.TOOLS + sandbox.WRITE_TOOLS)
 TEST_PREFIXES = [["uv", "run", "pytest"], ["uv", "run", "--frozen", "--offline", "pytest"]]
 TEST_CMD = ["uv", "run", "--frozen", "--offline", "pytest", "-q", "-p", "no:cacheprovider", "-m", "not live"]
 
@@ -102,7 +102,7 @@ def recorded_test_paths(e) -> list[str]:
 CODE_SKILL = Skill(name="code_read", description="Read and search the repository checkout (read-only).",
                    instructions="Code reading skill: Read, Grep, Glob and a read-only Bash (ls, cat, rg, grep, find, wc, head, "
                    "tail, git log/show/diff/ls-files). You cannot write files. Work from the task you were given, "
-                   "then reply with your final report and call merge(reason='done').", tools=sandbox.TOOLS)
+                   "then reply with your final report; the end of your turn merges it back.", tools=sandbox.TOOLS)
 
 
 def cost_of(usage_by_model: dict) -> float | None:
