@@ -2366,11 +2366,16 @@ def test_past_the_recovery_bound_a_hand_over_still_finishes(monkeypatch):
     async def go():
         monkeypatch.setattr(machine_module, "spawned", spawned)
         host, m = await started()
-        await say(m=m, text="go")
+        reply = await say(m=m, text="go")
         with contextlib.suppress(Exception):
             await clone(m=m, pairs=[("c1", True)])
         await asyncio.sleep(0.2)
         assert holders(host) == ["c1"] and host.status["o"] == "cloned"
+        waking = host.next("run", "o", "wake")
+        host.end("c1")  # its turn ends in its merge; the caller it holds is kept, and answered at rest
+        await asyncio.wait_for(waking, GUARD)
+        host.end("o")
+        assert await asyncio.wait_for(reply, GUARD) == "ended"
         await m.stop()
     run(go)
 
@@ -2396,5 +2401,35 @@ def test_a_focus_graft_whose_first_run_a_fault_kept_from_starting_rests(monkeypa
         await asyncio.wait_for(recovered, GUARD)
         assert await at_rest(m=m, tl="c1") == "ended"
         assert not host.logged(prefix=("run", "c1")) and not host.logged(prefix=("apply", "c1"))
+        await m.stop()
+    run(go)
+
+
+def test_a_focus_graft_past_the_recovery_bound_still_joins_failed(monkeypatch):
+    """Past MAX_RECOVERIES (`given_up`) a focus graft whose turn the fault ended joins `failed`, as
+    from `resumed`: it never rests after a turn."""
+    import graft.machine as machine_module
+    monkeypatch.setattr(machine_module, "may_recover", lambda ctx, inst, event: inst.timeline_id != "c1")
+    real, armed = machine_module.end_run, [True]
+
+    def end_run(ctx, inst, event):
+        if inst.timeline_id == "c1" and armed:
+            armed.clear()
+            raise RuntimeError("end_run bug")
+        return real(ctx=ctx, inst=inst, event=event)
+
+    async def go():
+        monkeypatch.setattr(machine_module, "end_run", end_run)
+        host, m = await started()
+        reply = await say(m=m, text="go")
+        await clone(m=m, pairs=[("c1", True)])
+        applied, waking = host.next("apply", "c1"), host.next("run", "o", "wake")
+        host.end("c1")
+        assert (await asyncio.wait_for(applied, GUARD))[2] == "failed"
+        with pytest.raises(RuntimeError, match="end_run bug"):
+            await asyncio.wait_for(reply, GUARD)
+        await asyncio.wait_for(waking, GUARD)
+        host.end("o")
+        assert await at_rest(m) == "ended" and holders(host) == ["o"] and host.status["c1"] == "joined"
         await m.stop()
     run(go)
