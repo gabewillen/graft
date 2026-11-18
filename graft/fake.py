@@ -1,7 +1,7 @@
 """A deterministic scripted policy for FakeProvider (offline tests and dry runs).
 
 It plays every role through the same neutral interface a real model sees, so the
-whole clone -> converse -> join -> re-clone path runs without an API key.
+whole branch -> converse -> merge -> re-branch path (graft's clone and join) runs without an API key.
 """
 
 from __future__ import annotations
@@ -25,13 +25,13 @@ def _text(t: str) -> list[dict]:
 
 
 def _clone(purpose: str, skills: list[str], seed_quotes: list[str], focus: bool = True) -> dict:
-    """One entry of a clone call."""
+    """One entry of a branch call."""
     return {"purpose": purpose, "skills": skills, "focus": focus, "seed_quotes": seed_quotes}
 
 
-# A wake note names the joined clones with their reasons ("... clone c1 (failed) joined; ...");
-# a join record does not ("... clone c1 joined, reason=..."). Both carry the harness mark.
-_WAKE_NOTE = re.compile(r"\(harness note: (background )?clones? \w+ \(")
+# A wake note names the merged branches with their reasons ("... your branch c1 (failed) merged; ...");
+# a merge record does not ("... your branch c1 merged, reason=..."). Both carry the harness mark.
+_WAKE_NOTE = re.compile(r"\(harness note: your (background )?branch(es)? \w+ \(")
 
 
 def woken(messages: list[dict]) -> str | None:
@@ -51,7 +51,7 @@ def _wake_reply(messages: list[dict]) -> list[dict]:
             if prev["role"] == "user" else []
         if any(_WAKE_NOTE.match(n) for n in notes):
             replies = []  # an earlier wake: already reported
-        if m["role"] == "assistant" and any(n.startswith("(harness note: clone ") for n in notes):
+        if m["role"] == "assistant" and any(n.startswith("(harness note: your branch ") for n in notes):
             replies += [b["text"] for b in m["content"] if b["type"] == "text"]
     return _text("Background work finished. " + " ".join(replies)[:300])
 
@@ -78,15 +78,15 @@ def _ids_from_sql(out: str) -> list[int]:
 def pivot_policy(system: str, messages: list[dict], tools: list[dict]) -> list[dict]:
     names = {t["name"] for t in tools}
     last = _last_block(messages)
-    if "clone" in names:  # the original: route with one clone call
+    if "branch" in names:  # the original: route with one branch call
         if last["type"] == "tool_result":
             return _text("(waiting)")
         if woken(messages):
             return _wake_reply(messages)
         user = [re.sub(r"^\[conversation [^\]]*\]\s*", "", t) for t in texts_of(messages)]
         wants_slides = any("slide" in t.lower() for t in user)
-        return _use("clone", clone=[_clone("handle the user's request",
-                                           ["slides" if wants_slides else "website"], user)])
+        return _use(tool="branch", branch=[_clone(purpose="handle the user's request",
+                                             skills=["slides" if wants_slides else "website"], seed_quotes=user)])
     # a clone: load its capability skill first (progressive disclosure)
     skill = "website" if "site_write" in names else "slides" if "slides_create" in names else None
     loaded = any(b["type"] == "tool_use" and b["name"] == "load_skill"
@@ -107,7 +107,7 @@ def pivot_policy(system: str, messages: list[dict], tools: list[dict]) -> list[d
         answered = any(m["role"] == "assistant" and any(b["type"] == "text" for b in m["content"])
                        for m in messages)
         if "slide" in msg.lower() and (acted or answered):
-            return _use("join", reason="out_of_scope")
+            return _use(tool="merge", reason="out_of_scope")
         if "services" in msg.lower():
             return _use("site_write", page="home", content="\n".join(_user_texts(messages)))
         return _text("Noted. What else should the site include?")
@@ -192,8 +192,8 @@ def _holder_policy(names: set[str], messages: list[dict]) -> list[dict]:
             else _text("Done: " + str(last["content"])[:120])
     msg = _clean(_user_texts(messages)[-1]) if _user_texts(messages) else ""
     wants = _wants(msg)
-    if "join" in names and wants and not set(wants) & set(caps):
-        return _use("join", reason="out_of_scope")
+    if "merge" in names and wants and not set(wants) & set(caps):
+        return _use(tool="merge", reason="out_of_scope")
     return _act(names, messages)
 
 
@@ -229,7 +229,7 @@ def bench_graft_policy(system: str, messages: list[dict], tools: list[dict]) -> 
         return _summary(messages)
     if names == {"compact"}:
         return _fake_compact(messages)
-    if "clone" in names:  # the original
+    if "branch" in names:  # the original
         if _last_block(messages)["type"] == "tool_result":
             return _text("(waiting)")
         if woken(messages):
@@ -238,7 +238,8 @@ def bench_graft_policy(system: str, messages: list[dict], tools: list[dict]) -> 
         texts = [t for t in texts if not t.startswith("(compaction")]
         wants = _wants(texts[-1] if texts else "") or _wants(" ".join(texts)) or ["website"]
         uniq = [t for t in dict.fromkeys(texts) if texts.count(t) == 1]
-        return _use("clone", clone=[_clone("handle the user's request", wants, uniq or texts[-1:])])
+        return _use(tool="branch", branch=[_clone(purpose="handle the user's request", skills=wants,
+                                             seed_quotes=uniq or texts[-1:])])
     return _holder_policy(names, messages)
 
 
@@ -247,7 +248,7 @@ def parallel_graft_policy(system: str, messages: list[dict], tools: list[dict]) 
     with one background entry per skill; the original keeps the conversation and reports when
     the harness wakes it (experiments/parallel.py)."""
     names = {t["name"] for t in tools}
-    if "clone" not in names:
+    if "branch" not in names:
         return _holder_policy(names, messages)
     last = _last_block(messages)
     if last["type"] == "tool_result":
@@ -257,8 +258,9 @@ def parallel_graft_policy(system: str, messages: list[dict], tools: list[dict]) 
     texts = [_clean(t) for t in _user_texts(messages)]
     wants = _wants(texts[-1] if texts else "") or ["website"]
     if len(wants) == 1:
-        return _use("clone", clone=[_clone("handle the user's request", wants, texts)])
-    return _use("clone", clone=[_clone(f"the {w} part of the user's request", [w], texts, focus=False)
+        return _use(tool="branch", branch=[_clone(purpose="handle the user's request", skills=wants, seed_quotes=texts)])
+    return _use(tool="branch", branch=[_clone(purpose=f"the {w} part of the user's request", skills=[w],
+                                         seed_quotes=texts, focus=False)
                                 for w in wants])
 
 

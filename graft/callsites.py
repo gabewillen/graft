@@ -15,7 +15,7 @@ Global: effort GRAFT_REASONING_EFFORT (default "low"); model GRAFT_MODEL (provid
 
 The clone_call rule (the effort must be chosen before the call, so it cannot depend on whether the
 response routes): an `original` call whose request ends with a user text message, i.e. the
-original is answering a fresh user message (or a join trigger) that it may route with `clone`.
+original is answering a fresh user message (or a join trigger) that it may route with `branch`.
 The original's other calls (after a tool result, e.g. a refused clone retry) are `original`.
 Compaction calls (tag `<role>:compaction`) are `compaction` in both arms; subagent-baseline tags
 `parent`/`handoff` are `subagent_parent` and `subagent`/`summary` are `subagent`.

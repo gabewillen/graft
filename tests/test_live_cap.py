@@ -42,22 +42,22 @@ def test_a_cap_of_five_takes_a_fifth_live_background_graft_across_clone_calls_an
     store, h = make(tmp_path=tmp_path, cap=5)
     (four, _), (fifth, _), (sixth, msg) = asyncio.run(fill(h=h, store=store, first=4, then=["slides", "calendar"]))
     assert len(four) == 4 and fifth == ["c5"] and sixth is None
-    assert "at most 5 background clones may be live" in msg and len(clones(store)) == 5
+    assert "at most 5 background branches may be live" in msg and len(clones(store)) == 5
 
 
 def test_the_default_cap_still_refuses_a_fifth_live_background_graft(tmp_path):
     store, h = make(tmp_path=tmp_path)
     (four, _), (fifth, msg) = asyncio.run(fill(h=h, store=store, first=4, then=["slides"]))
     assert len(four) == MAX_LIVE_BACKGROUND == 4 and fifth is None
-    assert "at most 4 background clones may be live" in msg
+    assert "at most 4 background branches may be live" in msg
 
 
 def test_the_default_cap_leaves_the_clone_skill_and_cancel_tool_bytes_as_they_were(tmp_path):
     store, _ = make(tmp_path=tmp_path)
-    clone = next(s for s in CATALOG if s.name == "clone")
-    row = store.con.execute("SELECT instructions FROM skills WHERE name='clone'").fetchone()[0]
+    clone = next(s for s in CATALOG if s.name == "branch")
+    row = store.con.execute("SELECT instructions FROM skills WHERE name='branch'").fetchone()[0]
     assert row == CLONE_INSTRUCTIONS == clone.instructions
-    assert "At most four background clones of yours may be live at a time." in row
+    assert "At most four background branches of yours may be live at a time." in row
     assert stored_cancel(store) == {**CANCEL_TOOL["input_schema"], "description": CANCEL_TOOL["description"]}
     assert stored_cancel(store)["properties"]["cancel"]["maxItems"] == MAX_CANCEL_IDS == 8
 
@@ -68,8 +68,8 @@ def stored_cancel(store):
 
 def test_a_configured_cap_is_said_in_the_clone_skill_and_bounds_the_cancel_call(tmp_path):
     store, h = make(tmp_path=tmp_path, cap=5)
-    row = store.con.execute("SELECT instructions FROM skills WHERE name='clone'").fetchone()[0]
-    assert "At most 5 background clones of yours may be live at a time" in row and "At most four" not in row
+    row = store.con.execute("SELECT instructions FROM skills WHERE name='branch'").fetchone()[0]
+    assert "At most 5 background branches of yours may be live at a time" in row and "At most four" not in row
     ids = [f"c{i}" for i in range(1, 12)]
     assert cancel_ids({"cancel": ids[:10]}, limit=10)[1] == []
     assert cancel_ids({"cancel": ids}, limit=10)[1]  # past twice the cap: refused

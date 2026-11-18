@@ -346,7 +346,7 @@ def comparison(res: dict, provider) -> None:
               f"{pricing.effective_total(r['roles']['TOTAL']):.0f}")
     store = Store(":memory:")
     install(store)
-    store.create_timeline("o", None, ["clone"])
+    store.create_timeline(tl="o", source=None, skills=["branch"])
     h, sub = Harness(store, provider), SubagentRunner(store, provider)
     m = cachestats.min_cacheable(provider.name)
     print("static prefix (tools + system) lengths:")

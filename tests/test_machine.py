@@ -276,9 +276,9 @@ def test_clone_is_decided_by_the_graph():
         host, m = await started()
         _, _, text = await clone(m=m, pairs=[("c1", False)])  # at rest: not in a turn
         assert "refused" in text and not host.logged(prefix=("commit",))
-        for pairs, refusal in (([("c1", True), ("c2", True)], "at most one graft may take the conversation"),
+        for pairs, refusal in (([("c1", True), ("c2", True)], "at most one branch may carry the conversation"),
                                ([(f"g{i}", False) for i in range(MAX_LIVE_BACKGROUND + 1)],
-                                f"at most {MAX_LIVE_BACKGROUND} background clones")):
+                                f"at most {MAX_LIVE_BACKGROUND} background branches")):
             await driven_turn(m=m)
             _, _, text = await clone(m=m, pairs=pairs)
             assert refusal in text and not host.logged(prefix=("commit",))
@@ -305,8 +305,8 @@ def test_a_run_tries_one_clone_call_and_one_retry_and_seeds_no_third():
         _, _, second = await clone(m=m, pairs=[("c1", True), ("c2", True)])  # the one retry: refused again
         _, _, third = await clone(m=m, pairs=[("c1", False)])
         assert [e[2] for e in host.logged(prefix=("prepare",))] == [True, False]  # the retry is the last one prepared
-        assert "may take the conversation" in first and "may take the conversation" in second
-        assert third == "clone not executed: no clone calls left for this message; answer the user instead"
+        assert "may carry the conversation" in first and "may carry the conversation" in second
+        assert third == "branch not executed: no branch calls left for this message; answer the user instead"
         assert ("result", "o", "k", third, True) in host.log  # its row, and nothing seeded or committed
         assert not host.logged(prefix=("commit",))
         await m.stop()
@@ -319,7 +319,7 @@ def test_a_committed_clone_call_is_the_runs_last():
         await say(m=m, text="go")
         children, _, _ = await clone(m=m, pairs=[("c1", False)])
         _, _, text = await clone(m=m, pairs=[("c2", False)])
-        assert children == ["c1"] and text.startswith("clone not executed: no clone calls left")
+        assert children == ["c1"] and text.startswith("branch not executed: no branch calls left")
         assert len(host.logged(prefix=("prepare",))) == 1  # the second was not prepared
         await m.stop()
     run(go)
@@ -335,7 +335,7 @@ def test_a_graft_is_refused_a_clone_by_the_graph_however_it_asks():
         assert focus == "c1" and "c1" in host.runs  # in its turn
         _, _, text = await m.ask(tl="c1", name="clone_request",
                                  build=lambda r: Clone(use={"id": "z"}, reply=r, pairs=[("c9", False)]))
-        assert "only the original clones" in text and not host.logged(prefix=("prepare", "c1"))
+        assert "you branch only from the main conversation" in text and not host.logged(prefix=("prepare", "c1"))
         assert "c9" not in host.status
         await m.stop()
     run(go)
@@ -351,7 +351,7 @@ def test_a_queued_graft_counts_toward_the_live_cap_until_its_join_is_applied():
         await m.ask(tl="g0", name="join", build=lambda r: (QueuedJoin(child="g0", reason="done", trigger=None), r))
         assert host.status["g0"] == "queued" and not host.logged(prefix=("apply",))  # finished, not joined
         _, _, text = await clone(m=m, pairs=[("n1", False)])
-        assert f"at most {MAX_LIVE_BACKGROUND} background clones" in text  # g0 still counts
+        assert f"at most {MAX_LIVE_BACKGROUND} background branches" in text  # g0 still counts
         waking = host.next("run", "o", "wake")
         await end_driven_turn(m=m)
         await waking  # g0's join is applied
@@ -403,7 +403,7 @@ def test_a_withdrawn_message_does_not_restart_the_clone_calls_of_the_one_before(
         host.end("c1")  # c1's join is applied, then a wake: a full run
         await asyncio.wait_for(waking, GUARD)
         _, _, text = await clone(m=m, pairs=[("c2", False)])
-        assert "clone calls for this user message are used up" in text and "c2" not in host.status
+        assert "branch calls for this user message are used up" in text and "c2" not in host.status
         await m.stop()
     run(go)
 
@@ -437,7 +437,7 @@ def test_a_message_withdrawn_through_a_recovery_does_not_restart_the_clone_calls
         host.end("c1")  # c1's join is applied, then a wake: a full run
         await asyncio.wait_for(waking, GUARD)
         _, _, text = await clone(m=m, pairs=[("c2", False)])
-        assert "clone calls for this user message are used up" in text and "c2" not in host.status
+        assert "branch calls for this user message are used up" in text and "c2" not in host.status
         await m.stop()
     run(go)
 
@@ -517,7 +517,7 @@ def test_a_request_handed_to_a_focus_graft_and_withdrawn_leaves_the_one_before_i
         host.end("c1")
         await asyncio.wait_for(waking, GUARD)
         _, _, text = await clone(m=m, pairs=[("c3", False)])
-        assert "clone calls for this user message are used up" in text and "c3" not in host.status
+        assert "branch calls for this user message are used up" in text and "c3" not in host.status
         await m.stop()
     run(go)
 
@@ -709,10 +709,10 @@ def test_cancel_is_refused_for_anything_but_a_running_background_graft_of_the_or
         await queued
         results = await cancel(m=m, tl="o", ids=["o", "c9", "c2"])
         outcomes = dict(ast.literal_eval(results[0][0]))
-        assert outcomes == {"o": "the original cannot be cancelled", "c9": "no such clone",
+        assert outcomes == {"o": "the main conversation cannot be cancelled", "c9": "no such branch",
                             "c2": "it has already finished or was already cancelled; nothing to cancel"}
         assert results[0][1] and host.status["c1"] == "background"  # nothing was touched
-        assert "only the original cancels" in await cancel(m=m, tl="c1", ids=["c2"])  # a graft never cancels
+        assert "you cancel only from the main conversation" in await cancel(m=m, tl="c1", ids=["c2"])  # a graft never cancels
         waking = host.next("run", "o", "wake")
         host.end("o")
         await waking  # the wake that reports c2
@@ -1076,7 +1076,7 @@ def test_a_refused_clone_call_whose_result_row_cannot_be_written_ends_its_run():
         await withdraw(m=m, reply=first)
         assert await first == "ended"
         (closed,) = host.logged(prefix=("close", "o"))
-        assert closed[2]["k"][1] is True and "no clone was created" in closed[2]["k"][0]  # the refusal, kept
+        assert closed[2]["k"][1] is True and "no branch was started" in closed[2]["k"][0]  # the refusal, kept
         await m.stop()
     run(go)
 
@@ -1126,7 +1126,7 @@ def test_a_graft_machine_that_cannot_start_undoes_the_whole_clone_call(monkeypat
             with pytest.raises(TransitionRefused, match="no machine"):
                 await m.send(tl=g, name="cancel")
         answer = await cancel(m=m, tl="o", ids=["c1"])
-        assert "no such clone" in answer[0][0]
+        assert "no such branch" in answer[0][0]
         host.end("o")
         assert await first == "ended"
         await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), timeout=GUARD)

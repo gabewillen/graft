@@ -19,14 +19,14 @@ source's grafts still running) comes in the host call the machine's activity mak
 run may take its next step is the machine's answer to the run's `may_continue` request. A user's
 call is a request the original's machine owns (see `user_says`); a cancelled call withdraws it.
 
-Clone is one call, `clone(clone=[{purpose, skills, focus, seed_quotes | seed_row_ids}, ...])`, and
-one atomic batch, put to the original's machine as the model made it. The machine decides
-whether the call may be tried at all (a run makes at most two: one, and one retry after a
-refusal); the harness then resolves every entry's seed to pointers and validates (the activity
-of the machine's `preparing` state; on violations the source gets them back); the machine then
-decides the call and commits it, all of it or none. At most one entry has focus=true: that
-graft takes the conversation and the source is suspended until it joins. The other grafts run in
-the background, never speak to the user, and the source keeps the conversation.
+Clone is one call, `branch(branch=[{purpose, skills, focus, seed_quotes | seed_row_ids}, ...])` as
+the model is told it, and one atomic batch, put to the original's machine as the model made it. The
+machine decides whether the call may be tried at all (a run makes at most two: one, and one retry
+after a refusal); the harness then resolves every entry's seed to pointers and validates (the
+activity of the machine's `preparing` state; on violations the source gets them back); the machine
+then decides the call and commits it, all of it or none. At most one entry has focus=true: that
+graft takes the conversation and the source is suspended until it joins. The other grafts run in the
+background, never speak to the user, and the source keeps the conversation.
 
 Join is deterministic (no model call): the harness appends pointers to the text rows of the
 clone's working view that the source lacks. Every join is a queue entry on the original's
@@ -104,8 +104,8 @@ class ToolResult(NamedTuple):
 
 
 NOT_RUN_INTERRUPTED = NotRun("not executed: the turn was interrupted")
-NOT_RUN_JOINING = NotRun("not executed: this task is being joined")
-NOT_RUN_BESIDE_CLONE = NotRun("not executed: call clone on its own")
+NOT_RUN_JOINING = NotRun("not executed: this branch is merging")
+NOT_RUN_BESIDE_CLONE = NotRun("not executed: call branch on its own")
 # A host tool call cut short while it ran (its run was left: a cancel, a withdrawal, shutdown).
 # It may have acted, or may still act (cancellation is cooperative: work it handed to a thread, or
 # shielded, can go on after the cancel), so it is recorded as run, with an error.
@@ -120,9 +120,15 @@ _NONCE_TAG = re.compile(r"^\[conversation [^\]]*\]\s*")
 WITHDRAWN_SEED = "row {row} is a message the user withdrew; it is not a request and cannot be seeded"
 
 
+def merge_head(*, child: str, reason: str) -> str:
+    """The head of every merge record a source is given (the one place it is worded)."""
+    return f"(harness note: your branch {child} merged, reason={reason}; "
+
+
 def check_skill_link(store: Store, source: str, skills: list[str]) -> list[str]:
     """The one place skill linking is checked. Grafts are one level deep: only the original
-    clones, so `clone` is never linked to a clone."""
+    clones, so the `branch` skill (graft's clone skill, as the model is told it) is never linked
+    to a graft."""
     v = []
     known = set(store.skill_names())
     if not skills:
@@ -130,11 +136,11 @@ def check_skill_link(store: Store, source: str, skills: list[str]) -> list[str]:
     for s in skills:
         if s not in known:
             v.append(f"unknown skill '{s}'")
-        elif s in ("join", "background"):
-            v.append(f"'{s}' is linked by the harness (join to a focus clone, background to a "
-                     "background clone); do not select it")
-        elif s == "clone":
-            v.append("'clone' cannot be linked to a clone (only the original clones)")
+        elif s in ("merge", "background"):
+            v.append(f"'{s}' is linked by the harness (merge to a focus branch, background to a "
+                     "background branch); do not select it")
+        elif s == "branch":
+            v.append("'branch' cannot be held by a branch (you branch only from the main conversation)")
     return v
 
 
@@ -157,38 +163,38 @@ def _typed_list(entry: dict, *, name: str, kind: type, index: int, violations: l
         return []
     if not isinstance(value, list) or not all(isinstance(x, kind) and not isinstance(x, bool) for x in value):
         what = "strings" if kind is str else "integers"
-        violations.append(f"clone[{index}]: {name} must be a list of {what}")
+        violations.append(f"branch[{index}]: {name} must be a list of {what}")
         return []
     return list(value)
 
 
 def clone_entries(args: object) -> tuple[list[CloneEntry], list[str]]:
-    """The entries of a clone call's input and its shape violations. `clone` is a list of one to
-    MAX_CLONE_ENTRIES objects, each with a purpose, an explicit boolean focus, `skills` (strings,
-    no duplicates) and optional `seed_quotes` (strings) and `seed_row_ids` (integers); at most
-    one focus=true. The input is model-written: nothing about its shape is assumed. Violations
-    name the entry by its index in the model's list."""
-    raw = args.get("clone") if isinstance(args, dict) else None
+    """The entries of a clone call's input and its shape violations. Its `branch` key (the model's
+    word for the clone call) is a list of one to MAX_CLONE_ENTRIES objects, each with a purpose, an
+    explicit boolean focus, `skills` (strings, no duplicates) and optional `seed_quotes` (strings)
+    and `seed_row_ids` (integers); at most one focus=true. The input is model-written: nothing about
+    its shape is assumed. Violations name the entry by its index in the model's list."""
+    raw = args.get("branch") if isinstance(args, dict) else None
     if not isinstance(raw, list) or not raw:
-        return [], ["`clone` must be a list of one or more entries, each "
+        return [], ["`branch` must be a list of one or more entries, each "
                     "{purpose, skills, focus, seed_quotes or seed_row_ids}"]
     if len(raw) > MAX_CLONE_ENTRIES:  # refused whole, before any per-entry work
-        return [], [f"a clone call takes at most {MAX_CLONE_ENTRIES} entries (got {len(raw)})"]
+        return [], [f"a branch call takes at most {MAX_CLONE_ENTRIES} entries (got {len(raw)})"]
     v: list[str] = []
     entries: list[CloneEntry] = []
     for i, e in enumerate(raw):
         if not isinstance(e, dict):
-            v.append(f"clone[{i}]: must be an object")
+            v.append(f"branch[{i}]: must be an object")
             continue
         purpose = e.get("purpose")
         if not isinstance(purpose, str) or not purpose.strip():
-            v.append(f"clone[{i}]: purpose is required")
+            v.append(f"branch[{i}]: purpose is required")
         if not isinstance(e.get("focus"), bool):
-            v.append(f"clone[{i}]: focus is required and must be true or false")
+            v.append(f"branch[{i}]: focus is required and must be true or false")
         skills = _typed_list(e, name="skills", kind=str, index=i, violations=v)
         repeated = sorted({k for k in skills if skills.count(k) > 1})
         if repeated:
-            v.append(f"clone[{i}]: skills lists {repeated} more than once")
+            v.append(f"branch[{i}]: skills lists {repeated} more than once")
         entries.append(CloneEntry(
             index=i, raw=e, purpose=purpose if isinstance(purpose, str) else "", skills=skills,
             focus=e.get("focus") is True,
@@ -196,8 +202,8 @@ def clone_entries(args: object) -> tuple[list[CloneEntry], list[str]]:
             seed_row_ids=_typed_list(e, name="seed_row_ids", kind=int, index=i, violations=v)))
     focus = [e.index for e in entries if e.focus]
     if len(focus) > 1:
-        v.append(f"at most one entry may have focus=true (entries {focus} do): only one clone can "
-                 "take the conversation")
+        v.append(f"at most one entry may have focus=true (entries {focus} do): only one branch can "
+                 "carry the conversation")
     return entries, v
 
 
@@ -230,14 +236,14 @@ def cancel_ids(args: object, limit: int) -> tuple[list[str], list[str]]:
     its index, shown as a short repr, and the others stand."""
     raw = args.get("cancel") if isinstance(args, dict) else None
     if not isinstance(raw, list) or not raw:
-        return [], ["`cancel` must be a list of one or more clone ids, for example [\"c2\"]"]
+        return [], ["`cancel` must be a list of one or more branch ids, for example [\"c2\"]"]
     if len(raw) > limit:
-        return [], [f"a cancel call takes at most {limit} clone ids (got {len(raw)})"]
+        return [], [f"a cancel call takes at most {limit} branch ids (got {len(raw)})"]
     ids: list[str] = []
     problems: list[str] = []
     for i, x in enumerate(raw):
         if not isinstance(x, str) or not GRAFT_ID.fullmatch(x):
-            problems.append(f"cancel[{i}]: not cancelled: {_echo(x)} is not a clone id (ids look like \"c2\")")
+            problems.append(f"cancel[{i}]: not cancelled: {_echo(x)} is not a branch id (ids look like \"c2\")")
         elif x not in ids:
             ids.append(x)
     return ids, problems
@@ -328,7 +334,7 @@ class Harness:
         if max_live_background < 1:
             raise ValueError(f"max_live_background must be at least 1, got {max_live_background}")
         if not says_live_cap(store, max_live_background):
-            raise ValueError(f"the installed clone skill does not say max_live_background={max_live_background}: "
+            raise ValueError(f"the installed branch skill does not say max_live_background={max_live_background}: "
                              f"install(store, max_live_background={max_live_background}) first")
         self.max_live_background = max_live_background
         self.max_cancel_ids = cancel_limit(max_live_background)  # ids one cancel call takes
@@ -340,7 +346,7 @@ class Harness:
         if call_timeout is not None and call_timeout <= 0:
             raise ValueError(f"call_timeout must be positive or None, got {call_timeout!r}")
         self.call_timeout = call_timeout
-        self.silent_done_refusals: list[str] = []  # clones whose join(done) was refused
+        self.silent_done_refusals: list[str] = []  # grafts whose merge(done) call was refused
         # Seed actor (graft/seeder.py): None = the original names the seed itself (GRAFT_SEEDER=model)
         self.seeder = seeder_mod.make_seeder() if seeder is ... else seeder
         self.seeder_log: list[dict] = []  # per clone: Jev latency, tokens, scores, selection, fallback
@@ -410,7 +416,7 @@ class Harness:
 
     # ------------------------------------------------------------ setup
     async def start(self, root: str = "o") -> None:
-        self.store.create_timeline(root, None, ["clone"])
+        self.store.create_timeline(tl=root, source=None, skills=["branch"])
         await self.machines.start_root(root)
 
     def _report_failure(self, *, kind: str, src: str | None, clones: list[str], error: BaseException,
@@ -424,25 +430,25 @@ class Harness:
         names = self._names(clones=clones, background=background)
         if kind == "wake":
             self.wake_errors.append(record)
-            line = f"(harness error: {names} joined, but reporting the result failed: {err})"
+            line = f"(harness error: {names} merged, but reporting the result failed: {err})"
             if not clones:
                 line = f"(harness error: a wake run failed: {err})"
         elif kind == "commit":
             self.commit_errors.append(record)
-            line = (f"(harness error: committing the join of {names} failed: {err}; "
-                    "the result is kept and the join will be retried)")
+            line = (f"(harness error: committing the merge of {names} failed: {err}; "
+                    "the result is kept and the merge will be retried)")
         elif kind == "abandon":
-            line = (f"(harness error: the join of {names} could not be applied after {MAX_JOIN_ATTEMPTS} attempts "
-                    f"({err}); it is abandoned. Its work stays in its frozen timeline and is not part of the "
+            line = (f"(harness error: the merge of {names} could not be applied after {MAX_JOIN_ATTEMPTS} attempts "
+                    f"({err}); it is abandoned. What was done there stays in its frozen timeline and is not part of the "
                     "conversation's memory.)")
         elif kind == "cancel":
             self.task_errors.append(record)
             line = (f"(harness error: {names} was cancelled and stopped, but recording that failed: {err}; "
-                    "its join is queued and will still be applied)")
+                    "its merge is queued and will still be applied)")
         elif kind == "cancel_result":
             self.task_errors.append(record)
             what = (f"{names} was cancelled and stopped by that call" if clones
-                    else "no clone was stopped by that call")
+                    else "no branch was stopped by that call")
             line = f"(harness error: writing the result of a cancel call failed: {err}; {what})"
         else:  # task, machine, mirror
             self.task_errors.append(record)
@@ -695,7 +701,7 @@ class Harness:
             lines.append(f"{c}: not cancelled: {outcome}")
         if stopped:
             head = (f"cancelled -> {', '.join(stopped)} (stopped; "
-                    f"{'its' if len(stopped) == 1 else 'their'} work so far joins when this turn ends, "
+                    f"what you did in {'it' if len(stopped) == 1 else 'them'} so far merges when this turn ends, "
                     "and nothing already done outside this conversation is undone)")
             lines = [head, *lines]
         self.trace(f"cancel {call.ids}: stopped {stopped}")
@@ -707,10 +713,11 @@ class Harness:
         parts = [self.persona, skill_listing(
             self.store, names,
             "Your skills (call load_skill(name) to read a skill's full instructions before using it):")]
-        if "clone" in names:
+        if "branch" in names:
             catalog = [r[0] for r in self.store.con.execute(
                 "SELECT name FROM skills ORDER BY skill_id") if r[0] not in BUILTIN]
-            parts.append(skill_listing(self.store, catalog, "Skill catalog (available to clones):"))
+            parts.append(skill_listing(store=self.store, names=catalog,
+                                       heading="Skill catalog (the skills a branch of yours can hold):"))
         return "\n\n".join(parts)
 
     def load(self, tl: str, name: str) -> tuple[str, bool]:
@@ -732,12 +739,13 @@ class Harness:
 
     @staticmethod
     def _names(clones: list[str], background: bool, named: bool = True) -> str:
-        """'background clones c1, c2' / 'clone c1'; with named=False just the noun. `background`:
-        all of them are background grafts."""
+        """'background branches c1, c2' / 'branch c1'; with named=False just the noun. `background`:
+        all of them are background grafts. Grafts are told to the model, and to the user, as
+        branches (spec: What the model is told: branch and merge)."""
         if not clones:
-            return "a clone"
-        word = "background clone" if background else "clone"
-        word += "s" if len(clones) != 1 else ""
+            return "a branch"
+        word = "background branch" if background else "branch"
+        word += "es" if len(clones) != 1 else ""
         return f"{word} {', '.join(clones)}" if named else word
 
 
@@ -966,16 +974,16 @@ class Harness:
             if not uses:
                 return RunOutcome(kind="replied")  # a background graft's reply is its result
             allowed = {t["name"] for t in tools}
-            join_use = next((u for u in uses if u["name"] == "join" and "join" in allowed), None)
-            clone_use = next((u for u in uses if u["name"] == "clone" and "clone" in allowed), None)
+            join_use = next((u for u in uses if u["name"] == "merge" and "merge" in allowed), None)
+            clone_use = next((u for u in uses if u["name"] == "branch" and "branch" in allowed), None)
             refused_join = None
             if join_use and str(join_use["input"].get("reason")) == "done" and not self.replied(tl):
                 refused_join, join_use = join_use, None
                 self.silent_done_refusals.append(tl)
-                self.trace(f"[{tl}] join(done) refused: no reply since the last user message")
+                self.trace(f"[{tl}] merge(done) refused: no reply since the last user message")
             if join_use:
                 results = [ToolResult(use=u, content=NOT_RUN_JOINING, is_error=True) for u in uses if u is not join_use]
-                results.append(ToolResult(use=join_use, content="joined", is_error=False))
+                results.append(ToolResult(use=join_use, content="merged", is_error=False))
                 self._store_results(tl=tl, results=results)
                 return RunOutcome(kind="join", reason=_reason(str(join_use["input"].get("reason", "failed"))))
             if clone_use:
@@ -1004,12 +1012,12 @@ class Harness:
                 await self.may_continue(tl)
                 if u is refused_join:
                     if background:
-                        msg = ("join(reason='done') refused: you have not written your result yet. First "
-                               "write your final reply saying what you did; then call join(reason='done').")
+                        msg = ("merge(reason='done') refused: you have not written your result yet. First "
+                               "write your final reply saying what you did; then call merge(reason='done').")
                     else:
-                        msg = ("join(reason='done') refused: you have not replied to the user since "
+                        msg = ("merge(reason='done') refused: you have not replied to the user since "
                                "their last message. First tell the user, in one or two sentences, what "
-                               "you did; then call join(reason='done').")
+                               "you did; then call merge(reason='done').")
                     self._store_results(tl=tl, results=[ToolResult(use=u, content=msg, is_error=True)])
                 elif u["name"] == "cancel":  # whoever calls it, whatever tools it was shown: the machine decides
                     cancels.append(u)
@@ -1107,7 +1115,7 @@ class Harness:
             skills = [k["name"] for k in self.store.skills_for(c) if k["name"] not in BUILTIN]
             live.append(f"{c} (skills: {', '.join(skills)})")
         return ("Still running: " + ", ".join(live) + "." if live
-                else "No other clone of yours is still running.")
+                else "No other branch of yours is still running.")
 
 
     def wake_note(self, src: str, joined: list[tuple[str, str]], handed_back: bool, running: list[str],
@@ -1120,26 +1128,25 @@ class Harness:
         names = ", ".join(f"{c} ({r})" for c, r in joined)
         dropped = [c for c, _ in joined if c in self.join_dropped]
         kept = [c for c, _ in joined if c not in self.join_dropped]
-        where = "what they did is in the rows above." if kept else ""
+        where = "what you did there is in the rows above." if kept else ""
         if dropped:
             where = (where + " " if where else "") + (
-                f"The result of {', '.join(dropped)} did not fit in your context and stays in the frozen "
-                f"timeline of {'that clone' if len(dropped) == 1 else 'those clones'}; say so if asked.")
+                f"What you did in {', '.join(dropped)} did not fit in your context and stays in the frozen "
+                f"timeline of {'that branch' if len(dropped) == 1 else 'those branches'}; say so if asked.")
         task = ("A request came back: answer it. " if handed_back else "") + (
             "Then go on with what the user asked for that is still to do, unless a still-running "
-            "clone is already doing it. ")
+            "branch of yours is already doing it. ")
         cancelled = [c for c, r in joined if r == CANCELLED]
         if cancelled:
             many = len(cancelled) > 1
-            task = (f"You cancelled {', '.join(cancelled)}: tell the user it was stopped and what it had "
-                    f"already done. The part{'s' if many else ''} {', '.join(cancelled)} "
-                    f"{'were' if many else 'was'} doing cannot be cloned again until the user's next "
-                    "message. ") + task
+            task = (f"You cancelled {', '.join(cancelled)}: tell the user {'they were' if many else 'it was'} "
+                    f"stopped and what you had already done there. The part{'s' if many else ''} you were doing "
+                    f"in {', '.join(cancelled)} cannot be branched for again until the user's next message. ") + task
         self.store.add_turn(tl=src, role="user", kind="text", harness=True, content=(
-                            f"(harness note: {self._names(clones=[c for c, _ in joined], background=background, named=False)} "
-                            f"{names} joined; {where} {self._running_note(running)} "
-                            "You hold the conversation: tell the user, "
-                            f"in your own words, only the outcome of the clones that have joined. {task}"
+                            f"(harness note: your {self._names(clones=[c for c, _ in joined], background=background, named=False)} "
+                            f"{names} merged; {where} {self._running_note(running)} "
+                            "You hold the conversation: tell the user, in your own words and in the first "
+                            f"person, only what you did in the branches that have merged. {task}"
                             "Do not describe still-running work as finished.)"))
         self.wakes.append({"source": src, "joined": joined})
         self.trace(f"[{src}] WAKE for joins: {names}")
@@ -1206,14 +1213,14 @@ class Harness:
         have = self.store.pointed(src)
         rows = [r["row_id"] for r in self.store.working_view(child)
                 if r["kind"] == "text" and r["row_id"] not in have and r["row_id"] != trigger]
-        error = (f"(harness note: clone {child} failed; its timeline is frozen)"
+        error = (f"(harness note: your branch {child} failed; its timeline is frozen)"
                  if reason == "failed" else None)
         if reason == CANCELLED:
             ran = self.tools_run(child, closing=closing)
-            error = (f"(harness note: clone {child} was cancelled before it finished; its timeline is frozen. "
-                     f"Before it was stopped it had run: {', '.join(ran) if ran else 'no tools'}. "
-                     "Nothing it did outside this conversation was undone; a tool that returned an error "
-                     "may still have acted before it failed.)")
+            error = (f"(harness note: your branch {child} was cancelled before it finished; its timeline is "
+                     f"frozen. Before it was stopped you had run there: {', '.join(ran) if ran else 'no tools'}. "
+                     "Nothing you did there outside this conversation was undone; a tool that returned an "
+                     "error may still have acted before it failed.)")
         if trigger is not None and trigger not in have:
             rows.append(trigger)
         return rows, error
@@ -1239,20 +1246,21 @@ class Harness:
         the record. Returns (rows to append, record)."""
         listed = ", ".join(map(str, rows)) or "none"
         live = self._running_note(running)
-        full = (rows, f"(harness note: clone {child} joined, reason={reason}; remembered rows {listed} "
-                      f"follow. {live})")
+        where = (f"what you did there is in the remembered rows {listed}, which follow." if rows
+                 else "it brings back no rows you do not already hold.")
+        full = (rows, merge_head(child=child, reason=reason) + f"{where} {live})")
         if self.window_tokens is None:
             return full
         limit = int(self.window_tokens * JOIN_WINDOW_FRACTION)
         base = self.store.working_view(src)
         trig = [trigger] if trigger is not None and trigger in rows else []
         last = next((r for r in reversed(rows) if r != trigger and self.store.turn(r)["role"] == "assistant"), None)
-        frozen = (f"(harness note: clone {child} joined, reason={reason}; its rows {listed} are too large "
+        frozen = (merge_head(child=child, reason=reason) + f"its rows {listed} are too large "
                   f"for this context, so only {{kept}} follow; the rest stay in {child}'s frozen timeline. "
                   f"{live})")
         tiers = [full]
         if last is not None:
-            tiers.append(([last] + trig, frozen.format(kept=f"its last reply (row {last})"
+            tiers.append(([last] + trig, frozen.format(kept=f"your last reply there (row {last})"
                                                        + (" and the trigger" if trig else ""))))
         tiers.append((trig, frozen.format(kept="the trigger" if trig else "this note")))
         before = compaction.estimate_tokens(render(base + self._join_tail(src, full[1], rows, error, trigger)))
@@ -1299,7 +1307,9 @@ class Harness:
             if v:
                 # Cannot happen for well-formed text rows; keep the source continuable anyway.
                 self.trace(f"[{src}] default join invalid: {v}; appending record + trigger only")
-                self.store.commit_join(src, record.replace("follow", "skipped (invalid view)"), [], error=None,
+                skipped = (merge_head(child=child, reason=reason)
+                           + f"its rows were skipped (invalid view). {self._running_note(running)})")
+                self.store.commit_join(source=src, record=skipped, rows=[], error=None,
                                        trigger=trig, tx=tx, status="rolled_back", committed_sql=None,
                                        scratch={"default": True, "violations": v}, closing=closes)
                 return False
@@ -1463,9 +1473,9 @@ class Harness:
             err = _described(e)
             self._roll_back(src=src, txs=txs, scratch={"args": clone.use.get("input"), "error": err})
             self.trace(f"[{src}] clone refused: internal error: {err}")
-            tail = "Call clone once more." if retry_left \
+            tail = "Call branch once more." if retry_left \
                 else "No retries left for this message; answer the user instead."
-            return f"clone refused; no clone was created: internal error ({err}).\n{tail}"
+            return f"branch refused; no branch was started: internal error ({err}).\n{tail}"
         if isinstance(prepared, str):
             return prepared
         batch, pairs, parts = prepared
@@ -1493,9 +1503,9 @@ class Harness:
         detail = f"internal error ({_described(error)})" if error is not None else why
         self._roll_back(src=src, txs=batch.txs, scratch={"refused": detail})
         self.trace(f"[{src}] clone refused: {detail}")
-        tail = "Call clone once more." if batch.retry_left \
+        tail = "Call branch once more." if batch.retry_left \
             else "No retries left for this message; answer the user instead."
-        return f"clone refused; no clone was created: {detail}.\n{tail}"
+        return f"branch refused; no branch was started: {detail}.\n{tail}"
 
     async def _prepare_clone(self, src: str, use: dict, *, retry_left: bool, txs: list[int]
                              ) -> str | tuple[CloneBatch, list[tuple[str, bool]], list]:
@@ -1534,7 +1544,7 @@ class Harness:
             if decision is not None:
                 sc["seeder"] = decision
             scratch.append(sc)
-        violations = shape + [f"clone[{e.index}]: {x}" for e, v in zip(entries, per_entry) for x in v]
+        violations = shape + [f"branch[{e.index}]: {x}" for e, v in zip(entries, per_entry) for x in v]
         if violations:
             for tx, sc in zip(txs, scratch):
                 self.store.end_tx(tx, status="rolled_back", committed_sql=None,
@@ -1543,10 +1553,10 @@ class Harness:
                 self.store.end_tx(self.store.begin_tx(src, "clone"), status="rolled_back", committed_sql=None,
                                   scratch={"violations": violations})
             self.trace(f"[{src}] clone refused: {violations}")
-            tail = ("Fix the entries and call clone once more.\n" + self.seed_index(src)) if retry_left \
+            tail = ("Fix the entries and call branch once more.\n" + self.seed_index(src)) if retry_left \
                 else "No retries left for this message; answer the user instead."
-            return "clone refused; no clone was created:\n- " + "\n- ".join(violations) + "\n" + tail
-        grafts = [Graft(child=child, seed=seed, skills=e.skills + ["join" if e.focus else "background"],
+            return "branch refused; no branch was started:\n- " + "\n- ".join(violations) + "\n" + tail
+        grafts = [Graft(child=child, seed=seed, skills=e.skills + ["merge" if e.focus else "background"],
                         focus=e.focus)
                   for child, e, (seed, _) in zip(ids, entries, resolved)]
         parts, audits = [], []
@@ -1555,6 +1565,6 @@ class Harness:
             audits.append((tx, f"CLONE {g.child} {mode} SEED {g.seed} SKILLS {g.skills}", sc))
             parts.append(f"{g.child} ({'focus, active' if g.focus else 'background, running'}; "
                          f"seed rows {g.seed}; skills {g.skills})")
-        batch = CloneBatch(grafts=grafts, audits=audits, text="cloned -> " + ", ".join(parts), txs=list(txs),
+        batch = CloneBatch(grafts=grafts, audits=audits, text="branched -> " + ", ".join(parts), txs=list(txs),
                            retry_left=retry_left)
         return batch, pairs, [(e.index, frozenset(e.skills)) for e in entries]

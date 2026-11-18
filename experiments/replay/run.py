@@ -56,11 +56,11 @@ EDIT_NOTE = ("You are a subagent working on the task below in a disposable check
              "tools to investigate and make the changes (Edit/Write); you can run the test suite with "
              "`uv run pytest -q` (offline). You cannot ask questions. When done, reply with your final report for "
              "the agent that delegated the task: what you changed and the test result.")
-EDIT_SKILL = Skill("code_edit", "Read, search and edit the repository checkout, and run its tests.",
-                   "Code editing skill: Read, Grep, Glob, Edit, Write and a restricted Bash (ls, cat, rg, grep, find, "
+EDIT_SKILL = Skill(name="code_edit", description="Read, search and edit the repository checkout, and run its tests.",
+                   instructions="Code editing skill: Read, Grep, Glob, Edit, Write and a restricted Bash (ls, cat, rg, grep, find, "
                    "wc, head, tail, git log/show/diff/ls-files/status, and `uv run pytest`, offline). Make the change "
                    "the task asks for, run the tests, then reply with your final report (what you changed and the "
-                   "test result) and call join(reason='done').", sandbox.TOOLS + sandbox.WRITE_TOOLS)
+                   "test result) and call merge(reason='done').", tools=sandbox.TOOLS + sandbox.WRITE_TOOLS)
 TEST_PREFIXES = [["uv", "run", "pytest"], ["uv", "run", "--frozen", "--offline", "pytest"]]
 TEST_CMD = ["uv", "run", "--frozen", "--offline", "pytest", "-q", "-p", "no:cacheprovider", "-m", "not live"]
 
@@ -99,10 +99,10 @@ def recorded_test_paths(e) -> list[str]:
                 if tok.startswith("tests") and not tok.startswith("--"):
                     seen[tok.split("::")[0].rstrip("/")] += 1
     return [p for p, _ in seen.most_common()]
-CODE_SKILL = Skill("code_read", "Read and search the repository checkout (read-only).",
-                   "Code reading skill: Read, Grep, Glob and a read-only Bash (ls, cat, rg, grep, find, wc, head, "
+CODE_SKILL = Skill(name="code_read", description="Read and search the repository checkout (read-only).",
+                   instructions="Code reading skill: Read, Grep, Glob and a read-only Bash (ls, cat, rg, grep, find, wc, head, "
                    "tail, git log/show/diff/ls-files). You cannot write files. Work from the task you were given, "
-                   "then reply with your final report and call join(reason='done').", sandbox.TOOLS)
+                   "then reply with your final report and call merge(reason='done').", tools=sandbox.TOOLS)
 
 
 def cost_of(usage_by_model: dict) -> float | None:
@@ -189,7 +189,7 @@ async def arm_g(e, sb: sandbox.Sandbox, max_steps: int, workdir: str) -> dict:
     t0 = time.perf_counter()
     # one focus graft: the replay hands the recorded subtask to a single clone and joins it back
     await h.begin_turn("o")  # a clone call belongs to a turn of the source
-    _, child, text = await h.clone_call(src="o", use={"id": "replay", "name": "clone", "input": {"clone": [{
+    _, child, text = await h.clone_call(src="o", use={"id": "replay", "name": "branch", "input": {"branch": [{
         "purpose": f"{e.description}: {e.handoff[:1500]}", "skills": [skill.name], "focus": True}]}})
     forced = False
     if child:

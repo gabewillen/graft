@@ -157,9 +157,9 @@ def select_topk(e: Event, scores: dict[int, float], k: int) -> set[int]:
 
 
 # ------------------------------------------------------------------ scorers
-NOUL_TRUE = ("The clone needs this message: it carries facts, names, numbers, requirements or "
+NOUL_TRUE = ("The branch needs this message: it carries facts, names, numbers, requirements or "
              "preferences the new task should use, or it is the request for the task.")
-NOUL_FALSE = "The clone can do the new task well without this message."
+NOUL_FALSE = "The branch can do the new task well without this message."
 
 
 def jev_request(e: Event) -> tuple[dict, dict]:
@@ -171,7 +171,7 @@ def jev_request(e: Event) -> tuple[dict, dict]:
              "conversation": [{"row_id": c["row_id"], "role": c["role"], "text": c["text"][:2000]}
                               for c in e.candidates]}
     questions = {f"row_{c['row_id']}": typesafe_sdk.Noul(
-        instructions={"question": "Does a clone doing the new task need this message from the conversation?",
+        instructions={"question": "Does a branch doing the new task need this message from the conversation?",
                       "row_id": c["row_id"], "message": c["text"][:600]},
         criteria={"true": NOUL_TRUE, "false": NOUL_FALSE}) for c in e.candidates}
     return state, questions
@@ -200,6 +200,9 @@ LUNA_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["ro
                                         "required": ["row_id", "needed", "confidence"],
                                         "properties": {"row_id": {"type": "integer"}, "needed": {"type": "boolean"},
                                                        "confidence": {"type": "number"}}}}}}
+# The alternative selectors below (luna, needle, ...) are eval-only and keep the prompts the committed
+# results in experiments/results/ were made with; NOUL_TRUE, NOUL_FALSE and the question above match
+# graft/seeder.py, which the harness uses, and say "branch" as the model is told it.
 LUNA_SYSTEM = ("You choose which messages of a conversation a focused clone needs for its new task. The "
                "clone sees only the messages you choose. It needs every message that carries facts, names, "
                "numbers, requirements or preferences the task should use, and the request for the task. "

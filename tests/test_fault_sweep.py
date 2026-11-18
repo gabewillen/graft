@@ -175,7 +175,7 @@ class Policy(FaultScript):
         last = messages[-1]["content"][-1]
         request = user_texts(messages)[-1]
         if request == WAITING and names != {"compact"}:
-            if "clone" in names:
+            if "branch" in names:
                 if last["type"] == "text" and last["text"] == request:
                     entries = [clone_entry(skills=[k], focus=False, quotes=[request]) for k in WAITING_TOOLS]
                     return [clone_use(*entries, id=f"k{len(messages)}") | {"type": "tool_use"}]
@@ -188,14 +188,14 @@ class Policy(FaultScript):
             tool, args = WAITING_TOOLS[skill]
             return [{"type": "tool_use", "id": f"t{len(messages)}", "name": tool, "input": args}]
         if request in (TOOL, TOOL_FOCUS) and names != {"compact"}:
-            if "clone" in names:
+            if "branch" in names:
                 if last["type"] == "text" and last["text"] == request:
                     entry = clone_entry(skills=["website"], focus=request == TOOL_FOCUS, quotes=[request])
                     return [clone_use(entry, id=f"k{len(messages)}") | {"type": "tool_use"}]
                 return text("Reported." if is_wake(last) else "Started.")
             if last["type"] == "tool_result" and request == TOOL_FOCUS:
                 return [{"type": "text", "text": "site done"},
-                        {"type": "tool_use", "id": f"j{len(messages)}", "name": "join", "input": {"reason": "done"}}]
+                        {"type": "tool_use", "id": f"j{len(messages)}", "name": "merge", "input": {"reason": "done"}}]
             if last["type"] == "tool_result":
                 return text("site done")
             return [{"type": "tool_use", "id": f"w{len(messages)}", "name": "site_write",
@@ -209,7 +209,7 @@ class Policy(FaultScript):
 
 
 def acts(h, store) -> tuple[int, int, int]:
-    graft = sum(1 for c in h.provider.calls if "clone" not in {t["name"] for t in c["tools"]}
+    graft = sum(1 for c in h.provider.calls if "branch" not in {t["name"] for t in c["tools"]}
                 and {t["name"] for t in c["tools"]} != {"compact"})
     commits = store.con.execute("SELECT count(*) FROM transactions WHERE kind='clone' AND status='committed'"
                                 ).fetchone()[0]

@@ -108,13 +108,16 @@ def scripted(system, messages, tools):
     """Offline stand-in: the original clones website (focus) and three background parts."""
     names = {t["name"] for t in tools}
     last = messages[-1]["content"][-1]
-    use = lambda i, n, **a: {"type": "tool_use", "id": f"{i}{len(messages)}", "name": n, "input": a}  # noqa: E731
-    if "clone" in names:
+    use = lambda prefix, tool, **a: {"type": "tool_use", "id": f"{prefix}{len(messages)}", "name": tool,  # noqa: E731
+                                     "input": a}
+    if "branch" in names:
         if last["type"] == "tool_result" or last.get("harness"):
             return [{"type": "text", "text": "On it."}]
-        entry = lambda s, f: {"purpose": s, "skills": [s], "focus": f, "seed_quotes": [REQUEST[:40]]}  # noqa: E731
-        return [use("k", "clone", clone=[entry("website", True), entry("slides", False),
-                                          entry("calendar", False), entry("newsletter", False)])]
+        entry = lambda skill, focus: {"purpose": skill, "skills": [skill], "focus": focus,  # noqa: E731
+                                      "seed_quotes": [REQUEST[:40]]}
+        return [use(prefix="k", tool="branch", branch=[
+            entry(skill="website", focus=True), entry(skill="slides", focus=False),
+            entry(skill="calendar", focus=False), entry(skill="newsletter", focus=False)])]
     results = sum(1 for m in messages for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_result")
     if "slides_create" in names and results < 2:
         if results == 1:
@@ -179,7 +182,7 @@ async def run(live: bool, trace: bool, gate: bool = False) -> dict:
             kinds[g.get("child")] = g.get("focus")
     clones = []
     for tl, status, reason in rows:
-        skills = [k["name"] for k in store.skills_for(tl) if k["name"] not in ("join", "background")]
+        skills = [k["name"] for k in store.skills_for(tl) if k["name"] not in ("merge", "background")]
         replied = any(r["role"] == "assistant" and r["kind"] == "text" for r in store.view(tl)
                       if r["owner_timeline"] == tl)
         clones.append({"clone": tl, "skills": skills, "status": status, "join_reason": reason,

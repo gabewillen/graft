@@ -210,7 +210,7 @@ def test_turn_structure_validated_after_partition(tmp_path):
     """A partition that leaves a tool_use without its tool_result is refused by the validator."""
     store = Store(str(tmp_path / "v.db"))
     install(store)
-    store.create_timeline("o", None, ["clone"])
+    store.create_timeline(tl="o", source=None, skills=["branch"])
     u = store.add_turn("o", "user", "text", "hi")
     tu = store.add_turn("o", "assistant", "tool_use", {"id": "x", "input": {}}, "load_skill")
     tr = store.add_turn("o", "user", "tool_result", {"tool_use_id": "x", "content": "ok"}, "load_skill")
@@ -244,7 +244,7 @@ def test_summary_mode_is_one_user_row_over_the_whole_prefix(tmp_path):
 def test_working_view_follows_latest_compaction(tmp_path):
     s = Store(str(tmp_path / "w.db"))
     install(s)
-    s.create_timeline("o", None, ["clone"])
+    s.create_timeline(tl="o", source=None, skills=["branch"])
     a = s.add_turn("o", "user", "text", "old 1")
     b = s.add_turn("o", "assistant", "text", "old 2")
     fresh = s.add_turn("o", "user", "text", "fresh request")

@@ -56,7 +56,7 @@ async def chat(db_path: str, trace: bool) -> None:
         # Status and errors are diagnostics: stderr. stdout carries the conversation.
         # The store's copy of each graft's state says which are still running.
         if store.con.execute("SELECT 1 FROM timelines WHERE status = 'background' LIMIT 1").fetchone():
-            print("waiting for background clones to join...", file=sys.stderr)
+            print("waiting for background branches to merge...", file=sys.stderr)
         try:
             await h.settle()
         except Exception as e:  # already shown when it happened; do not end on a traceback

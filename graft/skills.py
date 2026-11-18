@@ -1,4 +1,5 @@
-"""Skill catalog: three built-ins (clone, join, background) and simulated capability skills.
+"""Skill catalog: three built-ins (branch, merge, background: graft's clone and join skills, as the
+model is told them) and simulated capability skills.
 
 Capability tools act on an in-memory `World` (fake website, slide deck, calendar).
 Tool names use underscores because API tool names cannot contain dots.
@@ -28,8 +29,11 @@ LOAD_SKILL_TOOL = {
                    "using a skill's tools for the first time.",
     "input_schema": obj({"name": S}, ["name"])}
 
+# graft's join, as the model is told it: a branch of yourself merging back (spec: What the model is
+# told: branch and merge).
 JOIN_TOOL = {
-    "name": "join", "description": "End this task: done, out_of_scope, or failed.",
+    "name": "merge", "description": "End this branch: done, out_of_scope, or failed. What you did here "
+                                    "merges back into your memory.",
     "input_schema": obj({"reason": {"type": "string", "enum": ["done", "out_of_scope", "failed"]}},
                         ["reason"])}
 
@@ -41,15 +45,15 @@ def cancel_limit(max_live_background: int) -> int:
 # Graft ids in one cancel call at the default cap; a harness with another cap takes twice its cap.
 MAX_CANCEL_IDS = cancel_limit(MAX_LIVE_BACKGROUND)
 
-# `cancelled` is not a reason a clone can give: only the harness sets it, when the original cancels.
+# `cancelled` is not a reason a graft can give: only the harness sets it, when the original cancels.
 CANCEL_TOOL = {
     "name": "cancel",
-    "description": "Stop background clones of yours that are still running, by id. Each one is "
-                   "stopped where it is and its work so far joins your conversation when your turn ends.",
+    "description": "Stop background branches of yours that are still running, by id. Each one is "
+                   "stopped where it is and what you did in it so far merges back when your turn ends.",
     "input_schema": obj(props={"cancel": {"type": "array", "minItems": 1, "maxItems": MAX_CANCEL_IDS, "items": S}},
                         required=["cancel"])}
 
-MAX_CLONE_ENTRIES = 4  # entries (clones) in one clone call
+MAX_CLONE_ENTRIES = 4  # entries (branches) in one branch call
 
 CLONE_ENTRY = obj({"purpose": S, "skills": STRS, "focus": {"type": "boolean"},
                    "seed_quotes": STRS, "seed_row_ids": INTS}, ["purpose", "skills", "focus"])
@@ -60,73 +64,79 @@ BASE_SYSTEM = (
     "assistant and you narrow your tools for each task."
 )
 
+# The `branch` skill: graft's clone skill, as the original is told it.
 CLONE_INSTRUCTIONS = """\
-You hold only the `clone` skill. You converse, route, clone and absorb joins; every other
-capability (see the skill catalog below) requires a clone.
+You hold only the `branch` skill. You talk with the user and route each request, and you work on
+a request by branching yourself: a branch is you, carrying on with one part of the conversation
+and holding only the skills that part needs. Every other capability (see the skill catalog
+below) is used in a branch.
 ROUTING RULE: as soon as the user's request falls under a catalog skill (for example they want a
-website, slides, or a calendar booking), call `clone` right away, in that same turn, without text.
-Do not gather requirements, draft content, or plan the work yourself; a clone does that. Only
-answer yourself when no catalog skill applies.
+website, slides, or a calendar booking), call `branch` right away, in that same turn, without text.
+Do not gather requirements, draft content, or plan the work here; you do that in the branch. Only
+answer here when no catalog skill applies.
 
-CLONE (one call per user message). `clone(clone=[...])` takes a list of one to four clones and
-creates them all at once. At most four background clones of yours may be live at a time. Each entry has:
-- `purpose`: what this clone is for.
-- `skills`: catalog skill names to link (never `clone`, `join` or `background`).
+BRANCH (one call per user message). `branch(branch=[...])` takes a list of one to four branches and
+starts them all at once. At most four background branches of yours may be live at a time. Each entry has:
+- `purpose`: what this branch is for.
+- `skills`: catalog skill names the branch holds (never `branch`, `merge` or `background`).
 - `focus` (required): true or false. At most one entry may have `focus: true`.
-  - `focus: true`: this clone takes over the conversation and talks to the user directly; you
-    are suspended until it joins. Use it when the task needs the user: requirements are still
+  - `focus: true`: in this branch you carry on the conversation with the user; here you are
+    paused until it merges. Use it when the task needs the user: requirements are still
     open, or the user will want to iterate on the result.
-  - `focus: false`: this clone works in the background and never talks to the user; you keep
+  - `focus: false`: in this branch you work out of sight and never talk to the user; here you keep
     the conversation. Use it when the task is fully specified by what the user already said and
-    is independent of the other clones. A request with several independent parts is one `clone`
+    is independent of the other branches. A request with several independent parts is one `branch`
     call with one background entry per part.
-- the seed: the messages already in your conversation that this clone needs, as pointers (never
+- the seed: the messages already in your conversation that this branch needs, as pointers (never
   copies). Name each one either by `seed_quotes` (a short verbatim excerpt of that message, e.g.
   its first words; each must match exactly one message) or by `seed_row_ids` (the row ids that
-  harness notes list). Seed every user message that carries facts the clone needs (audience,
+  harness notes list). Seed every user message that carries facts the branch needs (audience,
   tone, constraints, prior work) and end with the user message that asks for the task.
-Each clone does only the part its skills cover and ignores the rest of the request, even when
+In each branch you do only the part its skills cover and ignore the rest of the request, even when
 its seed is the whole message. So a request with several parts needs one entry per part: a part
 with no entry is done by nobody.
 If any entry is invalid the whole call is refused, with the violations per entry and an index of
-your messages, and no clone is created; fix it and call `clone` once more.
-Background clones do not share locks: never give two clones work that changes the same thing.
-After a call with no focus clone, tell the user briefly what you started. While background
-clones run you keep talking to the user; you cannot steer a running clone.
+your messages, and no branch is started; fix it and call `branch` once more.
+Background branches do not share locks: never give two branches work that changes the same thing.
+After a call with no focus branch, tell the user briefly what you started. While background
+branches run you keep talking to the user; a running branch cannot be steered from here.
 
-CANCEL. `cancel(cancel=["c2", ...])` stops background clones of yours that are still running;
-harness notes and the clone result give their ids. Use it when the user asks you to stop a part,
-or when a part is no longer needed. Only you can cancel: a clone never cancels another clone. A
-cancelled clone is stopped where it is and joins like any other when your turn ends: you get the
-messages it had written and a note naming the tools it had already run. Nothing it already did
-outside the conversation (a page written, a booking made) is undone, so tell the user what was
-left behind. An id that is unknown, is a focus clone, or has already finished is reported in the
-result and nothing happens for it. To replace a part with different work, call `cancel` and
-`clone` in the same response: the cancel runs first, so the cancelled clone's place is free for
-the new one. Do not clone again for the same part you cancelled unless the user asks for it in
-a new message; that entry is refused. Any tool call other than `cancel` beside a `clone` call
-is skipped.
+CANCEL. `cancel(cancel=["c2", ...])` stops background branches of yours that are still running;
+harness notes and the branch result give their ids. Use it when the user asks you to stop a part,
+or when a part is no longer needed. You cancel only from here: in a branch you never cancel another
+branch. A cancelled branch is stopped where it is and merges like any other when your turn ends:
+you get the messages you had written in it and a note naming the tools you had already run there.
+Nothing you already did there outside the conversation (a page written, a booking made) is undone,
+so tell the user what was left behind. An id that is unknown, is a focus branch, or has already
+finished is reported in the result and nothing happens for it. To replace a part with different
+work, call `cancel` and `branch` in the same response: the cancel runs first, so the cancelled
+branch's place is free for the new one. Do not branch again for the same part you cancelled unless
+the user asks for it in a new message; that entry is refused. Any tool call other than `cancel`
+beside a `branch` call is skipped.
 
-JOIN (automatic). When a clone joins, the harness remembers for you, with no decision on your
-part: it appends a note listing the row ids, then the text messages (user and assistant) of the
-clone's conversation that you do not already have. If a focus clone left because the user asked
-for something else, that message is the last one; route it (usually: clone again, seeding from
-the rows you now hold). Harness notes list which of your clones are still running. If a focus
-clone hands a request back while background clones from the same call are still running, do not
-clone again for the parts those clones are doing: clone only for what nobody is doing. Background clones join when you are free: their results appear the same
-way, followed by a harness note asking you to tell the user the outcome. Do that in your own
-words, report only what has joined, and never describe still-running work as finished. Then go
-on with what the user asked for that is still to do: you may clone for it, as in any turn. Do
-not clone again for work that just finished.
+MERGE (automatic). When a branch merges, what you did there becomes your memory here, with no
+decision on your part: the harness appends a note listing the row ids, then the text messages
+(user and assistant) of that branch's conversation that you do not already have. If you left a
+focus branch because the user asked for something else, that message is the last one; route it
+(usually: branch again, seeding from the rows you now hold). Harness notes list which of your
+branches are still running. If a focus branch hands a request back while background branches from
+the same call are still running, do not branch again for the parts those branches are doing:
+branch only for what nobody is doing. Background branches merge when you are free: what you did in
+them appears the same way, followed by a harness note asking you to tell the user the outcome. Tell
+the user what you did, in your own words and in the first person (you did it; never say a branch
+did), report only what has merged, and never describe still-running work as finished. Then go on
+with what the user asked for that is still to do: you may branch for it, as in any turn. Do not
+branch again for work that just finished.
 """
 
+# The `merge` skill: graft's join skill, linked to every focus graft.
 JOIN_INSTRUCTIONS = """\
-You are a focused instance of the assistant for one task, holding only the skills listed here.
-You talk to the user directly. Do the task with your tools.
+You are working on one part of the conversation in a branch of yourself, holding only the skills
+listed here. You talk to the user directly. Do the task with your tools.
 - YOUR PART. The messages you start with may ask for several things. Do only the part your
-  skills cover. The other parts are handled by other instances of the assistant: do not attempt
-  them, do not apologise for them, and do not mention them. Their presence in the messages you
-  start with is never a reason to join `out_of_scope` or `failed`.
+  skills cover. The other parts are being done in other branches of yourself: do not attempt
+  them here, do not apologise for them, and do not mention them. Their presence in the messages
+  you start with is never a reason to call `merge` with `out_of_scope` or `failed`.
 - IN SCOPE, always (handle it yourself; ask clarifying questions if needed): every detail about
   your current deliverable, such as its content, services or products offered, audience, tone,
   style, structure, revisions, and questions about it. A message that adds facts or requirements
@@ -134,68 +144,70 @@ You talk to the user directly. Do the task with your tools.
 - OUT OF SCOPE, only for a message the user sends after you started: the user asks for a
   different kind of deliverable (for example a slide show while you build a website, or an
   email), or for an action none of your tools can perform. Then call
-  `join(reason="out_of_scope")` immediately, without writing any text and without acting on any
+  `merge(reason="out_of_scope")` immediately, without writing any text and without acting on any
   part of that message. Never tell the user you can't do something.
 - When the task is complete: first give the user your final reply, one or two sentences saying
-  what you did, and then call `join(reason="done")`. You may never end silently: `join(done)` is
+  what you did, and then call `merge(reason="done")`. You may never end silently: `merge(done)` is
   refused unless you have replied to the user since their last message.
-- If you cannot do your own part, call `join(reason="failed")`.
+- If you cannot do your own part, call `merge(reason="failed")`.
 """
 
 
+# The `background` skill: linked to every background graft, with the same `merge` tool.
 BACKGROUND_INSTRUCTIONS = """\
-You are a focused instance of the assistant for one task, holding only the skills listed here,
-and you run in the background: nothing you write reaches the user, and you cannot ask them
-anything. Do the task with your tools, using only what your conversation already contains.
+You are working on one part of the conversation in a background branch of yourself, holding only
+the skills listed here: nothing you write here reaches the user, and you cannot ask them
+anything. Do the task with your tools, using only what this conversation already contains.
 - YOUR PART. The messages you start with may ask for several things. Do only the part your
-  skills cover. The other parts are handled by other instances of the assistant: do not attempt
-  them, do not apologise for them, and do not mention them. Their presence in the messages you
-  start with is never a reason to join `out_of_scope` or `failed`.
+  skills cover. The other parts are being done in other branches of yourself: do not attempt
+  them here, do not apologise for them, and do not mention them. Their presence in the messages
+  you start with is never a reason to call `merge` with `out_of_scope` or `failed`.
 - Never ask a question and never wait for an answer. If a detail is missing, choose a sensible
   default and say which one you chose.
 - When your part is complete: write your result as a final reply, exactly as you would tell the
-  user (what you did, and anything you assumed or could not determine). This reply is what the
-  assistant will remember of your work. Then call `join(reason="done")`.
-- Call `join(reason="failed")` only if you could not do your own part; say why in a final reply
+  user (what you did, and anything you assumed or could not determine). This reply is what you
+  will remember of this work when the branch merges. Then call `merge(reason="done")`.
+- Call `merge(reason="failed")` only if you could not do your own part; say why in a final reply
   first.
 """
 
 CATALOG: list[Skill] = [
-    Skill("clone",
-          "Built-in. When a user request needs any catalog skill, call clone(clone=[...]) right "
-          "away, with no text, instead of doing or planning the work yourself. Each entry is one "
-          "clone: one with focus=true talks to the user; entries with focus=false work in the "
-          "background. cancel(cancel=[ids]) stops background clones that are still running. Load this "
-          "skill for the focus and seed rules, cancelling, and the join protocol.",
-          CLONE_INSTRUCTIONS, [
+    Skill(name="branch",
+          description="Built-in. When a user request needs any catalog skill, call branch(branch=[...]) right "
+          "away, with no text, instead of doing or planning the work here. Each entry is a branch "
+          "of yourself holding only the skills its part needs: in one with focus=true you carry the "
+          "conversation with the user; entries with focus=false work out of sight. "
+          "cancel(cancel=[ids]) stops background branches that are still running. Load this skill "
+          "for the focus and seed rules, cancelling, and how branches merge.",
+          instructions=CLONE_INSTRUCTIONS, tools=[
         LOAD_SKILL_TOOL,
-        {"name": "clone", "description": "Create one or more clones in one call. Each entry names its "
-                                         "purpose, the skills to link, whether it takes the conversation "
-                                         "(focus: at most one true), and its seed (messages of yours, by "
-                                         "short verbatim quote or by row id).",
-         "input_schema": obj({"clone": {"type": "array", "minItems": 1, "maxItems": MAX_CLONE_ENTRIES,
-                                        "items": CLONE_ENTRY}}, ["clone"])},
+        {"name": "branch", "description": "Branch yourself, one branch per entry, in one call. Each entry "
+                                          "names its purpose, the skills that branch holds, whether you "
+                                          "carry the conversation in it (focus: at most one true), and its "
+                                          "seed (messages of yours, by short verbatim quote or by row id).",
+         "input_schema": obj(props={"branch": {"type": "array", "minItems": 1, "maxItems": MAX_CLONE_ENTRIES,
+                                         "items": CLONE_ENTRY}}, required=["branch"])},
         CANCEL_TOOL,
     ]),
-    Skill("join",
-          "Built-in. You are a focused instance for one task; details about that task are always in "
-          "scope. The messages you start with may ask for several things: do only the part your "
-          "skills cover and say nothing about the rest; other instances handle it. Only if a "
-          "message the user sends after you started asks for a different kind of deliverable or a "
-          "capability your skills lack, call join(reason='out_of_scope') at once with no text. When "
-          "the task is finished, reply to the user first, then call join(reason='done'). Load this "
-          "skill for details.",
-          JOIN_INSTRUCTIONS, [
+    Skill(name="merge",
+          description="Built-in. You are working on one part of the conversation in a branch of yourself; details "
+          "about that part are always in scope. The messages you start with may ask for several "
+          "things: do only the part your skills cover and say nothing about the rest; you are doing "
+          "it in other branches. Only if a message the user sends after you started asks for a "
+          "different kind of deliverable or a capability your skills lack, call "
+          "merge(reason='out_of_scope') at once with no text. When the task is finished, reply to "
+          "the user first, then call merge(reason='done'). Load this skill for details.",
+          instructions=JOIN_INSTRUCTIONS, tools=[
         LOAD_SKILL_TOOL,
         JOIN_TOOL,
     ]),
-    Skill("background",
-          "Built-in. You are a focused instance for one task, working in the background: you cannot "
-          "reach the user, so never ask questions. The messages you start with may ask for several "
-          "things: do only the part your skills cover and say nothing about the rest; other "
-          "instances handle it. Write your result as a final reply, then call join(reason='done'). "
-          "Load this skill for details.",
-          BACKGROUND_INSTRUCTIONS, [
+    Skill(name="background",
+          description="Built-in. You are working on one part of the conversation in a background branch of "
+          "yourself: you cannot reach the user, so never ask questions. The messages you start with "
+          "may ask for several things: do only the part your skills cover and say nothing about the "
+          "rest; you are doing it in other branches. Write your result as a final reply, then call "
+          "merge(reason='done'). Load this skill for details.",
+          instructions=BACKGROUND_INSTRUCTIONS, tools=[
         LOAD_SKILL_TOOL,
         JOIN_TOOL,
     ]),
@@ -254,7 +266,7 @@ CATALOG: list[Skill] = [
     ]),
 ]
 
-BUILTIN = ("clone", "join", "background")
+BUILTIN = ("branch", "merge", "background")
 
 
 def load_skill(store: Store, linked: set[str], name: str) -> tuple[str, bool]:
@@ -271,7 +283,7 @@ def skill_listing(store: Store, names: list[str], heading: str) -> str:
     return heading + "\n" + "\n".join(f"- {r[0]}: {r[1]}" for r in rows if r)
 
 
-LIVE_CAP_SENTENCE = "At most four background clones of yours may be live at a time."
+LIVE_CAP_SENTENCE = "At most four background branches of yours may be live at a time."
 
 
 def catalog(max_live_background: int = MAX_LIVE_BACKGROUND) -> list[Skill]:
@@ -280,15 +292,15 @@ def catalog(max_live_background: int = MAX_LIVE_BACKGROUND) -> list[Skill]:
     another cap is said in the clone skill's text (a cap above the four entries a clone call
     takes is reached across calls) and bounds the cancel tool's list."""
     if LIVE_CAP_SENTENCE not in CLONE_INSTRUCTIONS:  # the text drifted: the cap could not be said
-        raise ValueError("the clone skill no longer says the live cap as LIVE_CAP_SENTENCE")
+        raise ValueError("the branch skill no longer says the live cap as LIVE_CAP_SENTENCE")
     if max_live_background == MAX_LIVE_BACKGROUND:
         return CATALOG
-    said = (f"At most {max_live_background} background clones of yours may be live at a time"
-            + (" (across clone calls: one call takes at most four)." if max_live_background > MAX_CLONE_ENTRIES
+    said = (f"At most {max_live_background} background branches of yours may be live at a time"
+            + (" (across branch calls: one call takes at most four)." if max_live_background > MAX_CLONE_ENTRIES
                else "."))
     out = []
     for skill in CATALOG:
-        if skill.name == "clone":
+        if skill.name == "branch":
             tools = copy.deepcopy(skill.tools)
             for t in tools:
                 if t["name"] == "cancel":
@@ -302,11 +314,11 @@ def says_live_cap(store: Store, max_live_background: int) -> bool:
     """Does the store's installed clone skill say this cap, and its cancel tool take twice it, as
     `install` wrote them? True if no clone skill is installed: a store a host fills itself (tests,
     a bare harness) has no text that could say another cap, so there is nothing to disagree."""
-    row = store.con.execute("SELECT instructions FROM skills WHERE name='clone'").fetchone()
+    row = store.con.execute("SELECT instructions FROM skills WHERE name='branch'").fetchone()
     tool = store.con.execute("SELECT input_schema FROM tools WHERE name='cancel'").fetchone()
     if row is None or tool is None:
         return True
-    want = next(s.instructions for s in catalog(max_live_background) if s.name == "clone")
+    want = next(s.instructions for s in catalog(max_live_background=max_live_background) if s.name == "branch")
     taken = json.loads(tool[0])["properties"]["cancel"].get("maxItems")
     return row[0] == want and taken == cancel_limit(max_live_background)
 

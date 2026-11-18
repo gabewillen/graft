@@ -10,7 +10,7 @@ truncated deterministically (recorded in the decision).
 
 With `model` (the default when TYPESAFE_API_KEY is unset) the original names the seed itself (seed_quotes / seed_row_ids). With
 `jev`, a TypeSafe Jev decision model picks the seed: one `system_one` request per clone with one
-Noul ("does a clone doing <purpose> need this message?") per candidate row. Candidates are the
+Noul ("does a branch doing <purpose> need this message?") per candidate row. Candidates are the
 text rows of the source's working view, excluding harness notes. Rows scoring at or above
 GRAFT_SEED_THRESHOLD (default 0.4) are seeded in view order, and the user's latest message (the
 trigger) is always seeded. The original's own seed fields are then ignored, except as the
@@ -35,10 +35,12 @@ NEIGHBOR_CHARS = 300
 MESSAGE_CHARS = 1500
 # Chosen offline (experiments/seed_eval.py, 140 stored long_compaction events, reduced design):
 # t=0.4 -> 140/140 events with full fact recall (single and chunked); t=0.5 -> 139 / 138; t=0.7 -> 136.
+# t=0.4 is unmeasured for the current question and criteria: the figures above are for the wording
+# that experiments/results/ records.
 DEFAULT_THRESHOLD = 0.4
-NOUL_TRUE = ("The clone needs this message: it carries facts, names, numbers, requirements or "
+NOUL_TRUE = ("The branch needs this message: it carries facts, names, numbers, requirements or "
              "preferences the new task should use, or it is the request for the task.")
-NOUL_FALSE = "The clone can do the new task well without this message."
+NOUL_FALSE = "The branch can do the new task well without this message."
 
 
 def seeder_name() -> str:
@@ -88,7 +90,7 @@ def _side(c: dict | None) -> dict | None:
 def reduced_question(candidates: list[dict], i: int, max_message_chars: int = MESSAGE_CHARS) -> dict:
     """The Noul instructions for candidate i: the row plus one neighbour on each side."""
     c = candidates[i]
-    return {"question": "Does a clone doing the new task need this message from the conversation?",
+    return {"question": "Does a branch doing the new task need this message from the conversation?",
             "row_id": c["row_id"], "role": c["role"], "message": c["text"][:max_message_chars],
             "before": _side(candidates[i - 1] if i > 0 else None),
             "after": _side(candidates[i + 1] if i + 1 < len(candidates) else None)}
@@ -129,7 +131,7 @@ def jev_request(purpose: str, candidates: list[dict], trigger_text: str) -> tupl
              "conversation": [{"row_id": c["row_id"], "role": c["role"], "text": c["text"][:2000]}
                               for c in candidates]}
     questions = {f"row_{c['row_id']}": typesafe_sdk.Noul(
-        instructions={"question": "Does a clone doing the new task need this message from the conversation?",
+        instructions={"question": "Does a branch doing the new task need this message from the conversation?",
                       "row_id": c["row_id"], "message": c["text"][:600]},
         criteria={"true": NOUL_TRUE, "false": NOUL_FALSE}) for c in candidates}
     return state, questions

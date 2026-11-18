@@ -11,7 +11,7 @@ from graft.skills import install
 def store(tmp_path):
     s = Store(str(tmp_path / "t.db"))
     install(s)
-    s.create_timeline("o", None, ["clone"])
+    s.create_timeline(tl="o", source=None, skills=["branch"])
     return s
 
 
@@ -40,7 +40,7 @@ def test_turns_and_context_are_append_only(store):
 
 def test_pointer_dedup_and_stored_once(store):
     rid = store.add_turn("o", "user", "text", "hi")
-    store.commit_clone("o", [Graft(child="c1", seed=[rid], skills=["website", "join"], focus=True)])
+    store.commit_clone(source="o", grafts=[Graft(child="c1", seed=[rid], skills=["website", "merge"], focus=True)])
     assert store.append("c1", rid) is None  # already pointed: skipped
     assert [r["row_id"] for r in store.view("c1")] == [rid]
     assert store.con.execute("SELECT count(*) FROM turns").fetchone()[0] == 1
@@ -89,6 +89,6 @@ def test_trigger_must_be_last():
 
 def test_tools_only_through_skills(store):
     rid = store.add_turn("o", "user", "text", "hi")
-    store.commit_clone("o", [Graft(child="c1", seed=[rid], skills=["website", "join"], focus=True)])
-    assert {t["name"] for t in store.tools_for("c1")} == {"site_write", "site_read", "join", "load_skill"}
+    store.commit_clone(source="o", grafts=[Graft(child="c1", seed=[rid], skills=["website", "merge"], focus=True)])
+    assert {t["name"] for t in store.tools_for("c1")} == {"site_write", "site_read", "merge", "load_skill"}
     assert "site_write" not in {t["name"] for t in store.tools_for("o")}

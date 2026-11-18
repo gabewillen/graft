@@ -126,11 +126,11 @@ def build_history(store: Store, tl: str) -> None:
 def build(path: str, provider):
     store = Store(path)
     install(store)
-    store.create_timeline("o", None, ["clone"])
+    store.create_timeline(tl="o", source=None, skills=["branch"])
     build_history(store, "o")
     task_row = store.add_turn("o", "user", "text", TASK)
     # clone arm: graft clone seeded only with the task-relevant user row
-    store.commit_clone("o", [Graft(child="c1", seed=[task_row], skills=["slides", "join"], focus=True)])
+    store.commit_clone(source="o", grafts=[Graft(child="c1", seed=[task_row], skills=["slides", "merge"], focus=True)])
     # shared arm: one timeline with every capability skill linked and the same history
     store.create_timeline("shared", None, CAPABILITY)
     for r in store.view("o"):
@@ -139,7 +139,7 @@ def build(path: str, provider):
     arms = {
         "clone": {
             "rows": store.view("c1"), "system": h.system("c1"), "tools": store.tools_for("c1"),
-            "linked": {"slides", "join"}},
+            "linked": {"slides", "merge"}},
         "shared": {
             "rows": store.view("shared"),
             "system": "\n\n".join([BASE_SYSTEM, skill_listing(
@@ -181,8 +181,8 @@ def agent_loop(provider, instructions: dict[str, str], arm: dict, world: World, 
             break
         results, stop = [], False
         for u in uses:
-            if u["name"] == "join":
-                content, err, stop = "joined", False, True
+            if u["name"] == "merge":
+                content, err, stop = "merged", False, True
             elif u["name"] == "load_skill":
                 loaded.append(str(u["input"].get("name")))
                 want = str(u["input"].get("name", ""))
