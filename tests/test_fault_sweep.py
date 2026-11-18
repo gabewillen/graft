@@ -43,6 +43,7 @@ import contextlib
 import dataclasses
 import gc
 import inspect
+import itertools
 import logging
 import re
 import threading
@@ -412,8 +413,11 @@ def run(tmp_path, monkeypatch, scenario: str, target: str | None = None, nth: in
     and `second`, if any, raises at its first call after that."""
     script = Policy()
     tmp_path.mkdir(parents=True)
-    store, h, said = make(tmp_path=tmp_path, policy=script, **({"compact_tokens": 400} if scenario == "compaction"
-                                                                  else {}))
+    # branch ids drawn c1, c2, ... by this harness itself: the sweep undoes the tests' monkeypatches
+    # between its runs, and the scripts stop a branch by the id it is known by (c1)
+    count = itertools.count(1)
+    store, h, said = make(tmp_path=tmp_path, policy=script, names=lambda: f"c{next(count)}",
+                          **({"compact_tokens": 400} if scenario == "compaction" else {}))
     case = Case(said=said)
     error = RuntimeError(f"INJECTED {target}#{nth}")
     error2 = RuntimeError(f"INJECTED {second}#after")
