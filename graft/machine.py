@@ -1344,12 +1344,11 @@ def joins_back(ctx, inst, event) -> bool:
 
 
 def rejoins(ctx, inst, event) -> bool:
-    """A focus graft whose turn a fault ended (a run of its model loop had begun since it was last
-    at rest, its request was not withdrawn, and it is not shutting down): it joins `failed`. One
-    that never ran, a turn its caller drives or a withdrawal already ended, and one being shut down
-    come to rest instead, as without the fault."""
-    return (inst.kind == "focus" and inst.in_turn and not (inst.closing or inst.final)
-            and not _run_withdrawn(inst))
+    """A focus graft whose turn a fault ended (`in_turn`: a run of its model loop began since it
+    was last at rest, and no withdrawal or shutdown cut it short, `turn_cut_short`; and it is not
+    shutting down): it joins `failed`. One that never ran, a turn its caller drives or a
+    withdrawal already ended, and one being shut down come to rest instead, as without the fault."""
+    return inst.kind == "focus" and inst.focus is None and inst.in_turn and not (inst.closing or inst.final)
 
 
 def turn_began(ctx, inst, event) -> None:  # entry of a run of the model loop
@@ -1357,8 +1356,8 @@ def turn_began(ctx, inst, event) -> None:  # entry of a run of the model loop
 
 
 def turn_cut_short(ctx, inst, event) -> None:
-    """Entry of `closing_calls`: the run was ended early (a withdrawal, shutdown), not by its own
-    end, so a fault from here on did not end a turn (`rejoins`)."""
+    """A withdrawal or shutdown ends the run early (not its own end, and not a guard that raised):
+    a fault from here on did not end a turn (`rejoins`)."""
     inst.in_turn = False
 
 
@@ -3170,7 +3169,9 @@ def give_up_fault(ctx, inst, event) -> None:
     _salvage(inst=inst, event=fault.event)
     inst.stopping, inst.pending = inst.stopping | inst.pending, set()
     _requeue_strays(inst)
-    at_rest = [w.reply for w in inst.waiters]
+    # the callers waiting to be answered at rest, but the ones a focus graft it made holds with the
+    # conversation (they are handed over, `given_up`, and answered after its turn's merge)
+    at_rest = [w.reply for w in inst.waiters] if inst.focus is None else []
     _restate_and_fail(inst=inst, fault=fault, errors=fault.errors, engaged=False, also=at_rest)
     inst.waiters = [w for w in inst.waiters if not w.reply.done()]
     inst.faulted = None
@@ -3756,18 +3757,18 @@ def _timeline(name: str) -> hsm.Model:
                     T(On("run_failed", E), S("../closing_calls"), G(error_already_shown), Effect(error_shown)),
                     T(On("run_failed", E), S("../closing_calls"),
                       Effect(checked(is_focus, error_to_user, error_already_shown, effects=(error_reported,)))),
-                    T(On("withdraw"), S("../closing_calls"), G(ends_run), Effect(note_withdrawn)),
-                    T(On("withdraw"), S("../closing_calls"), G(ends_wake), Effect(note_late_withdrawal)),
+                    T(On("withdraw"), S("../closing_calls"), G(ends_run), Effect(note_withdrawn, turn_cut_short)),
+                    T(On("withdraw"), S("../closing_calls"), G(ends_wake), Effect(note_late_withdrawal, turn_cut_short)),
                     T(On("withdraw"), G(withdraws_late_only), Call(note_late_withdrawal)),
                     T(On("withdraw"), Call(checked(ends_run, ends_wake, withdraws_late_only, effects=(note_withdrawn,)))),
                     # the run asks before each step that could act: it goes on while the request it
                     # answers, if any, is live; once it is withdrawn the run is ended the way a
                     # withdrawal ends it (leaving `busy` ends the run that asked: nothing is left to answer)
                     T(On("may_continue"), G(run_goes_on), Effect(answer_true)),
-                    T(On("may_continue"), S("../closing_calls"), Effect(checked(run_goes_on))),
-                    T(On("inbox_handed"), S("../closing_calls"), G(handed_withdraws_run), Effect(take_handed)),
+                    T(On("may_continue"), S("../closing_calls"), Effect(checked(run_goes_on, effects=(turn_cut_short,)))),
+                    T(On("inbox_handed"), S("../closing_calls"), G(handed_withdraws_run), Effect(take_handed, turn_cut_short)),
                     T(On("inbox_handed"), Call(checked(handed_withdraws_run, effects=(take_handed,)))),
-                    T(On("shutdown"), S("../closing_calls"), Effect(interrupted_closing)),
+                    T(On("shutdown"), S("../closing_calls"), Effect(interrupted_closing, turn_cut_short)),
                     _work("run", Entry(turn_began), Activity(work=busy_activity, done="run"),
                           T(On("turn_done"), S("../../ran"), Effect(end_run))),
                     _work("driven", T(On("driven_done"), S("../../rest"), Effect(end_driven))),
@@ -3793,7 +3794,7 @@ def _timeline(name: str) -> hsm.Model:
                     T(On(E), S("../unrecorded"), Effect(focus_failure_not_recorded)),
                 ),
                 hsm.State(
-                    "closing_calls", Entry(turn_cut_short), io(done="calls_closed", work=_close_calls),
+                    "closing_calls", io(done="calls_closed", work=_close_calls),
                     T(On("calls_closed"), S("../withdrawn_choice"), Effect(calls_closed)),
                     T(On(E), S("../withdrawn_choice"), Effect(calls_not_closed)),
                 ),
@@ -3903,8 +3904,9 @@ def _timeline(name: str) -> hsm.Model:
                     # past MAX_RECOVERIES: it goes on from rest without closing anything out, but a
                     # focus graft whose turn the fault ended still joins (it never rests after a turn)
                     "given_up",
+                    T(S("../passing"), G(hands_over), Effect(pass_inbox)),
                     T(S("handing_back"), G(rejoins)),
-                    T(S("rest"), Effect(checked(rejoins))),
+                    T(S("rest"), Effect(checked(hands_over, rejoins))),
                 ),
             ),
             hsm.Choice("shutting", T(S("../closed"), Effect(close_root))),

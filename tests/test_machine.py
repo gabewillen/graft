@@ -2322,3 +2322,54 @@ def test_a_focus_graft_whose_turn_a_withdrawal_ended_rests_after_a_fault(monkeyp
         assert not host.logged(prefix=("apply", "c1")) and not host.logged(prefix=("run", "o", "wake"))
         await m.stop()
     run(go)
+
+
+def test_a_guard_that_raises_in_a_focus_grafts_run_ends_its_turn_and_it_joins_failed(monkeypatch):
+    """`run_goes_on` raises once as c1's run asks to go on: the decision's safe branch ends the run,
+    but no withdrawal or shutdown cut it short, so the fault ended its turn and it joins `failed`."""
+    import graft.machine as machine_module
+    real, armed = machine_module.run_goes_on, [True]
+
+    def run_goes_on(ctx, inst, event):
+        if inst.timeline_id == "c1" and armed:
+            armed.clear()
+            raise RuntimeError("run_goes_on bug")
+        return real(ctx=ctx, inst=inst, event=event)
+
+    async def go():
+        monkeypatch.setattr(machine_module, "run_goes_on", run_goes_on)
+        host, m = await started()
+        await say(m=m, text="go")
+        await clone(m=m, pairs=[("c1", True)])
+        applied = host.next("apply", "c1")
+        await m.send(tl="c1", name="may_continue", data=m.future())
+        assert (await asyncio.wait_for(applied, GUARD))[2] == "failed"
+        assert holders(host) == ["o"] or host.status["o"] in ("joining", "active")
+        await m.stop()
+    run(go)
+
+
+def test_past_the_recovery_bound_a_hand_over_still_finishes(monkeypatch):
+    """The original gives up recovering (past MAX_RECOVERIES) after a focus graft it made has
+    started: the hand-over finishes, so only that graft holds the conversation."""
+    import graft.machine as machine_module
+    monkeypatch.setattr(machine_module, "may_recover", lambda ctx, inst, event: inst.timeline_id != "o")
+    real, armed = machine_module.spawned, [True]
+
+    def spawned(ctx, inst, event):
+        out = real(ctx=ctx, inst=inst, event=event)
+        if inst.timeline_id == "o" and armed:
+            armed.clear()
+            raise RuntimeError("spawned bug")
+        return out
+
+    async def go():
+        monkeypatch.setattr(machine_module, "spawned", spawned)
+        host, m = await started()
+        await say(m=m, text="go")
+        with contextlib.suppress(Exception):
+            await clone(m=m, pairs=[("c1", True)])
+        await asyncio.sleep(0.2)
+        assert holders(host) == ["c1"] and host.status["o"] == "cloned"
+        await m.stop()
+    run(go)
