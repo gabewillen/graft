@@ -192,13 +192,13 @@ async def arm_g(e, sb: sandbox.Sandbox, max_steps: int, workdir: str) -> dict:
         "current": {"skills": [skill.name], "messages": rows}}})  # the seeder picks; these are its fallback
     forced = False
     if child:
-        if await h.run(child) == "ended":  # no live user: end the task if it stopped without joining
+        if await h.run(child) == "ended":  # its turn ends in its merge; a run left at rest is joined here
             forced = True
             await h.do_join(child, "done")
     lat = time.perf_counter() - t0
     view = store.working_view("o")
     seed = [r for r in store.view(child) if r["owner_timeline"] != child] if child else []
-    joined = [r for r in view if r["owner_timeline"] == child]
+    joined = [r for r in view if r["owner_timeline"] == child and r["kind"] == "text"]  # not its merge call
     by_model = {m: u for m, u in p.by_model.items() if u["calls"]}
     slog = h.seeder_log[0] if h.seeder_log else {}
     if slog.get("input_tokens"):

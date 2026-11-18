@@ -48,8 +48,9 @@ CREATE TABLE IF NOT EXISTS turns(
   role TEXT NOT NULL CHECK(role IN ('user','assistant')),
   kind TEXT NOT NULL CHECK(kind IN ('text','tool_use','tool_result','thinking')),
   tool_name TEXT, content TEXT NOT NULL, tokens INTEGER, ts REAL NOT NULL,
-  -- 1: written by the harness (join records, error records, wake notes). Set only by the
-  -- harness; a harness row is recognised by this mark, never by what its text says.
+  -- 1: written by the harness (merge results, a branch's fork result, an implicit merge call and
+  -- its result, a skipped join's note). Set only by the harness; a harness row is recognised by
+  -- this mark, never by what its text says.
   harness INTEGER NOT NULL DEFAULT 0 CHECK(harness IN (0, 1)));
 
 CREATE TABLE IF NOT EXISTS context(
@@ -371,23 +372,35 @@ class Store:
             self.con.execute("ROLLBACK")
             raise
 
-    def commit_join(self, source: str, record: str, rows: list[int], *, error: str | None,
-                    trigger: int | None, tx: int, status: str, committed_sql: str | None,
-                    scratch: Any, closing: Sequence[tuple[str, str, Any]] = ()) -> int:
+    def commit_join(self, source: str, child: str, rows: list[int], *, merge: int | None,
+                    implicit: dict | None, result: dict | None, note: str | None, trigger: int | None,
+                    tx: int, status: str, committed_sql: str | None, scratch: Any,
+                    closing: Sequence[tuple[str, str, Any]] = ()) -> int | None:
         """One join, one SQL transaction: the clone's close-out it could not write as it froze
         (`closing`: (timeline, tool name, tool_result block) rows, written first, into its own
-        timeline), the record row, the remembered pointers, the error row of a failed clone, the
-        trigger pointer, and the outcome of the join's audit record `tx`. All of it or none of it,
-        so a join that failed halfway leaves nothing and can be retried."""
+        timeline), the harness's merge call and its result at the end of the clone's timeline
+        (`implicit`: {"use", "result"}, for a turn that ended without one), the remembered
+        pointers, a pointer to the merge call (`merge`, the clone's own, or the one just written),
+        the source's merge result row (`result`, a tool_result block), or, for a join whose rows
+        were skipped, a note instead of both (`note`), the trigger pointer, and the outcome of the
+        join's audit record `tx`. All of it or none of it, so a join that failed halfway leaves
+        nothing and can be retried. Returns the merge result's (or the note's) row id."""
         self.con.execute("BEGIN")
         try:
             for tl, tool_name, block in closing:
                 self.add_turn(tl, "user", "tool_result", block, tool_name=tool_name)
-            rec = self.add_turn(source, "user", "text", record, harness=True)
-            for rid in rows:
-                self.append(source, rid)
-            if error:
-                self.add_turn(source, "user", "text", error, harness=True)
+            if implicit is not None:
+                written = self.add_turn(child, "assistant", "tool_use", implicit["use"], tool_name="merge", harness=True)
+                self.add_turn(child, "user", "tool_result", implicit["result"], tool_name="merge", harness=True)
+                merge = written if merge is None else merge
+            rec = None
+            if note is not None:
+                rec = self.add_turn(source, "user", "text", note, harness=True)
+            else:
+                for rid in rows:
+                    self.append(source, rid)
+                self.append(source, merge)
+                rec = self.add_turn(source, "user", "tool_result", result, tool_name="merge", harness=True)
             if trigger is not None:
                 self.append(source, trigger)
             self.end_tx(tx, status=status, committed_sql=committed_sql, scratch=scratch)

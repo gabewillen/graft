@@ -134,15 +134,18 @@ def test_turns_compaction_keeps_user_rows_and_compresses_windows(tmp_path):
         await h.machines.stop()
 
     asyncio.run(go())
-    assert h.compactions and fp.by_tag["clone:c1:compaction"]["calls"] >= 1
+    # a current branch holds the conversation for one turn, so the long conversation is main's to compact
     e = h.compaction_log[0]
-    wv = store.working_view("c1")
+    tl = e["timeline"]
+    tag = "original" if tl == "o" else f"clone:{tl}"
+    assert h.compactions and fp.by_tag[f"{tag}:compaction"]["calls"] >= 1
+    wv = store.working_view(tl)
     # no synthesized user row: every user text row in the working view is an original user turn
     for r in wv:
         if r["role"] == "user" and r["kind"] == "text":
             assert store.compression_window(r["row_id"]) is None
     comp = [r for r in wv if store.compression_window(r["row_id"])]
-    assert comp and all(r["role"] == "assistant" and r["owner_timeline"] == "c1" for r in comp)
+    assert comp and all(r["role"] == "assistant" and r["owner_timeline"] == tl for r in comp)
     # rendered as a normal turn in its role: no visible marker in the text
     assert all(not r["content"].startswith("(") for r in comp)
     # the window covers a contiguous run of the prefix, placed at its position

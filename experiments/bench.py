@@ -152,7 +152,6 @@ async def run_one(sc: Scenario, arm: str, i: int, fake: bool, compact: int | Non
             "SELECT count(*) FROM timelines WHERE source_id IS NOT NULL").fetchone()[0]
         rec["joins"] = [tuple(r) for r in agent.store.con.execute(
             "SELECT timeline_id, join_reason FROM timelines WHERE source_id IS NOT NULL ORDER BY created_at")]
-        rec["silent_done_refusals"] = len(agent.silent_done_refusals)
         rec["context_out"] = roles.get("handoff/clone-tx", {}).get("output", 0)
         await agent.close()
     elif agent is not None:
@@ -372,8 +371,7 @@ def report(recs: list[dict], pricing: cachestats.Pricing, scenarios: list[str], 
             extra = ""
             if arm.startswith("graft"):
                 joins = Counter(j[1] for r in rs for j in r.get("joins", []))
-                extra = (f"; joins {dict(joins)}; silent-done refusals "
-                         f"{sum(r.get('silent_done_refusals', 0) for r in rs)}")
+                extra = f"; joins {dict(joins)}"
             print(f"  {sc:<16} {arm:<9} failed checks {dict(fails) or '{}'}; errors {dict(errs) or '{}'}{extra}")
 
 

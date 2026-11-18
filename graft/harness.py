@@ -30,14 +30,19 @@ all of it or none. The `current` graft takes the conversation and the source is 
 joins. The `detached` grafts run in the background, never speak to the user, and the source keeps
 the conversation. A graft is known to the model by its id (its name), never by its timeline id.
 
-Join is deterministic (no model call): the harness appends pointers to the text rows of the
-clone's working view that the source lacks. Every join is a queue entry on the original's
+Every turn of a graft ends in its join: its `merge` call (`merge(reason?)`, the reason its own
+words, never read here), or, when the turn ends without one, the harness's argument-less `merge()`
+written into its timeline in the join's transaction. Join is deterministic (no model call): the
+harness appends pointers to the text rows of the clone's working view that the source lacks, then
+to its merge call, then the source's own merge result (what the join record and wake note used to
+say). Every join is a queue entry on the original's
 machine, applied only when the original holds the conversation and is at rest: before a new user
 message (which waits on the machine meanwhile), at the end of a run, when a graft finishes while
 the original is idle, and, when a focus graft joins back, behind the background joins that were
-waiting. After joins that bring news and leave no user message to answer, the original is woken
-once with a closing harness note, for a full run: it tells the user the outcome and may go on
-(clone, cancel, answer a request that was handed back), as any turn.
+waiting. Every merge is news: after joins that leave no user message to answer, the original is
+woken once, on a view that ends on their merge results, for a full run: it tells the user what
+the user has not seen and may go on (clone, cancel, answer a request that was handed back), or end
+its turn without saying anything, as any turn.
 
 Cancel is the original's alone: `stop(ids=[branch ids])` as the model is told it, while it runs. The cancel calls of
 one response are one request to its machine, which cancels each graft the graph allows (leaving
@@ -141,16 +146,45 @@ _NONCE_TAG = re.compile(r"^\[conversation [^\]]*\]\s*")
 WITHDRAWN_SEED = "row {row} is a message the user withdrew; it is not a request and cannot be seeded"
 
 
-def said(reason: str) -> str:
-    """A join reason as the model is told it (the one place it is worded): the harness's own
-    `cancelled` is said `stopped`, the model's word for graft's cancel; the others are the
-    `merge` tool's own reasons."""
-    return "stopped" if reason == CANCELLED else reason
+MERGED = "merged"  # a merge call's result in the branch's own timeline
 
 
-def merge_head(*, child: str, reason: str) -> str:
-    """The head of every merge record a source is given (the one place it is worded)."""
-    return f"(harness note: your branch {child} merged, reason={said(reason)}; "
+def merge_result(*, name: str, reason: str, focus: bool, ran: list[str], dropped: str | None,
+                 running: str, empty: bool = False) -> str:
+    """Main's result of a branch's merge call (the one place it is worded): what the join record
+    and the wake note used to say. `reason` is graft's own and never said; `ran`: the tools a stopped
+    branch had run; `dropped`: what the size fit left out, if anything; `running`: the still-running
+    sentence; `empty`: no messages of the branch's are above (it brought none main lacks, or the
+    size fit left them all out). It forbids nothing: main may
+    fork for what is still to do, or end its turn."""
+    if reason == CANCELLED:
+        head = (f"{name} was stopped before it finished. Before it was stopped you had run there: "
+                f"{', '.join(ran) if ran else 'no tools'}. Nothing you did there outside this conversation was "
+                "undone; a tool that returned an error may still have acted before it failed. Tell the user it "
+                "was stopped and what you had already done there.")
+    elif reason == "failed":
+        head = (f"{name} merged after it failed: what you did there before it failed is in the messages "
+                "above. Tell the user, in your own words, what happened.")
+    elif reason == "out_of_scope":
+        head = (f"{name} merged without answering the user's last message: that message is yours to "
+                "answer now (answer it here, or fork for it).")
+    elif focus:
+        head = f"{name} merged. Its replies above already reached the user: do not repeat them."
+    elif empty and dropped:
+        head = f"{name} merged."
+    elif empty:
+        head = f"{name} merged; it brings back no messages you do not already have."
+    else:
+        head = (f"{name} merged. What you did there is in the messages above, and the user has not seen "
+                "it: tell the user, in your own words and in the first person, what you did there.")
+    return " ".join(x for x in (head, dropped, running, (
+        "Do not describe still-running work as finished. Go on with what the user asked for that is "
+        "still to do (fork for it), unless a still-running branch of yours is already doing it; if "
+        "nothing is left to do or say, end your turn without saying anything.")) if x)
+
+
+SKIPPED_NOTE = ("(harness note: your branch {name} merged, but its messages were skipped (they would not "
+                "make a valid conversation here); they stay in that branch's frozen timeline. {running})")
 
 
 def fork_result(*, name: str, focus: bool, skills: list[str], reason: str | None) -> str:
@@ -367,6 +401,8 @@ class ModelCallTimeout(TimeoutError):
 
 
 def _reason(reason: str) -> str:
+    """A join reason a caller outside the model loop gives (`do_join`: tests, replay); the model's
+    `merge` takes none."""
     return reason if reason in ("done", "out_of_scope", "failed") else "failed"
 
 
@@ -412,7 +448,6 @@ class Harness:
         if call_timeout is not None and call_timeout <= 0:
             raise ValueError(f"call_timeout must be positive or None, got {call_timeout!r}")
         self.call_timeout = call_timeout
-        self.silent_done_refusals: list[str] = []  # grafts whose merge(done) call was refused
         # Decisions client (graft/seeder.py) that picks a graft's seed; None: the conversation so far
         self.seeder = seeder_mod.make_seeder() if seeder is ... else seeder
         self.seeder_log: list[dict] = []  # per clone: Jev latency, tokens, scores, selection, fallback
@@ -421,7 +456,6 @@ class Harness:
         self._mark = 0  # self.out[:_mark] was already returned by user_says / settle
         # per wake run: {source, joined: [(clone, reason)]}
         self.wakes: list[dict] = []
-        self.join_dropped: set[str] = set()  # clones none of whose rows fit in the source (size backstop)
         # Records of what failed, for the experiments and tests (the session machine keeps the
         # errors `settle` raises): (source, clones, error) per failed wake run, failed join commit,
         # and other harness failure; (clone, error) per graft whose run raised and joined failed.
@@ -644,7 +678,12 @@ class Harness:
         await self.machines.ask(tl=child, name="join", build=lambda reply: (join, reply))
 
     # ------------------------------------------------------------ host: I/O for the machines
-    async def run_busy(self, tl: str, kind: str) -> RunOutcome:
+    async def run_busy(self, tl: str, kind: str, woken: list[tuple[str, str]] | None = None) -> RunOutcome:
+        """A run of tl (the activity of its `busy` state). `woken`: the joins a wake run is for
+        (its machine says so), recorded in `wakes`."""
+        if woken is not None:
+            self.wakes.append({"source": tl, "joined": list(woken)})
+            self.trace(f"[{tl}] WAKE for joins: {', '.join(f'{self.shown(c)} ({r})' for c, r in woken)}")
         return await self._loop(tl=tl, kind=kind)
 
     async def run_background(self, tl: str) -> RunOutcome:
@@ -754,7 +793,12 @@ class Harness:
         if rows:
             self.mark_withdrawn(timelines=viewers, rows=rows)
 
-    def join_of(self, tl: str, reason: str) -> QueuedJoin:
+    def join_of(self, tl: str, reason: str, focus: bool = False) -> QueuedJoin:
+        """tl's join event. A focus graft's turn that ended `done` without a reply to the user since
+        the last user message in its view hands that request back (`out_of_scope`, graft's own
+        word: the model gave no reason) when `focus` (its machine says so)."""
+        if focus and reason == "done" and not self.replied(tl):
+            reason = "out_of_scope"
         return QueuedJoin(child=tl, reason=reason, trigger=self.compute_trigger(child=tl, reason=reason))
 
     def shown(self, tl: str) -> str:
@@ -1056,16 +1100,11 @@ class Harness:
             allowed = {t["name"] for t in tools}
             join_use = next((u for u in uses if u["name"] == "merge" and "merge" in allowed), None)
             clone_use = next((u for u in uses if u["name"] == "fork" and "fork" in allowed), None)
-            refused_join = None
-            if join_use and str(join_use["input"].get("reason")) == "done" and not self.replied(tl):
-                refused_join, join_use = join_use, None
-                self.silent_done_refusals.append(tl)
-                self.trace(f"[{tl}] merge(done) refused: no reply since the last user message")
-            if join_use:
+            if join_use:  # the merge call ends the turn; its `reason` is the branch's own words, never read here
                 results = [ToolResult(use=u, content=NOT_RUN_JOINING, is_error=True) for u in uses if u is not join_use]
-                results.append(ToolResult(use=join_use, content="merged", is_error=False))
+                results.append(ToolResult(use=join_use, content=MERGED, is_error=False))
                 self._store_results(tl=tl, results=results)
-                return RunOutcome(kind="join", reason=_reason(str(join_use["input"].get("reason", "failed"))))
+                return RunOutcome(kind="join", reason="done")
             if clone_use:
                 # this call's role was routing into a clone: account it as the clone transaction
                 retag = getattr(self.provider, "retag", None)
@@ -1089,16 +1128,7 @@ class Harness:
             # response that raises never leaves a call that ran recorded as not run.
             for u in uses:
                 await self.may_continue(tl)
-                if u is refused_join:
-                    if background:
-                        msg = ("merge(reason='done') refused: you have not written your result yet. First "
-                               "write your final reply saying what you did; then call merge(reason='done').")
-                    else:
-                        msg = ("merge(reason='done') refused: you have not replied to the user since "
-                               "their last message. First tell the user, in one or two sentences, what "
-                               "you did; then call merge(reason='done').")
-                    self._store_results(tl=tl, results=[ToolResult(use=u, content=msg, is_error=True)])
-                elif u["name"] == "stop":  # graft's cancel: whoever calls it, whatever tools it was shown, the machine decides
+                if u["name"] == "stop":  # graft's cancel: whoever calls it, whatever tools it was shown, the machine decides
                     cancels.append(u)
                 elif u["name"] not in allowed:
                     absent = NotRun(f"tool '{u['name']}' is not available to you")
@@ -1195,7 +1225,7 @@ class Harness:
 
 
     def _running_note(self, running: list[str]) -> str:
-        """Harness-generated sentence for join records and wake notes: which of the source's grafts
+        """Harness-generated sentence for merge results: which of the source's grafts
         are still running (`running`, from its machine), with their skills so the source can tell
         which part each is doing."""
         live = []
@@ -1205,38 +1235,6 @@ class Harness:
         return ("Still running: " + ", ".join(live) + "." if live
                 else "No other branch of yours is still running.")
 
-
-    def wake_note(self, src: str, joined: list[tuple[str, str]], handed_back: bool, running: list[str],
-                  background: bool) -> None:
-        """Close src's view with one harness note (a user row, so src can continue) for the joins
-        its machine is waking it for (the activity of its `noting` state). The note is factual and
-        forbids nothing: the wake is a full run. `handed_back`: a focus graft failed or handed its
-        request back, so that request is src's to answer (the machine says so). `running`: src's
-        grafts still running; `background`: the joined grafts are all background grafts."""
-        names = ", ".join(f"{self.shown(c)} ({said(r)})" for c, r in joined)
-        dropped = [c for c, _ in joined if c in self.join_dropped]
-        kept = [c for c, _ in joined if c not in self.join_dropped]
-        where = "what you did there is in the rows above." if kept else ""
-        if dropped:
-            where = (where + " " if where else "") + (
-                f"What you did in {', '.join(map(self.shown, dropped))} did not fit in your context and stays in the frozen "
-                f"timeline of {'that branch' if len(dropped) == 1 else 'those branches'}; say so if asked.")
-        task = ("A request came back: answer it. " if handed_back else "") + (
-            "Then go on with what the user asked for that is still to do, unless a still-running "
-            "branch of yours is already doing it. ")
-        cancelled = [c for c, r in joined if r == CANCELLED]
-        if cancelled:
-            many = len(cancelled) > 1
-            task = (f"You stopped {', '.join(map(self.shown, cancelled))}: tell the user {'they were' if many else 'it was'} "
-                    f"stopped and what you had already done there. ") + task
-        self.store.add_turn(tl=src, role="user", kind="text", harness=True, content=(
-                            f"(harness note: your {self._names(clones=[c for c, _ in joined], background=background, named=False)} "
-                            f"{names} merged; {where} {self._running_note(running)} "
-                            "You hold the conversation: tell the user, in your own words and in the first "
-                            f"person, only what you did in the branches that have merged. {task}"
-                            "Do not describe still-running work as finished.)"))
-        self.wakes.append({"source": src, "joined": joined})
-        self.trace(f"[{src}] WAKE for joins: {names}")
 
     # ------------------------------------------------------------ join event
     def replied(self, tl: str) -> bool:
@@ -1269,85 +1267,96 @@ class Harness:
         return None
 
     # ------------------------------------------------------------ default join (deterministic)
-    def default_join_rows(self, src: str, child: str, reason: str, trigger: int | None,
-                          closing: Sequence[ToolResult] = ()) -> tuple[list[int], str | None]:
-        """Spec 'Default join': text rows (user + assistant) of the clone's working view that the
-        source lacks; out_of_scope ends with the trigger; failed adds a harness error record, and
-        cancelled a harness record of the tools the graft had run.
-        Returns (row ids to append, error record text or None)."""
+    def default_join_rows(self, src: str, child: str, trigger: int | None) -> list[int]:
+        """Spec 'Default join': the text rows (user + assistant) of the clone's working view that
+        the source lacks (the trigger goes last, on its own)."""
         have = self.store.pointed(src)
-        rows = [r["row_id"] for r in self.store.working_view(child)
+        return [r["row_id"] for r in self.store.working_view(child)
                 if r["kind"] == "text" and r["row_id"] not in have and r["row_id"] != trigger]
-        error = (f"(harness note: your branch {self.shown(child)} failed; its timeline is frozen)"
-                 if reason == "failed" else None)
-        if reason == CANCELLED:
-            ran = self.tools_run(child, closing=closing)
-            error = (f"(harness note: your branch {self.shown(child)} was stopped before it finished; its timeline is "
-                     f"frozen. Before it was stopped you had run there: {', '.join(ran) if ran else 'no tools'}. "
-                     "Nothing you did there outside this conversation was undone; a tool that returned an "
-                     "error may still have acted before it failed.)")
-        if trigger is not None and trigger not in have:
-            rows.append(trigger)
-        return rows, error
 
-    def _join_tail(self, src: str, record: str, rows: list[int], error: str | None,
-                   trigger: int | None) -> list[dict]:
-        """The rows a join appends to src, in order: record, remembered rows, error, trigger."""
-        tail = [self._virtual(src, "user", "text", record)]
-        tail += [self.store.turn(r) for r in rows if trigger is None or r != trigger]
-        if error:
-            tail.append(self._virtual(src, "user", "text", error))
-        if trigger is not None and trigger in rows:
+    def merge_call(self, child: str, closing: bool) -> tuple[dict, bool]:
+        """The clone's merge call, as a row: its own last one, when its timeline ends on a merge
+        call and its "merged" result; else the harness's argument-less `merge()` (`implicit`, True),
+        to be written at the end of its timeline in the join's transaction. A timeline that gets a
+        close-out first (`closing`) ended its turn early, never on a merge call."""
+        rows = self.store.view(child)
+        end = len(rows)
+        while end > 0 and rows[end - 1]["kind"] == "tool_result":
+            end -= 1
+        start = end
+        while start > 0 and rows[start - 1]["role"] == "assistant":
+            start -= 1
+        merged = {data["tool_use_id"] for data in (json.loads(r["content"]) for r in rows[end:])
+                  if data.get("content") == MERGED and not data.get("not_run")}
+        if not closing:
+            for r in rows[start:end]:
+                if r["kind"] == "tool_use" and r["tool_name"] == "merge" and json.loads(r["content"])["id"] in merged:
+                    return r, False
+        use = {"id": f"merge-{self.shown(child)}", "input": {}}
+        row = {"row_id": None, "owner_timeline": child, "role": "assistant", "kind": "tool_use",
+               "tool_name": "merge", "content": json.dumps(use), "harness": 1}
+        return row, True
+
+    def _join_tail(self, src: str, rows: list[int], merge: dict, result: str, trigger: int | None) -> list[dict]:
+        """The rows a join appends to src, in order: remembered rows, the merge call, its result
+        (main's), the trigger."""
+        tail = [self.store.turn(r) for r in rows]
+        tail += [merge, self._virtual(src, "user", "tool_result", json.dumps(
+            {"tool_use_id": json.loads(merge["content"])["id"], "content": result, "is_error": False}))]
+        if trigger is not None:
             tail.append(self.store.turn(trigger))
         return tail
 
-    def fit_join(self, src: str, child: str, reason: str, *, rows: list[int], error: str | None,
-                 trigger: int | None, running: list[str]) -> tuple[list[int], str]:
+    def fit_join(self, src: str, child: str, reason: str, *, rows: list[int], merge: dict, trigger: int | None,
+                 running: list[str], closing: Sequence[ToolResult] = ()) -> tuple[list[int], str]:
         """Join size check (spec: Open Questions, join size). The joined working view of src must
         stay under JOIN_WINDOW_FRACTION of the window: compaction cannot rescue an over-window
         view, since its own request carries the whole prefix. Tiers, first that fits: (0) every
-        remembered row; (1) the clone's last assistant reply + trigger; (2) trigger only. The
-        dropped rows stay in the clone's frozen timeline. `running`: src's grafts still running, for
-        the record. Returns (rows to append, record)."""
-        listed = ", ".join(map(str, rows)) or "none"
-        live = self._running_note(running)
-        where = (f"what you did there is in the remembered rows {listed}, which follow." if rows
-                 else "it brings back no rows you do not already hold.")
-        full = (rows, merge_head(child=self.shown(child), reason=reason) + f"{where} {live})")
+        remembered row; (1) the clone's last assistant reply; (2) none. Every tier keeps the merge
+        call, its result and the trigger. The dropped rows stay in the clone's frozen timeline.
+        `running`: src's grafts still running. Returns (rows to append, merge result)."""
+        name = self.shown(child)
+        said = dict(name=name, reason=reason, focus="merge" in {k["name"] for k in self.store.skills_for(child)},
+                    ran=self.tools_run(child, closing=closing) if reason == CANCELLED else [],
+                    running=self._running_note(running))
+        full = (rows, merge_result(dropped=None, empty=not rows, **said))
         if self.window_tokens is None:
             return full
         limit = int(self.window_tokens * JOIN_WINDOW_FRACTION)
         base = self.store.working_view(src)
-        trig = [trigger] if trigger is not None and trigger in rows else []
-        last = next((r for r in reversed(rows) if r != trigger and self.store.turn(r)["role"] == "assistant"), None)
-        frozen = (merge_head(child=self.shown(child), reason=reason) + f"its rows {listed} are too large "
-                  f"for this context, so only {{kept}} follow; the rest stay in {self.shown(child)}'s frozen timeline. "
-                  f"{live})")
-        tiers = [full]
-        if last is not None:
-            tiers.append(([last] + trig, frozen.format(kept=f"your last reply there (row {last})"
-                                                       + (" and the trigger" if trig else ""))))
-        tiers.append((trig, frozen.format(kept="the trigger" if trig else "this note")))
-        before = compaction.estimate_tokens(render(base + self._join_tail(src, full[1], rows, error, trigger)))
-        for tier, (kept, record) in enumerate(tiers):
-            size = compaction.estimate_tokens(render(base + self._join_tail(src, record, kept, error, trigger)))
-            if size <= limit or tier == len(tiers) - 1:
+        last = next((r for r in reversed(rows) if self.store.turn(r)["role"] == "assistant"), None)
+        tiers = [(0, *full)]
+        if last is not None and rows != [last]:
+            tiers.append((1, [last], merge_result(empty=False, dropped=(
+                f"Only your last reply there is above: the rest of what you did in {name} did not fit in your "
+                "context and stays in that branch's frozen timeline; say so if asked."), **said)))
+        if rows:
+            tiers.append((2, [], merge_result(empty=True, dropped=(
+                f"What you did in {name} did not fit in your context and stays in that branch's frozen "
+                "timeline; say so if asked."), **said)))
+        before = compaction.estimate_tokens(render(base + self._join_tail(src, rows, merge, full[1], trigger)))
+        for i, (tier, kept, result) in enumerate(tiers):
+            size = compaction.estimate_tokens(render(base + self._join_tail(src, kept, merge, result, trigger)))
+            if size <= limit or i == len(tiers) - 1:
                 if tier:
                     self.join_fallbacks.append({"clone": child, "tier": tier, "before": before, "after": size})
                     self.trace(f"[{src}] join of {child} is about {before} tokens, over {limit}: "
                                f"tier {tier} keeps rows {kept} ({size} tokens)")
-                return kept, record
+                return kept, result
         raise AssertionError("unreachable")
 
     def default_join(self, src: str, child: str, reason: str, trigger: int | None, running: list[str],
                      closing: dict[str, tuple[str, bool]] | None = None) -> bool:
         """Apply the default join of child to src, once. True: committed. False: the resulting
-        view was invalid and only the record (and trigger) were appended (rolled back). If the
-        write fails, nothing of the join is in the store, its audit record says `failed`, and
-        the error is raised. `running`: src's grafts still running, named in the record.
+        view was invalid and only a note (and the trigger) were appended (rolled back). If the
+        write fails, nothing of the join is in the store, its audit record says `failed`, and the
+        error is raised. `running`: src's grafts still running, named in the merge result.
         `closing`: the close-out child could not write as it froze (its machine carried it with the
         join): the results its last turn still lacks are written into child's timeline first, in
-        the join's SQL transaction, so a retry after a failed write writes them once."""
+        the join's SQL transaction, so a retry after a failed write writes them once. Then the
+        harness's `merge()` call and its result are written at the end of child's timeline if its
+        turn ended without one (an implicit merge), and src gets the remembered rows, the merge
+        call and its merge result."""
         applied = self.store.join_outcome(child)
         if applied is not None:
             # The join is already in the store: an earlier attempt wrote it and then failed before
@@ -1358,30 +1367,35 @@ class Harness:
         closes = [(child, result[0]["name"], self._result_block(result)) for result in closed]
         if closes:
             self.trace(f"[{src}] join of {child} writes its close-out: {[c[2]['tool_use_id'] for c in closes]}")
-        wanted, error = self.default_join_rows(src=src, child=child, reason=reason, trigger=trigger, closing=closed)
-        rows, record = self.fit_join(src=src, child=child, reason=reason, rows=wanted, error=error, trigger=trigger,
-                                     running=running)
-        if [r for r in wanted if r != trigger] and not [r for r in rows if r != trigger]:
-            self.join_dropped.add(child)  # the size backstop kept none of its rows
-        pending = self.store.view(src) + self._join_tail(src, record, rows, error, trigger)
+        merge, implicit = self.merge_call(child=child, closing=bool(closes))
         trig = trigger if trigger is not None and trigger not in self.store.pointed(src) else None
-        v = validate(pending, src, trigger=trig, require_user_end=trig is not None)
+        wanted = self.default_join_rows(src=src, child=child, trigger=trigger)
+        rows, result = self.fit_join(src=src, child=child, reason=reason, rows=wanted, merge=merge, trigger=trig,
+                                     running=running, closing=closed)
+        pending = self.store.view(src) + self._join_tail(src, rows, merge, result, trig)
+        v = validate(pending, src, trigger=trig)
+        use = json.loads(merge["content"])
+        written = {"use": use, "result": {"tool_use_id": use["id"], "content": MERGED, "is_error": False}} \
+            if implicit else None
         tx = self.store.begin_tx(src, "join", target=child)
-        sql = f"DEFAULT JOIN {child} reason={reason} rows={rows}"
+        sql = f"DEFAULT JOIN {child} reason={reason} rows={rows} merge={use['id']}"
         try:
             if v:
-                # Cannot happen for well-formed text rows; keep the source continuable anyway.
-                self.trace(f"[{src}] default join invalid: {v}; appending record + trigger only")
-                skipped = (merge_head(child=self.shown(child), reason=reason)
-                           + f"its rows were skipped (invalid view). {self._running_note(running)})")
-                self.store.commit_join(source=src, record=skipped, rows=[], error=None,
+                # Cannot happen for well-formed rows; keep the source continuable anyway: a note,
+                # since there is no merge call in its view to carry the text.
+                self.trace(f"[{src}] default join invalid: {v}; appending a note + trigger only")
+                self.store.commit_join(source=src, child=child, rows=[], merge=None, implicit=written,
+                                       result=None, note=SKIPPED_NOTE.format(
+                                           name=self.shown(child), running=self._running_note(running)),
                                        trigger=trig, tx=tx, status="rolled_back", committed_sql=None,
                                        scratch={"default": True, "violations": v}, closing=closes)
                 return False
-            # record, pointers, error row, trigger and the audit outcome: one SQL transaction
-            self.store.commit_join(src, record, [r for r in rows if r != trigger], error=error, trigger=trig,
-                                   tx=tx, status="committed", committed_sql=sql, scratch={"default": True},
-                                   closing=closes)
+            # close-out, implicit merge, pointers, merge result, trigger and the audit outcome: one SQL transaction
+            self.store.commit_join(source=src, child=child, rows=rows, merge=None if implicit else merge["row_id"],
+                                   implicit=written, result={"tool_use_id": use["id"], "content": result,
+                                                            "is_error": False},
+                                   note=None, trigger=trig, tx=tx, status="committed", committed_sql=sql,
+                                   scratch={"default": True}, closing=closes)
         except Exception as e:  # nothing of the join was written; the audit record says so
             self.store.end_tx(tx, status="failed", committed_sql=None,
                               scratch={"default": True, "error": _described(e)})
@@ -1402,8 +1416,8 @@ class Harness:
         that response's other calls (a stop call's real result, "not executed" beside a clone
         call). None if the call is not a row in src's working view (a turn its caller drives)."""
         rows = self.store.working_view(src)
-        at = next((i for i, r in enumerate(rows) if r["kind"] == "tool_use" and r["role"] == "assistant"
-                   and json.loads(r["content"]).get("id") == use.get("id")), None)
+        at = next((i for i in reversed(range(len(rows))) if rows[i]["kind"] == "tool_use"  # the latest: ids may repeat
+                   and json.loads(rows[i]["content"]).get("id") == use.get("id")), None)
         if at is None:
             return None
         start, end = at, at

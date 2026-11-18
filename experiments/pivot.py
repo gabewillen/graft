@@ -3,9 +3,9 @@
 The user describes a website (dentists in Ohio, formal tone, 3 services), then pivots:
 "Instead of a website let's just build a slide show". Same scripted user in both arms.
 
-  graft:  the original clones (one call) a website clone that hears the facts; the clone
-            joins out_of_scope on the pivot; the deterministic default join (no model call)
-            appends pointers to the clone's text rows; the original seeds a slides clone with them.
+  graft:  the original forks a current website branch for each message (each branch's turn ends
+            in its merge, and the deterministic default join, no model call, appends pointers to
+            its text rows); on the pivot it forks a slides branch pointed at the user's facts.
   subagent: the parent (same persona) talks to the user throughout and calls
             delegate(skill, task_prompt); the subagent sees only that parent-written prompt and
             returns a summary (graft/subagent.py).
@@ -16,8 +16,8 @@ are printed as a DIAGNOSTIC only: this pivot is too small to show fact loss (no 
 summaries, compaction or nested delegation), so no verdict is drawn from it.
 
 Graft checks:
-  1. the website clone joined with reason=out_of_scope
-  2. the original's (default) join for it committed
+  1. every website branch merged at the end of its turn, and the pivot reached the original
+  2. the original's (default) joins committed and it holds the facts
   3. the slides clone's seed points at the user's own audience and tone rows
      (same row_ids -> verbatim, no paraphrase)
   4. the deck uses those facts
@@ -96,11 +96,7 @@ def graft_checks(h: Harness, verbose: bool = True) -> bool:
     clones = [r for r in s.con.execute(
         "SELECT timeline_id, join_reason, join_trigger FROM timelines WHERE source_id IS NOT NULL "
         "ORDER BY created_at")]
-    premature = [c["timeline_id"] for c in clones
-                 if c["join_reason"] == "out_of_scope" and c["join_trigger"] != piv]
-    print(f"info: clones={len(clones)} joins={[(c['timeline_id'], c['join_reason'], c['join_trigger']) for c in clones]} "
-          f"premature out_of_scope (trigger is not the pivot)={premature} "
-          f"silent-done refusals={h.silent_done_refusals}")
+    print(f"info: clones={len(clones)} joins={[(c['timeline_id'], c['join_reason'], c['join_trigger']) for c in clones]}")
     return ok
 
 
@@ -111,24 +107,19 @@ def pivot_structural_checks(h: Harness) -> list[tuple[str, bool, str]]:
     slides = clones_with(s, "slides")
     aud, tone, svc = user_row(s, FACT_AUDIENCE), user_row(s, FACT_TONE), user_row(s, FACT_SERVICES)
     piv = user_row(s, PIVOT)
-    fact_owners = {s.turn(r)["owner_timeline"] for r in (aud, tone, svc) if r}
-    checks.append(("facts were told to a website clone (not the original)",
-                   bool(fact_owners) and fact_owners <= set(web),
-                   f"fact rows {aud},{tone},{svc} owned by {sorted(fact_owners)}; website clones={web}"))
-    # the website clone that received the pivot message
-    w = s.turn(piv)["owner_timeline"] if piv else None
-    t = s.timeline(w) if w else None
-    ok1 = bool(t and w in web and t["join_reason"] == "out_of_scope" and t["join_trigger"] == piv)
-    checks.append(("website clone joined out_of_scope on the pivot message", ok1,
-                   f"pivot row={piv} owner={w} join_reason={t and t['join_reason']} "
-                   f"trigger={t and t['join_trigger']}"))
-    tx = s.con.execute("SELECT tx_id, status FROM transactions WHERE kind='join' AND target=?",
-                       (w,)).fetchone() if w else None
+    # every user message reaches the original: a current branch holds the conversation for one turn
+    owners = {s.turn(r)["owner_timeline"] for r in (aud, tone, svc, piv) if r}
+    merged = all(s.timeline(c)["status"] == "joined" for c in web)
+    ok1 = bool(web) and merged and owners == {s.root()}
+    checks.append(("every website branch merged at the end of its turn; the user's messages reached the original",
+                   ok1, f"website branches={web} merged={merged}; message rows owned by {sorted(owners)}"))
+    txs = [s.con.execute("SELECT status FROM transactions WHERE kind='join' AND target=?", (c,)).fetchone()
+           for c in web]
     held = s.pointed(s.root())
     remembered = [r for r in (aud, tone, svc) if r in held]
-    checks.append(("original's default join committed and it remembers the facts",
-                   bool(tx and tx["status"] == "committed" and aud in held and tone in held),
-                   f"join tx={dict(tx) if tx else None}; fact rows now in original's context: {remembered}"))
+    checks.append(("original's default joins committed and it holds the facts",
+                   bool(txs and all(t and t["status"] == "committed" for t in txs) and aud in held and tone in held),
+                   f"join txs={[dict(t) if t else None for t in txs]}; fact rows in original's context: {remembered}"))
     sl = slides[0] if slides else None
     # the seed: pointers the clone did not produce itself
     seed = [r["row_id"] for r in s.view(sl) if r["owner_timeline"] != sl] if sl else []

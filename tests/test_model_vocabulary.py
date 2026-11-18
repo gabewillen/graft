@@ -18,7 +18,7 @@ every function that writes model-facing text (PRODUCERS) are scanned, and each p
 to be scanned by a mutation of its own text that the check catches."""
 
 import ast
-from _util import ran, started
+from _util import ran, started, woke
 import asyncio
 import inspect
 import json
@@ -42,7 +42,9 @@ BANNED = re.compile(r"\bclon|\bjoin|\binstances?\b|\bsub-?agents?\b|\bworkers?\b
                     r"|\bgrafts?\b|\boriginal\b|the assistant will|\bbackground|\bcancel|\bfocus"
                     # `branch` as the tool (the model's tool is `fork`); the noun, a branch, stays
                     r"|\bbranch\(|`branch`|\"name\": \"branch\"|\bbranch(?:ed|ing)\b"
-                    r"|\b(?:call|may|you|not|to) branch\b|\bbranch (?:again|calls?|refused|not executed|once more|on its own)\b",
+                    r"|\b(?:call|may|you|not|to) branch\b|\bbranch (?:again|calls?|refused|not executed|once more|on its own)\b"
+                    # a join reason (graft's own; the model's merge takes none)
+                    r"|\bout_of_scope\b|reason=['\"]?(?:done|failed)\b|\(done\)|\(failed\)",
                     re.IGNORECASE)
 REQUEST = "Build a website and a slide deck for the dental practice."
 GATE_TIMEOUT = 10
@@ -131,14 +133,20 @@ def test_the_built_in_skills_and_tools_say_branch_and_merge():
     branch_tool = next(t for s in CATALOG for t in s.tools if t["name"] == "fork")
     assert set(branch_tool["input_schema"]["properties"]) == {"current", "detached"}
     merge_tool = next(t for s in CATALOG for t in s.tools if t["name"] == "merge")
-    assert merge_tool["input_schema"]["properties"]["reason"]["enum"] == ["done", "out_of_scope", "failed"]
+    assert set(merge_tool["input_schema"]["properties"]) == {"reason"} and merge_tool["input_schema"]["required"] == []
+    assert merge_tool["input_schema"]["properties"]["reason"]["type"] == "string"  # its own words: no enum
+    assert "enum" not in merge_tool["input_schema"]["properties"]["reason"]
+    assert set(branch_tool["input_schema"]["properties"]["current"]["properties"]) == {"id", "skills", "messages", "reason"}
     # the first-person framing: a branch is you, and what you did there is your memory
     focus, background, original = (" ".join(t.split()) for t in (JOIN_INSTRUCTIONS, BACKGROUND_INSTRUCTIONS,
                                                                    CLONE_INSTRUCTIONS))
-    assert "in a branch of yourself" in focus and "in a detached branch of yourself" in background
-    assert "other branches of yourself" in focus and "other branches of yourself" in background
+    assert "on a branch of yourself" in focus and "on a detached branch of yourself" in background
+    assert "yours on other branches or on main" in focus and "yours on other branches or on main" in background
+    assert "the reason you wrote for this branch" in focus and "the reason you wrote for this branch" in background
     assert "what you will remember of this work when the branch merges" in background
     assert "forking yourself: each branch you fork is you" in original and "in the first person" in original
+    # main stays main: `current` names a new branch, never main itself
+    assert "Forking never moves you off main" in original and "never main itself" in original
 
 
 def test_no_built_in_skill_text_or_tool_uses_a_banned_word():
@@ -166,19 +174,21 @@ def test_the_banned_words_are_caught():
               "a sub-agent", "workers", "a helper", "delegates", "the assistant will remember", "a graft",
               "background grafts", "the original", "cancel", "Cancelled", "a background branch", "cancelling", "focus: true", "the focus branch",
               "call branch", "branch(current=", "`branch`", "branched ->", "branch refused", "you branch only",
-              "no branch calls left", "branching is not possible"):
+              "no branch calls left", "branching is not possible", "out_of_scope", "merge(reason='done')",
+              "merge(reason=\"failed\")", "c2 (done)", "c2 (failed)"):
         assert banned(t), t
     for t in ("your branch c2 merged", "stop", "a detached branch", "fork", "forked ->", "each branch you fork",
-              "a branch never stops another branch", "the current branch", "out_of_scope", "the same assistant", "rejoice", "grafted",
+              "a branch never stops another branch", "the current branch", "the same assistant", "rejoice", "grafted",
+              "the work is done", "it failed", "site merged after it failed",
               "originally"):
         assert not banned(t), t
 
 
 # ------------------------------------------------------------------ representative runs
 def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
-    """Two background parts, a refused call (bad entries and seeds, a tool beside it), a graft
-    that tries to cancel and to merge silently, a cancel by the original (bad ids among them), the
-    wake that reports it, and a new branch for the stopped part, which is allowed (no harness limit)."""
+    """Two background parts, a refused call (bad entries, a tool beside it), a graft that tries to
+    cancel and then merges with a reason, a cancel by the original (bad ids among them), the merge
+    result that reports it, and a new branch for the stopped part, which is allowed (no harness limit)."""
     slides_gate = threading.Event()
     website_gate = threading.Event()  # c1 is still running when the original cancels: it is not named
     waits = []  # each gate wait's outcome, asserted in the test body (a failure on a model-call thread is a failed run)
@@ -187,28 +197,29 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
         names = {t["name"] for t in tools}
         last = last_block(messages)
         if "fork" in names:
-            if last["type"] == "text" and not last.get("harness") and last["text"] == REQUEST:
+            if last["type"] == "text" and not woke(last) and last["text"] == REQUEST:
                 return [use(tool="fork", use_id="b1", **branched(
                             entry(skills=["merge"], focus=False), entry(skills=["fork"], focus=False),
                             entry(skills=["website"], focus=False, purpose="p"), entry(skills=["slides"], focus=False, id="Bad Id"))),
                         use(tool="load_skill", use_id="l1", name="website")]
             if ran(last) and "b1" == last["tool_use_id"]:
                 return [use(tool="fork", use_id="b2", **branched(entry(skills=["website"], focus=False), entry(skills=["slides"], focus=False)))]
-            if last["type"] == "text" and not last.get("harness") and last["text"] == "Stop the slides.":
+            if last["type"] == "text" and not woke(last) and last["text"] == "Stop the slides.":
                 return [use(tool="stop", use_id="x1", ids=["c2", "c9", "o", 5])]
             if ran(last) and last["tool_use_id"] == "x1":
                 website_gate.set()
                 slides_gate.set()  # c2 is stopped: the slides branch forked again later finishes
                 return text("Okay.")
-            if last["type"] == "text" and last.get("harness") and "c2 (stopped)" in last["text"]:
+            if woke(last) and any("c2 was stopped before it finished" in str(b.get("content"))
+                                  for b in messages[-1]["content"]):
                 return [use(tool="fork", use_id="b3", **branched(entry(skills=["slides"], focus=False)))]
             return text("Okay.")
         if "site_write" in names:
             if not any(ran(b) for m in messages for b in m["content"]):
-                return [use(tool="stop", use_id="g1", ids=["c2"]), use(tool="merge", use_id="g2", reason="done")]
+                return [use(tool="stop", use_id="g1", ids=["c2"])]
             waits.append(("website", website_gate.wait(GATE_TIMEOUT)))
             return [{"type": "text", "text": "Website built."}, use(tool="site_write", use_id="g3", page="home", content="hi"),
-                    use(tool="merge", use_id="g4", reason="done")]
+                    use(tool="merge", use_id="g4", reason="The home page is written; nothing else is left.")]
         waits.append(("slides", slides_gate.wait(GATE_TIMEOUT)))
         return text("Slides built.")
 
@@ -233,30 +244,31 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
     assert "c9: not stopped: no such branch" in cancel[0] and "o: not stopped:" in cancel[0], cancel
     assert "ids[3]: not stopped: a int is not a branch id" in cancel[0], cancel
     assert len({t for t in results if t.startswith("forked -> ")}) == 2, results  # a stopped part may be forked again
-    assert any("merge(reason='done') refused" in t for t in results), results
-    notes = [t for w, t in rec.seen if w == "note"]
-    assert any(t.startswith("(harness note: your detached branch") and "c2 (stopped)" in t
-               and "You stopped c2" in t for t in notes), notes
+    assert any(t.startswith("c2 was stopped before it finished.") and "you had run there: no tools" in t
+               for t in results), results
     check(rec.seen + store_texts(store))
 
 
-def test_focus_hand_back_and_failure_say_branch_and_merge(tmp_path):
-    """A focus branch that asks, then hands a message back; a focus branch that fails."""
+def test_focus_merges_hand_back_and_failure_say_branch_and_merge(tmp_path):
+    """A current branch that asks and merges at its turn's end; one that merges at once with a
+    reason (it hands the request back); one whose run fails. Each merge result is main's."""
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = last_block(messages)
-        user = last["type"] == "text" and not last.get("harness")
+        user = last["type"] == "text" and not woke(last)
         if "fork" in names:
             if user and last["text"] == "Build me a website.":
                 return [use(tool="fork", use_id="f1", **branched(entry(skills=["website"], focus=True)))]
+            if user and last["text"] == "Book a room.":
+                return [use(tool="fork", use_id="f2", **branched(entry(skills=["calendar"], focus=True)))]
             if user and last["text"] == "Make slides.":
-                return [use(tool="fork", use_id="f2", **branched(entry(skills=["slides"], focus=True)))]
-            return text("Okay.")
+                return [use(tool="fork", use_id="f3", **branched(entry(skills=["slides"], focus=True)))]
+            return [] if woke(last) else text("Okay.")
         if "site_write" in names:
-            if user and last["text"] == "Build me a website.":
-                return text("Which colors?")
-            return [use(tool="merge", use_id="m1", reason="out_of_scope")]
-        return [use(tool="merge", use_id="m2", reason="failed")]
+            return text("Which colors?")
+        if "calendar_book" in names:
+            return [use(tool="merge", use_id="m1", reason="I cannot tell which room; ask on main.")]
+        raise ValueError("provider exploded")
 
     store, h, rec = make(tmp_path=tmp_path, policy=policy, name="b")
 
@@ -264,14 +276,16 @@ def test_focus_hand_back_and_failure_say_branch_and_merge(tmp_path):
         await h.start()
         await h.user_says("Build me a website.")
         await h.user_says("Blue. Also send an email to Bob.")
+        await h.user_says("Book a room.")
         await h.user_says("Make slides.")
         await h.settle()
         await h.close()
 
     asyncio.run(go())
-    notes = [t for w, t in rec.seen if w == "note"]
-    assert any("merged, reason=out_of_scope" in t for t in notes), notes
-    assert any("branch c2 failed" in t for t in notes), notes
+    results = [t for w, t in rec.seen if w == "result"]
+    assert any(t.startswith("c1 merged. Its replies above already reached the user") for t in results), results
+    assert any(t.startswith("c2 merged without answering the user's last message") for t in results), results
+    assert any(t.startswith("c3 merged after it failed") for t in results), results
     check(rec.seen + store_texts(store))
 
 
@@ -293,8 +307,8 @@ def test_a_merge_too_large_for_the_context_says_branch(tmp_path):
 
     asyncio.run(go())
     assert h.join_fallbacks and h.join_fallbacks[0]["tier"] == 2
-    notes = [t for w, t in store_texts(store) if w == "stored note"]
-    assert any("did not fit" in t for t in notes), notes
+    results = [t for w, t in store_texts(store) if w == "stored result"]
+    assert any("did not fit in your context" in t for t in results), results
     check(rec.seen + store_texts(store))
 
 
@@ -307,7 +321,7 @@ def test_the_old_tool_names_run_nothing(tmp_path):
         if "fork" in names:
             if ran(last) and last["tool_use_id"] == "old":
                 return [use(tool="fork", use_id="new", **branched(entry(skills=["website"], focus=True)))]
-            if ran(last):
+            if ran(last) or woke(last):
                 return text("Okay.")
             return [use(tool="clone", use_id="old", clone=[{"skills": ["website"]}])]
         if ran(last) and last["tool_use_id"] == "j":
@@ -327,7 +341,9 @@ def test_the_old_tool_names_run_nothing(tmp_path):
     assert results.count("tool 'join' is not available to you") == 1, results
     made = [r[0] for r in store.con.execute("SELECT timeline_id FROM timelines WHERE source_id IS NOT NULL")]
     assert made == ["c1"]  # only the `fork` call made a branch
-    assert store.timeline("c1")["join_reason"] is None  # `join` did not end it
+    # `join` did not end it: its turn ended on its reply, and the harness merged it
+    assert store.timeline("c1")["join_reason"] == "done"
+    assert [r["tool_name"] for r in store.view("c1")][-2:] == ["merge", "merge"]
     assert h.world.log == []
     echoes = {"tool 'clone' is not available to you", "tool 'join' is not available to you"}  # the model's own words
     check([(w, t) for w, t in rec.seen + store_texts(store) if t not in echoes])
@@ -342,8 +358,8 @@ def test_a_merge_whose_view_would_be_invalid_says_branch(tmp_path, monkeypatch):
     forced = []
 
     def failing(rows, viewer, trigger=None, require_user_end=True):
-        if viewer == "o" and require_user_end is False and trigger is None \
-                and any(r.get("owner_timeline") == "c1" for r in rows):
+        if viewer == "o" and trigger is None and any(r.get("row_id") is None for r in rows) \
+                and any(r.get("owner_timeline") == "c1" for r in rows):  # the merge's pending view
             forced.append(viewer)
             return ["forced"]
         return real(rows=rows, viewer=viewer, trigger=trigger, require_user_end=require_user_end)
@@ -365,7 +381,8 @@ def test_a_merge_whose_view_would_be_invalid_says_branch(tmp_path, monkeypatch):
     asyncio.run(go())
     notes = [t for w, t in store_texts(store) if w == "stored note"]
     assert forced, "the merge's validation was never forced to fail"
-    assert any("its rows were skipped (invalid view)" in t for t in notes), notes
+    assert any("site merged, but its messages were skipped" in t or "c1 merged, but its messages were skipped" in t
+               for t in notes), notes
     check(rec.seen + store_texts(store))
 
 
@@ -377,10 +394,10 @@ from graft import compaction as compaction_mod, db as db_mod, harness as harness
 # fails the check (it must be listed again), so a new place that words a note or a refusal is
 # added here, not missed.
 PRODUCERS = {
-    harness_mod: ["said", "merge_head", "check_skill_link", "clone_entries", "_strings", "_messages", "cancel_ids",
+    harness_mod: ["merge_result", "SKIPPED_NOTE", "MERGED", "check_skill_link", "clone_entries", "_strings", "_messages", "cancel_ids",
                   "fork_result", "Harness.resolve_messages", "Harness.message_index", "ENTRY_SHAPE",
                   "Harness.cancel_text", "Harness.system", "Harness.load", "Harness._names", "Harness._running_note",
-                  "Harness.wake_note", "Harness.default_join_rows", "Harness.fit_join", "Harness.default_join",
+                  "Harness.merge_call", "Harness.fit_join", "Harness.default_join",
                   "Harness.task_of", "Harness._stop_call", "_entry", "NOT_A_DRAWN_ID", "NO_FREE_ID", "Harness.prepare_clone", "Harness.refuse_clone",
                   "Harness._prepare_clone", "Harness._loop", "Harness._missing_results",
                   "NOT_RUN_INTERRUPTED", "NOT_RUN_JOINING", "NOT_RUN_BESIDE_CLONE", "CANCELLED_WHILE_RUNNING",
@@ -397,7 +414,7 @@ PRODUCERS = {
 }
 # graft's own identifiers (store and transaction kinds, a graft's kind, its reason, the keys of the
 # harness's logs) and its audit records: compared and stored, never shown to a model.
-INTERNAL = {"clone", "join", "joined", "background", "focus", "cancelled", "FOCUS ", ":clone_tx", "DEFAULT JOIN ", "CLONE ",
+INTERNAL = {"clone", "join", "joined", "background", "focus", "cancelled", "out_of_scope", "FOCUS ", ":clone_tx", "DEFAULT JOIN ", "CLONE ",
             "BACKGROUND", "FOCUS"}
 # Calls whose text is never shown to a model: the host's trace and the lines the user's callbacks get.
 NOT_MODEL_FACING = {"trace", "_report", "_report_failure", "emit", "DecisionFault", "Aborted", "RuntimeError",
@@ -477,10 +494,11 @@ def test_every_model_facing_producer_uses_no_banned_word(module, name):
 
 
 # ------------------------------------------------------------------ wordings no other run reaches
-def test_the_merge_record_of_a_branch_that_wrote_nothing_and_plural_stops_say_branch(tmp_path):
-    """A branch that brings back no rows the conversation lacks, and a stop of two branches (its
-    result and the wake note that reports them)."""
+def test_the_merge_result_of_a_branch_that_wrote_nothing_and_plural_stops_say_branch(tmp_path):
+    """A branch that brings back no rows the conversation lacks, a stop of two branches, and every
+    merge result wording (each reason, focus or not, each size tier)."""
     from _util import clone_in_turn
+    from graft.harness import merge_result
     store, h, rec = make(tmp_path=tmp_path, policy=lambda **_: text(t="Reporting."), name="h")
 
     async def go():
@@ -494,17 +512,17 @@ def test_the_merge_record_of_a_branch_that_wrote_nothing_and_plural_stops_say_br
         await h.machines.stop()
 
     asyncio.run(go())
-    notes = [t for w, t in store_texts(store) if w == "stored note"]
-    assert any("it brings back no rows you do not already hold" in t for t in notes), notes
+    results = [t for w, t in store_texts(store) if w == "stored result"]
+    assert any(t.startswith("c1 merged; it brings back no messages you do not already have.") for t in results), results
     check(rec.seen + store_texts(store))
 
     from graft.machine import CANCELLED, CancelCall
     stopped, _ = h.cancel_text(call=CancelCall(use={"id": "x"}, ids=["c1", "c2"], problems=[]),
                                outcomes={"c1": CANCELLED, "c2": CANCELLED})
     assert stopped.startswith("stopped -> c1, c2 (what you did in them so far merges"), stopped
-    store.add_turn(tl="o", role="assistant", kind="text", content="Okay.")
-    h.wake_note(src="o", joined=[("c1", CANCELLED), ("c2", CANCELLED)], handed_back=False, running=[], background=True)
-    note = store.view("o")[-1]["content"]
-    assert "detached branches c1 (stopped), c2 (stopped) merged" in note and "You stopped c1, c2" in note
-    assert note.rstrip(")").endswith("Do not describe still-running work as finished.") and "they were stopped" in note, note
-    check([("result", stopped), ("note", note)])
+    worded = [merge_result(name="site", reason=reason, focus=focus, ran=["site_write (returned an error)"],
+                           dropped=dropped, running="No other branch of yours is still running.", empty=empty)
+              for reason in ("done", "out_of_scope", "failed", CANCELLED) for focus in (True, False)
+              for empty in (True, False) for dropped in (None, "What you did in site did not fit.")]
+    assert all(t.endswith("end your turn without saying anything.") for t in worded)
+    check([("result", stopped)] + [("result", t) for t in worded])

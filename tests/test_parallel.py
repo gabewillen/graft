@@ -14,7 +14,7 @@ import threading
 
 import pytest
 
-from _util import clone_in_turn, clones, holder, holders, status, ran, started, pointing
+from _util import clone_in_turn, clones, holder, holders, status, ran, started, pointing, merged, woke
 from graft.db import Store, render, validate
 from graft.harness import (NOT_RUN_BESIDE_CLONE, NOT_RUN_INTERRUPTED, NOT_RUN_JOINING, Harness,
                            NotRun, _reason, cancel_ids, clone_entries)
@@ -90,8 +90,10 @@ def make(tmp_path, policy, **kw):
 
 
 def join_records(store, tl="o"):
-    """The harness's join and error records in tl's view (rows it marked; wake notes left out)."""
-    return [r["content"] for r in store.view(tl) if r["harness"] and r["content"].startswith("(harness note: your branch ")]
+    """tl's merge results (its own results of its branches' merge calls), as their texts: what the
+    join record and the wake note said, in order."""
+    return [json.loads(r["content"])["content"] for r in store.view(tl)
+            if r["kind"] == "tool_result" and r["tool_name"] == "merge" and r["owner_timeline"] == tl]
 
 
 def now(coro):
@@ -114,9 +116,12 @@ async def returned(thread):
 
 
 def is_wake(block):
-    """Is this message block the harness's wake note? By its mark first; the text says which note."""
-    return (block["type"] == "text" and bool(block.get("harness"))
-            and block["text"].startswith("(harness note: your detached branch"))
+    """Is this message block what a wake run's view ends on: main's result of a branch's merge call
+    (spec: Join; there is no wake note)? Its text is at "text" too, as a note's was."""
+    if merged(block):
+        block.setdefault("text", block["content"])
+        return True
+    return False
 
 
 # ------------------------------------------------------------------ the clone call is one batch
@@ -214,7 +219,7 @@ def test_source_keeps_the_conversation_and_is_woken_when_grafts_join(tmp_path):
         assert join_records(store) == []
         script.open()
         out = await h.settle()
-        assert out and all(o.startswith("Report: (harness note: your detached branch") for o in out)
+        assert out and all(re.match(r"Report: c[12] merged\. What you did there", o) for o in out)
         assert sorted(c for w in h.wakes for c, _ in w["joined"]) == ["c1", "c2"]
         assert all(r == "done" for w in h.wakes for _, r in w["joined"])  # a text-only turn joined done
         assert [status(store=store, tl=t) for t in ("o", "c1", "c2")] == ["active", "joined", "joined"]
@@ -259,7 +264,10 @@ def test_joins_wait_for_the_source_to_be_at_rest_and_one_wake_covers_them(tmp_pa
         assert out[0] == "Started." and len(out) == 2 and out[1].startswith("Report:")
         assert len(h.wakes) == 1 and sorted(c for c, _ in h.wakes[0]["joined"]) == ["c1", "c2"]
         texts = [r["content"] for r in store.view("o") if r["kind"] == "text"]
-        assert texts.index("Started.") < min(texts.index(x) for x in join_records(store))  # after its turn
+        ids = [r["row_id"] for r in store.view("o")]
+        merges = [r["row_id"] for r in store.view("o") if r["tool_name"] == "merge"]
+        started_at = next(r["row_id"] for r in store.view("o") if r["content"] == "Started.")
+        assert ids.index(started_at) < min(map(ids.index, merges))  # the merges come after its turn
         assert await h.settle() == []
         await h.machines.stop()
 
@@ -287,9 +295,10 @@ def test_queued_joins_commit_before_the_next_user_message_without_a_wake(tmp_pat
         assert out == ["Noted."] and h.wakes == []
         assert status(store=store, tl=c1) == "joined"
         rows = store.view("o")
-        tail = [r["row_id"] for r in rows][-4:]
-        assert tail[1] == done and rows[-2]["content"] == "Thanks. Anything else?"  # record, reply, message
-        assert rows[-4]["content"].startswith("(harness note: your branch c1 merged, reason=done")
+        tail = [r["row_id"] for r in rows][-5:]
+        assert tail[0] == done and rows[-2]["content"] == "Thanks. Anything else?"  # reply, merge, result, message
+        assert (rows[-4]["tool_name"], rows[-4]["owner_timeline"]) == ("merge", c1)
+        assert json.loads(rows[-3]["content"])["content"].startswith("c1 merged.")
         assert req in store.pointed("o") and [r["row_id"] for r in rows].count(req) == 1  # the seed is not re-joined
         await h.machines.stop()
 
@@ -316,9 +325,9 @@ def test_background_joins_commit_before_a_focus_join_so_its_trigger_stays_last(t
         await h.do_join(c1, "out_of_scope")
         rows = store.view("o")
         ids = [r["row_id"] for r in rows]
-        assert [x.split()[4] for x in join_records(store)] == ["c2", "c1"]  # background first
+        assert [x.split()[0] for x in join_records(store)] == ["c2", "c1"]  # background first
         assert ids.index(deck) < ids.index(trig) and ids[-2] == trig  # trigger last, then the source's answer
-        assert rows[-1]["content"] == "Routing that." and h.wakes == []  # the trigger woke it; no wake note
+        assert rows[-1]["content"] == "Routing that." and h.wakes == []  # a turn on the trigger: no wake
         assert status(store=store, tl="o") == "active" and status(store=store, tl=c1) == status(store=store, tl=c2) == "joined"
         await h.machines.stop()
 
@@ -339,7 +348,7 @@ def test_focus_done_with_queued_background_joins_wakes_the_source_once(tmp_path)
         await h.do_join(c2, "done")
         store.add_turn(c1, "assistant", "text", "Site built.")
         await h.do_join(c1, "done")
-        assert h.wakes == [{"source": "o", "joined": [(c2, "done")]}]
+        assert h.wakes == [{"source": "o", "joined": [(c2, "done"), (c1, "done")]}]  # every merge is news
         assert h.out == ["Both are finished."] and await h.until_rest("o") == "ended"
         await h.machines.stop()
 
@@ -363,8 +372,8 @@ def test_background_step_budget_and_empty_response_join_failed(tmp_path):
         await h.settle()
         assert store.timeline("c1")["join_reason"] == "failed" and store.timeline("c2")["join_reason"] == "failed"
         assert status(store=store, tl="c1") == status(store=store, tl="c2") == "joined"
-        errors = [r["content"] for r in store.view("o") if "failed; its timeline is frozen" in r["content"]]
-        assert len(errors) == 2
+        assert [x.split(" merged after it failed")[0] for x in join_records(store)] == ["c2", "c1"] or \
+            sorted(x.split(" merged after it failed")[0] for x in join_records(store)) == ["c1", "c2"]
         await h.user_says("Try again please.")  # a new message may clone again
         assert "c3" in clones(store)
         script.open()
@@ -394,12 +403,10 @@ def test_background_mechanical_error_joins_failed(tmp_path):
     asyncio.run(go())
 
 
-def test_background_silent_done_is_refused_until_it_writes_its_result(tmp_path):
-    steps = iter([
-        [{"type": "tool_use", "id": "j1", "name": "merge", "input": {"reason": "done"}}],
-        [{"type": "text", "text": "Site built with defaults."},
-         {"type": "tool_use", "id": "j2", "name": "merge", "input": {"reason": "done"}}],
-    ])
+def test_a_background_merge_without_a_result_is_accepted_and_merges(tmp_path):
+    """No refusal of a merge without a reply (the model's merge takes no reason): a detached
+    branch that merges at once merges, and main is told it brought back nothing."""
+    steps = iter([[{"type": "tool_use", "id": "j1", "name": "merge", "input": {}}]])
     script = Script(entries=[clone_entry(skills=["website"], focus=False)], graft=lambda skill, messages: next(steps))
     script.open()
     store, h, _ = make(tmp_path, script)
@@ -411,11 +418,9 @@ def test_background_silent_done_is_refused_until_it_writes_its_result(tmp_path):
         await h.machines.stop()
 
     asyncio.run(go())
-    assert h.silent_done_refusals == ["c1"]
-    refusal = [r for r in store.view("c1") if r["kind"] == "tool_result" and not r["harness"]][0]
-    assert "you have not written your result yet" in refusal["content"]
+    assert [r for r in store.view("c1") if r["kind"] == "tool_result" and not r["harness"]][0]["tool_name"] == "merge"
     assert store.timeline("c1")["join_reason"] == "done"
-    assert "Site built with defaults." in [r["content"] for r in store.view("o")]
+    assert join_records(store)[0].startswith("c1 merged; it brings back no messages you do not already have.")
 
 
 def test_a_clone_batch_is_one_store_transaction(tmp_path):
@@ -449,7 +454,7 @@ def test_parallel_experiment_runs_offline(capsys, tmp_path):
     seq, par = asyncio.run(go())
     assert parallel.report([seq, par], live=False, latency=0.0)
     assert all(seq["checks"].values()) and all(par["checks"].values())
-    assert (seq["focus"], seq["background"], seq["clone_calls"], seq["wakes"]) == (3, 0, 3, 0)
+    assert (seq["focus"], seq["background"], seq["clone_calls"], seq["wakes"]) == (3, 0, 3, 3)  # a run after each merge
     assert (par["focus"], par["background"], par["clone_calls"]) == (0, 3, 1) and par["wakes"] >= 1
     assert [(s, j) for _, s, j in par["clones"]] == [("joined", "done")] * 3
     assert par["replies"][0].startswith("I have started") and len(par["replies"]) == 1 + par["wakes"]
@@ -502,7 +507,7 @@ def test_a_done_join_wakes_a_full_run_that_clones_the_next_task(tmp_path):
             return text("Deck built." if "slides_create" in names else "Site built.")
         if ran(last):
             return text("Refused: " + last["content"] if last.get("is_error") else "Started.")
-        if is_wake(last) and "c1 (done)" in last["text"]:
+        if is_wake(last) and last["text"].startswith("c1 merged."):
             return [{"type": "text", "text": "The website is done; starting the deck."},
                     clone_use(clone_entry(skills=["slides"], focus=False), id="k2") | {"type": "tool_use"}]
         if is_wake(last):
@@ -526,17 +531,18 @@ def test_a_done_join_wakes_a_full_run_that_clones_the_next_task(tmp_path):
 
 
 def test_a_failed_join_wakes_a_full_run_that_clones_another_part(tmp_path):
-    """The website graft joins `failed`; its wake is a full run, and the original clones the deck."""
+    """The website graft's run raises (it joins `failed`); the run after its merge is a full run,
+    and the original clones the deck."""
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" not in names:
             if "slides_create" in names:
                 return text("Deck built.")
-            return [{"type": "tool_use", "id": "j1", "name": "merge", "input": {"reason": "failed"}}]
+            raise ValueError("the site tool chain broke")  # its run raises: it merges failed
         if ran(last):
             return text("Refused: " + last["content"] if last.get("is_error") else "Started.")
-        if is_wake(last) and "c1 (failed)" in last["text"]:
+        if is_wake(last) and last["text"].startswith("c1 merged after it failed"):
             return [{"type": "text", "text": "The website failed; starting the deck."},
                     clone_use(clone_entry(skills=["slides"], focus=False), id="k2") | {"type": "tool_use"}]
         if is_wake(last):
@@ -558,32 +564,26 @@ def test_a_failed_join_wakes_a_full_run_that_clones_another_part(tmp_path):
 
 
 def test_a_focus_hand_back_wakes_a_full_run_that_clones_another_part(tmp_path):
-    """The focus website graft hands the request back (`out_of_scope`) with no new message: the
-    wake note says a request came back, and the wake is a full run that clones the deck."""
+    """The current website branch merges at once with a reason and no reply (graft's
+    `out_of_scope`): its merge result says the user's message is main's to answer, and the run
+    after it is a full run that forks the deck."""
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" not in names:
             if "slides_create" in names:
                 return text("Deck built.")
-            return [{"type": "tool_use", "id": "j1", "name": "merge", "input": {"reason": "out_of_scope"}}]
+            return [{"type": "tool_use", "id": "j1", "name": "merge", "input": {"reason": "This is a deck, not a site."}}]
         if ran(last):
             return text("Refused: " + last["content"] if last.get("is_error") else "Started.")
-        if is_wake(last) or (last["type"] == "text" and "c1 (out_of_scope) merged" in last["text"]):
-            if "c1 (out_of_scope)" in last["text"]:
+        if is_wake(last):
+            if last["text"].startswith("c1 merged without answering the user's last message"):
                 return [{"type": "text", "text": "Starting the deck."},
                         clone_use(clone_entry(skills=["slides"], focus=False), id="k2") | {"type": "tool_use"}]
             return text("The deck is done.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id="k1") | {"type": "tool_use"}]
 
     store, h, _ = make(tmp_path, policy)
-    notes = []
-    real = h.wake_note
-
-    def wake_note(**kw):
-        notes.append(kw["handed_back"])
-        return real(**kw)
-    h.wake_note = wake_note
 
     async def go():
         await h.start()
@@ -593,39 +593,39 @@ def test_a_focus_hand_back_wakes_a_full_run_that_clones_another_part(tmp_path):
         await h.machines.stop()
 
     asyncio.run(go())
-    assert notes == [True, False]  # the first wake answers the handed-back request
-    wake_notes = [r["content"] for r in store.view("o") if r["harness"] and " merged; " in r["content"]]
-    assert "A request came back: answer it." in wake_notes[0] and "A request came back" not in wake_notes[1]
+    reasons = [json.loads(r["content"])["input"].get("reason") for r in store.view("o")
+               if r["kind"] == "tool_use" and r["tool_name"] == "merge"]
+    assert reasons == ["This is a deck, not a site.", None]  # its own words reach main in its merge call
     assert clones(store) == ["c1", "c2"] and h.part_of("c2") == {"slides"}
     assert validate(store.view("o"), "o", require_user_end=False) == []
 
 
-# ------------------------------------------------------------------ scope: a graft does its own part
+# ------------------------------------------------------------------ each graft does only its own part
 def test_skill_text_carries_the_own_part_rule():
     from graft.skills import BACKGROUND_INSTRUCTIONS, CATALOG, CLONE_INSTRUCTIONS, JOIN_INSTRUCTIONS
     desc = {s.name: " ".join(s.description.split()).lower() for s in CATALOG}
     for name, instr in (("merge", JOIN_INSTRUCTIONS), ("detached", BACKGROUND_INSTRUCTIONS)):
         flat = " ".join(instr.split()).lower()
-        # the messages a graft starts with may ask for several things: it does only its own part
-        assert "start with" in flat and "only the part" in flat and "other branches of yourself" in flat, name
+        # the messages a graft starts with may ask for several things: it does only its own part,
+        # the one main's reason gives it
+        assert "start with may ask for more" in flat and "the reason you wrote for this branch" in flat, name
+        assert "yours on other branches or on main" in flat, name
         assert "do not attempt" in flat and "apologise" in flat and "mention" in flat, name
-        assert "never a reason to call `merge`" in flat, name
+        assert "never hand them back" in flat, name
         # the one-line description is what a graft sees before it loads the skill
-        assert "only the part" in desc[name] and "other branches" in desc[name], name
-    join = " ".join(JOIN_INSTRUCTIONS.split()).lower()
-    assert "after you started" in join and "after you started" in desc["merge"]  # whole-message rule: later messages
-    background = " ".join(BACKGROUND_INSTRUCTIONS.split()).lower()
-    assert "only if you could not do your own part" in background
+        assert "the reason you wrote for this branch" in desc[name] and "merges this branch back into main" in desc[name], name
     clone = " ".join(CLONE_INSTRUCTIONS.split()).lower()
-    assert "only the part its skills cover" in clone and "one branch per part" in clone
-    assert "still running" in clone and "do not fork again for the parts" in clone
+    assert "one branch per part" in clone and "give every branch a reason" in clone
+    assert "you stay on main" in clone and "never main itself" in clone
+    assert "never repeat them" in clone and "end your turn without saying anything" in clone
 
 
 def test_a_focus_graft_seeded_with_a_multi_part_message_does_its_part(tmp_path):
-    """The seed asks for a website and slides. The website focus graft builds the site; only a
-    later message for something else sends it back out of scope."""
+    """The seed asks for a website and slides. The website focus graft builds the site and its
+    turn ends in its merge; the next message, for something else, reaches main, never the graft."""
     from graft.fake import bench_graft_policy
     multi = "We offer cleaning services. Please build our website and a slide deck for the open house."
+    book = "Now book an appointment on 2026-12-05 at 10:00."
 
     def policy(system, messages, tools):
         if "fork" not in {t["name"] for t in tools}:
@@ -634,19 +634,19 @@ def test_a_focus_graft_seeded_with_a_multi_part_message_does_its_part(tmp_path):
         if last["type"] == "text" and last["text"] == multi:
             return [clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=False),
                               id="k1") | {"type": "tool_use"}]
-        return text("Okay.")
+        return [] if woke(last) else text("Okay.")
 
     store, h, _ = make(tmp_path, policy)
 
     async def go():
         await h.start()
         out = await h.user_says(multi)
-        assert status(store=store, tl="c1") == "active" and store.timeline("c1")["join_reason"] is None
+        assert status(store=store, tl="c1") == "joined" and store.timeline("c1")["join_reason"] == "done"
         assert "services" in h.world.site["home"] and out and out[-1].startswith("Done: wrote page home")
         await h.settle()
         assert store.timeline("c2")["join_reason"] == "done" and h.world.decks
-        await h.user_says("Now book an appointment on 2026-12-05 at 10:00.")  # arrives after it started
-        assert store.timeline("c1")["join_reason"] == "out_of_scope"
+        assert await h.user_says(book) == ["Okay."]  # main answers it: the graft's turn is over
+        assert book not in [r["content"] for r in store.view("c1")]
         await h.machines.stop()
 
     asyncio.run(go())
@@ -664,17 +664,16 @@ def test_pivot_policy_website_graft_keeps_a_multi_part_seed(tmp_path):
         (c1,), msg = await clone_in_turn(h=h, use=clone_use(clone_entry(skills=["website"], focus=True)))
         store.add_turn(tl="o", role="assistant", kind="tool_use", content={"id": "t", "input": {}}, tool_name="fork")
         store.add_turn(tl="o", role="user", kind="tool_result", content={"tool_use_id": "t", "content": msg}, tool_name="fork")
-        await h.run(c1)  # the seed also mentions slides: that is another instance's part
-        assert status(store=store, tl="c1") == "active" and "cleaning" in h.world.site["home"]  # did its part
-        await h.user_says("Instead let's build a slide show.")  # a later message: out of scope
-        assert store.timeline("c1")["join_reason"] == "out_of_scope"
+        assert await h.run(c1) == "joined"  # its turn ends in its merge
+        assert "cleaning" in h.world.site["home"]  # it did its part; the slide show is another part
+        assert store.timeline("c1")["join_reason"] == "done"
         await h.machines.stop()
 
     asyncio.run(go())
 
 
 # ------------------------------------------------------------------ notes name the grafts still running
-def test_wake_note_and_join_record_name_the_grafts_still_running(tmp_path):
+def test_merge_results_name_the_grafts_still_running(tmp_path):
     store, h, _ = make(tmp_path, lambda *a: text("Reporting."))
 
     async def go():
@@ -685,38 +684,33 @@ def test_wake_note_and_join_record_name_the_grafts_still_running(tmp_path):
         store.add_turn(c1, "assistant", "text", "Site built.")
         await h.do_join(c1, "done")
         await h.drain_and_wake("o")
-        notes = [r["content"] for r in store.view("o") if r["harness"]]
-        record, wake = notes[-2:]
-        assert record.startswith("(harness note: your branch c1 merged, reason=done")
-        assert "Still running: c2 (skills: slides)" in record
-        assert wake.startswith("(harness note: your detached branch c1 (done) merged")
-        assert "Still running: c2 (skills: slides)" in wake
-        assert "only" in wake and "not describe still-running work as finished" in wake
+        result = join_records(store)[-1]
+        assert result.startswith("c1 merged. What you did there is in the messages above")
+        assert "Still running: c2 (skills: slides)" in result
+        assert "Do not describe still-running work as finished." in result
         store.add_turn(c2, "assistant", "text", "Deck built.")
         await h.do_join(c2, "done")
         await h.drain_and_wake("o")
-        notes = [r["content"] for r in store.view("o") if r["harness"]]
-        record, wake = notes[-2:]
-        assert "Still running" not in record and "No other branch of yours is still running" in record
-        assert "Still running" not in wake and "No other branch of yours is still running" in wake
+        result = join_records(store)[-1]
+        assert "Still running" not in result and "No other branch of yours is still running" in result
         await h.machines.stop()
 
     asyncio.run(go())
     from graft import seeder
     from graft.fake import woken
-    for r in store.view("o"):  # every note is still recognised as a harness note
-        if "still running" in r["content"].lower():
+    for r in store.view("o"):  # every merge result is the harness's, and never a seed candidate
+        if r["tool_name"] == "merge" and r["kind"] == "tool_result":
             assert not seeder.is_candidate(r) and r["harness"] == 1
     from graft.db import render
-    assert woken(render(store.view("o")[:-1]))  # the view up to the wake note: recognised by its mark
+    assert woken(render(store.view("o")[:-1]))  # the view up to main's reply ends on a merge result
 
 
-def test_focus_join_record_names_live_background_grafts(tmp_path):
+def test_focus_merge_result_names_live_background_grafts(tmp_path):
     seen = {}
 
     def policy(system, messages, tools):
-        seen["notes"] = [b["text"] for m in messages if m["role"] == "user" for b in m["content"]
-                         if b["type"] == "text" and b.get("harness")]
+        seen["results"] = [b["content"] for m in messages if m["role"] == "user" for b in m["content"]
+                           if merged(b)]
         return text("Routing that.")
 
     store, h, _ = make(tmp_path, policy)
@@ -729,10 +723,9 @@ def test_focus_join_record_names_live_background_grafts(tmp_path):
         store.add_turn(tl="o", role="assistant", kind="tool_use", content={"id": "t", "input": {}}, tool_name="fork")
         store.add_turn(tl="o", role="user", kind="tool_result", content={"tool_use_id": "t", "content": msg}, tool_name="fork")
         await h.do_join(c1, "out_of_scope")  # bounces at once, while both background grafts are live
-        assert len(seen["notes"]) == 2  # the source ran for the hand-back: the join record, then the closing note
-        assert "c1 (out_of_scope) merged" in seen["notes"][1] and "Still running: c2" in seen["notes"][1]
-        assert seen["notes"][0].startswith("(harness note: your branch c1 merged, reason=out_of_scope")
-        assert "Still running: c2 (skills: slides), c3 (skills: calendar)" in seen["notes"][0]
+        assert len(seen["results"]) == 1  # the source ran after the merge, on its merge result
+        assert seen["results"][0].startswith("c1 merged without answering the user's last message")
+        assert "Still running: c2 (skills: slides), c3 (skills: calendar)" in seen["results"][0]
         await h.machines.stop()
 
     asyncio.run(go())
@@ -830,7 +823,7 @@ def test_settle_raises_every_failed_background_task(tmp_path):
     asyncio.run(go())
 
 
-def test_wake_note_does_not_point_at_rows_the_size_backstop_dropped(tmp_path):
+def test_a_merge_result_does_not_point_at_rows_the_size_backstop_dropped(tmp_path):
     store, h, _ = make(tmp_path, lambda *a: text("Reporting."), window_tokens=120)
 
     async def go():
@@ -845,10 +838,10 @@ def test_wake_note_does_not_point_at_rows_the_size_backstop_dropped(tmp_path):
 
     asyncio.run(go())
     assert h.join_fallbacks and h.join_fallbacks[0]["tier"] == 2  # nothing of c1 fits
-    wake = [r["content"] for r in store.view("o")
-            if r["harness"] and r["content"].startswith("(harness note: your detached")][0]
-    assert "in the rows above" not in wake
-    assert "c1" in wake and "did not fit" in wake and "frozen timeline" in wake
+    result = join_records(store)[0]
+    assert result.startswith("c1 merged. What you did in c1 did not fit")  # none follow, so it points at none
+    assert "in the messages above" not in result
+    assert "What you did in c1 did not fit in your context" in result and "frozen timeline" in result
 
 
 def test_clone_entries_validates_model_written_fields_and_keeps_raw_indexes():
@@ -976,7 +969,7 @@ def test_a_rolled_back_queued_join_ends_its_graft_joined_and_the_queue_moves_on(
         await drain(h)
         # a join that rolls back ends its graft `joined` too, and the queue moves on to the next one
         assert status(store=store, tl=c1) == status(store=store, tl=c2) == "joined"
-        assert [x.split()[4] for x in join_records(store)] == [c2]  # c1's rows were not appended
+        assert [x.split()[0] for x in join_records(store)] == [c2]  # c1's rows were not appended
         assert h.commit_errors == [] and len(h.wakes) == 1
         await h.machines.stop()
 
@@ -1020,7 +1013,7 @@ def test_a_failed_wake_after_a_focus_done_join_is_contained(tmp_path):
         await h.do_join(c2, "done")
         store.add_turn(c1, "assistant", "text", "Site built.")
         await h.do_join(c1, "done")  # the wake that follows fails; the joins hold and nothing propagates
-        assert h.wake_errors == [("o", [c2], "ValueError: wake exploded")] and len(said) == 1
+        assert h.wake_errors == [("o", [c2, c1], "ValueError: wake exploded")] and len(said) == 1  # one wake for both
         assert len(join_records(store)) == 2 and await h.until_rest("o") == "ended"
         await h.machines.stop()
 
@@ -1043,8 +1036,8 @@ def test_close_cancels_running_background_grafts_and_joins_them_failed(tmp_path)
     script.open()  # let the abandoned model-call threads end
     assert [store.timeline(c)["join_reason"] for c in ("c1", "c2")] == ["failed", "failed"]
     assert [store.timeline(c)["status"] for c in ("c1", "c2")] == ["joined", "joined"]
-    records = [x for x in join_records(store) if " merged, " in x]  # without the two error records
-    assert len(records) == 2 and all("reason=failed" in x for x in records)
+    records = join_records(store)
+    assert len(records) == 2 and all(" merged after it failed" in x for x in records)
     assert validate(store.view("o"), "o", require_user_end=False) == []
 
 
@@ -1215,8 +1208,8 @@ def test_a_join_is_one_sql_transaction(tmp_path, monkeypatch):
         real = store.insert_turn
 
         def crash_on_error_row(owner, role, kind, content, tool_name=None, harness=False):
-            if "failed; its timeline is frozen" in str(content):
-                raise OSError("disk full")  # after the record and the pointers were written
+            if "merged after it failed" in str(content):
+                raise OSError("disk full")  # after the implicit merge and the pointers were written
             return real(owner, role, kind, content, tool_name, harness=harness)
 
         monkeypatch.setattr(store, "insert_turn", crash_on_error_row)
@@ -1230,9 +1223,8 @@ def test_a_join_is_one_sql_transaction(tmp_path, monkeypatch):
         monkeypatch.setattr(store, "insert_turn", real)
         await h.drain_and_wake("o")  # the retry
         assert status(store=store, tl=c1) == "joined"
-        records = [x for x in join_records(store) if " merged, " in x]
-        errors = [x for x in join_records(store) if "failed; its timeline is frozen" in x]
-        assert len(records) == 1 and len(errors) == 1  # exactly one record, one error row
+        assert len(join_records(store)) == 1  # exactly one merge result
+        assert [r["tool_name"] for r in store.view(c1)].count("merge") == 2  # one implicit merge call and its result
         assert [r["content"] for r in store.view("o")].count("Half a site.") == 1
         tx = store.con.execute("SELECT status FROM transactions WHERE kind='join' AND target=? ORDER BY tx_id",
                                (c1,)).fetchall()
@@ -1285,6 +1277,10 @@ def test_parallel_experiment_answers_a_question_with_a_bounded_follow_up(capsys,
         if "fork" in names:
             if ran(last):
                 return text("(waiting)")
+            if woke(last):  # after a merge: the current branch already asked; the follow-up comes to main
+                return []
+            if parallel.FOLLOW_UP in user_texts(messages)[-1]:  # the answer: fork the site again for it
+                return [clone_use(clone_entry(skills=["website"], focus=True), id=f"k{len(messages)}") | {"type": "tool_use"}]
             return [clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=False),
                               clone_entry(skills=["calendar"], focus=False), id="k1") | {"type": "tool_use"}]
         told = any(parallel.FOLLOW_UP in t for t in user_texts(messages))
@@ -1325,7 +1321,6 @@ def test_harness_rows_are_marked_in_the_store_and_in_rendered_blocks(tmp_path):
     assert seeder.is_candidate(rows[typed]) and not seeder.is_candidate(rows[note])
     blocks = [b for m in render(store.view("o")) for b in m["content"]]
     assert "harness" not in blocks[0] and blocks[2]["harness"] is True
-    assert woken(render(store.view("o"))) and not woken(render(store.view("o")[:1]))  # by the mark, not the text
     with pytest.raises(Exception):
         store.con.execute("INSERT INTO turns(owner_timeline, role, kind, content, ts, harness) "
                           "VALUES ('o','user','text','x',0,2)")
@@ -1375,15 +1370,16 @@ def test_a_graft_starts_from_the_conversation_and_never_from_rows_the_source_doe
 
 # ------------------------------------------------------------------ join failure paths
 def _focus_script(reply="Routing that."):
-    """The original clones one website focus graft for REQUEST and answers anything else with
-    `reply`; the graft answers its seed and hands any later message back."""
+    """The original clones one website focus graft for REQUEST, says nothing after a merge (the
+    graft's reply already reached the user) and answers anything else with `reply`; the graft
+    answers its seed and hands any later message back."""
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "text" and last["text"] == REQUEST and not last.get("harness"):
+            if last["type"] == "text" and last["text"] == REQUEST and not woke(last):
                 return [clone_use(clone_entry(skills=["website"], focus=True), id="k1") | {"type": "tool_use"}]
-            return text(reply)
+            return [] if merged(last) else text(reply)
         if len(user_texts(messages)) > 1:
             return [{"type": "tool_use", "id": f"j{len(messages)}", "name": "merge",
                      "input": {"reason": "out_of_scope"}}]
@@ -1396,30 +1392,27 @@ def test_a_focus_join_whose_commit_raises_is_reported_kept_and_retried(tmp_path,
 
     async def go():
         await h.start()
-        assert await h.user_says(REQUEST) == ["Site built."]
         real = store.commit_join
 
         def broken(*a, **kw):
             raise OSError("disk full")
 
         monkeypatch.setattr(store, "commit_join", broken)
-        out = await h.user_says("Now email it to Bob.")  # c1 hands it back; the join cannot be written
-        assert len(out) == 1 and "committing the merge of branch c1 failed" in out[0] and "disk full" in out[0]
-        assert h.commit_errors == [("o", ["c1"], "OSError: disk full")] and said[-1] == out[0]
+        out = await h.user_says(REQUEST)  # c1 answers; its turn ends in its merge, which cannot be written
+        assert out[0] == "Site built." and len(out) == 2
+        assert "committing the merge of branch c1 failed" in out[1] and "disk full" in out[1]
+        assert h.commit_errors == [("o", ["c1"], "OSError: disk full")] and said[-1] == out[1]
         assert status(store=store, tl="c1") == "queued"  # not joined
-        c1 = store.timeline("c1")
-        assert c1["join_reason"] == "out_of_scope" and c1["join_trigger"] is not None  # its reason and trigger are kept
+        assert store.timeline("c1")["join_reason"] == "done"  # its reason is kept
         assert await h.until_rest("o") == "ended" and holder(store) == "o"  # the source has the conversation
         monkeypatch.setattr(store, "commit_join", real)
-        assert await h.settle() == ["Routing that."]  # the next commit point lands it and the request is answered
-        assert status(store=store, tl="c1") == "joined"
-        texts = [r["content"] for r in store.view("o") if r["kind"] == "text"]
-        assert texts[-2:] == ["Now email it to Bob.", "Routing that."]  # the handed-back request was not lost
+        assert await h.settle() == []  # the next commit point lands it; main's run after it says nothing
+        assert status(store=store, tl="c1") == "joined" and len(join_records(store)) == 1
+        assert await h.user_says("Thanks.") == ["Routing that."]
         await h.machines.stop()
 
     asyncio.run(go())
     assert validate(store.view("o"), "o", require_user_end=False) == []
-    assert len([x for x in join_records(store) if " merged, " in x]) == 1
 
 
 def test_a_refused_join_leaves_the_store_untouched(tmp_path):
@@ -1460,7 +1453,7 @@ def test_a_focus_graft_whose_run_raises_joins_failed_without_the_model(tmp_path)
             raise ValueError("provider exploded")
         if ran(last):
             return text("Sorry, I could not build that.")
-        if any(b.get("harness") for m in messages for b in m["content"] if b["type"] == "text"):
+        if woke(last):
             return text("Sorry, I could not build that.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id="k1") | {"type": "tool_use"}]
 
@@ -1476,7 +1469,7 @@ def test_a_focus_graft_whose_run_raises_joins_failed_without_the_model(tmp_path)
         await h.machines.stop()
 
     asyncio.run(go())
-    assert [x for x in join_records(store) if "failed; its timeline is frozen" in x]
+    assert [x for x in join_records(store) if x.startswith("c1 merged after it failed")]
 
 
 def test_close_joins_failed_a_background_graft_that_never_started(tmp_path):
@@ -1491,7 +1484,7 @@ def test_close_joins_failed_a_background_graft_that_never_started(tmp_path):
 
     asyncio.run(go())
     assert (store.timeline("c1")["status"], store.timeline("c1")["join_reason"]) == ("joined", "failed")
-    assert len([x for x in join_records(store) if " merged, " in x]) == 1
+    assert len([x for x in join_records(store) if " merged after it failed" in x]) == 1
     assert h.provider.calls == []
 
 
@@ -1605,7 +1598,7 @@ def _fails_after_speaking(raises):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if last["type"] == "text" and last.get("harness"):
+            if woke(last):
                 return text("Sorry, building the site failed.")
             if ran(last):
                 return text("(waiting)")
@@ -1627,8 +1620,8 @@ def test_a_focus_graft_that_fails_after_speaking_still_gets_the_user_an_answer(t
         assert out[0] == "Working on it." and out[-1] == "Sorry, building the site failed."
         assert store.timeline("c1")["join_reason"] == "failed" and status(store=store, tl="c1") == "joined"
         assert await h.until_rest("o") == "ended" and holder(store) == "o"
-        note = store.view("o")[-2]
-        assert note["harness"] and "c1 (failed)" in note["content"]  # what the source was woken with
+        result = store.view("o")[-2]  # what the source was woken with: its merge result
+        assert result["harness"] and json.loads(result["content"])["content"].startswith("c1 merged after it failed")
         await h.close()
 
     asyncio.run(go())
@@ -1655,15 +1648,15 @@ def test_a_store_error_while_a_focus_graft_joins_does_not_strand_the_source(tmp_
 
     async def go():
         await h.start()
-        await h.user_says(REQUEST)
         broken = _once(real=store.set_join, when=lambda tl, reason, trigger=None: tl == "c1", error=OSError("disk full"))
         monkeypatch.setattr(store, "set_join", broken)
-        out = await h.user_says("Now email it to Bob.")  # c1 hands it back; the first write after the event fails
-        assert broken.fired and len(out) == 1 and "disk full" in out[0] and out[0].startswith("(harness error")
+        out = await h.user_says(REQUEST)  # c1 answers and merges; the first write after the event fails
+        assert broken.fired and out[0] == "Site built." and len(out) == 2
+        assert "disk full" in out[1] and out[1].startswith("(harness error")
         assert await h.until_rest("o") == "ended" and holder(store) == "o"
         assert status(store=store, tl="c1") == "queued"
-        assert await h.settle() == ["Routing that."]  # the retry lands the join; the request is answered
-        assert store.timeline("c1")["join_reason"] == "out_of_scope" and status(store=store, tl="c1") == "joined"
+        assert await h.settle() == []  # the retry lands the join; main's run after it says nothing
+        assert store.timeline("c1")["join_reason"] == "done" and status(store=store, tl="c1") == "joined"
         await h.close()
 
     asyncio.run(go())
@@ -1691,8 +1684,8 @@ def test_a_store_error_right_after_a_wake_begins_does_not_strand_the_source(tmp_
 
     async def go():
         c1, c2 = await _two_queued(store, h)
-        broken = _once(real=store.set_status, when=lambda tl, status: (tl, status) == ("o", "active") and bool(h.wakes),
-                       error=OSError("disk full"))
+        broken = _once(real=store.set_status, when=lambda tl, status: (tl, status) == ("o", "active")
+                       and len(join_records(store)) == 2, error=OSError("disk full"))  # the wake's state, once both landed
         monkeypatch.setattr(store, "set_status", broken)
         await drain(h)  # the wake runs although its state could not be copied to the store
         assert broken.fired and h.wake_errors == [] and h.out[-1] == "Reporting."
@@ -1782,7 +1775,7 @@ def test_a_model_call_that_never_returns_times_out_and_the_graft_joins_failed(tm
         if "fork" not in names:
             never.wait(10)  # a hung provider call
             return text("too late")
-        if last["type"] == "text" and last.get("harness"):
+        if woke(last):
             return text("That did not work.")
         if ran(last):
             return text("Started.")
@@ -1914,8 +1907,8 @@ class CancelScript:
                 if self.gate_after_cancel:
                     assert self.gates["cancel"].wait(GATE_TIMEOUT)
                 return text("Stopped.")
-            if is_wake(last):
-                return text("Report: " + last["text"])
+            if is_wake(last):  # a current branch's replies already reached the user: nothing to add
+                return [] if "already reached the user" in last["text"] else text("Report: " + last["text"])
             if last["text"] == STOP:
                 if self.gate_before_cancel:
                     assert self.gates["root"].wait(GATE_TIMEOUT)
@@ -1973,8 +1966,8 @@ def test_cancel_ids_validates_model_written_input():
 
 
 def test_cancelled_is_a_reason_only_the_harness_sets_and_cancel_a_tool_only_the_original_holds(tmp_path):
-    assert "cancelled" not in JOIN_TOOL["input_schema"]["properties"]["reason"]["enum"]
-    assert _reason("cancelled") == "failed"  # a graft that sends it is treated like any invalid reason
+    assert "enum" not in JOIN_TOOL["input_schema"]["properties"]["reason"]  # the model's merge takes no reason
+    assert _reason("cancelled") == "failed"  # a caller outside the loop that gives it is treated like any invalid reason
     assert [s.name for s in CATALOG if any(t["name"] == "stop" for t in s.tools)] == ["fork"]
     script = CancelScript(entries=TWO, ids=["c1"])
     store, h, _ = make(tmp_path=tmp_path, policy=script)
@@ -2018,7 +2011,7 @@ def test_the_original_cancels_a_graft_during_its_model_call_and_its_work_so_far_
         script.open("cancel")
         out = await turn
         assert out[0] == "Stopped." and len(out) == 2 and out[1].startswith("Report:")
-        assert "You stopped c1" in out[1]
+        assert "c1 was stopped before it finished" in out[1]
         assert "Still running: c2 (skills: slides)." in out[1]  # c1 is not running any more
         assert status(store=store, tl="c1") == "joined" and status(store=store, tl="c2") == "background"
         assert h.wakes == [{"source": "o", "joined": [("c1", "cancelled")]}]
@@ -2032,8 +2025,7 @@ def test_the_original_cancels_a_graft_during_its_model_call_and_its_work_so_far_
     asyncio.run(go())
     assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
     records = join_records(store)
-    assert "branch c1 merged, reason=stopped" in records[0]
-    assert "your branch c1 was stopped before it finished" in records[1] and "you had run there: no tools" in records[1]
+    assert records[0].startswith("c1 was stopped before it finished") and "you had run there: no tools" in records[0]
     assert not any("website finished" in r["content"] for r in store.view("o"))  # the late reply never landed
     assert store.con.execute("SELECT status FROM transactions WHERE kind='join' AND target='c1'").fetchone()[0] == "committed"
     assert said_errors(said) == []
@@ -2058,7 +2050,7 @@ def test_a_graft_cancelled_after_it_acted_joins_what_it_wrote_and_the_tools_it_r
         await h.user_says(REQUEST)
         await until(event=second_call, what="c1's second model call")  # it wrote the page and is working on
         out = await h.user_says(STOP)
-        assert out[0] == "Stopped." and "You stopped c1" in out[1]
+        assert out[0] == "Stopped." and "c1 was stopped before it finished" in out[1]
         assert h.world.site == {"home": "hi"}  # what it did outside the conversation is not undone
         script.open()
         assert await h.settle() == []
@@ -2068,9 +2060,9 @@ def test_a_graft_cancelled_after_it_acted_joins_what_it_wrote_and_the_tools_it_r
     view = store.view("o")
     assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
     assert [r["owner_timeline"] for r in view if r["content"] == "Writing the home page."] == ["c1"]  # by pointer
-    note = [r for r in join_records(store) if "your branch c1 was stopped before it finished" in r]
+    note = [r for r in join_records(store) if "c1 was stopped before it finished" in r]
     assert len(note) == 1 and "you had run there: site_write." in note[0] and "was undone" in note[0]
-    assert not any(r["kind"] in ("tool_use", "tool_result") and r["owner_timeline"] == "c1" for r in view)
+    assert not any(r["kind"] in ("tool_use", "tool_result") and r["owner_timeline"] == "c1" and r["tool_name"] != "merge" for r in view)
 
 
 def test_a_graft_cancelled_between_a_tool_call_and_its_result_is_left_valid(tmp_path):
@@ -2161,7 +2153,7 @@ def test_a_cancel_call_reports_each_bad_id_and_never_raises(tmp_path):
 
     async def go():
         await h.start()
-        assert await h.user_says(REQUEST) == ["Booked."]  # the focus graft is back; c2 and c3 are still out
+        assert await h.user_says(REQUEST) == ["Booked."]  # the focus graft answered and merged; c2 and c3 are still out
         assert holder(store) == "o" and "merge" in [k["name"] for k in store.skills_for("c1")]  # c1 was a focus graft
         before = states()
         for n, attempt in enumerate(bad):
@@ -2169,18 +2161,18 @@ def test_a_cancel_call_reports_each_bad_id_and_never_raises(tmp_path):
             result, is_error = script.results[-1]
             assert is_error and ("not stopped" in result or "must be a list" in result), (attempt, result)
             assert long_id not in result and len(result) < 400
-            assert states() == before and h.wakes == []
+            assert states() == before and len(h.wakes) == 1  # only the run after c1's merge
         by_attempt = dict(zip(map(repr, bad), (r for r, _ in script.results)))
         assert "no such branch" in by_attempt[repr({"ids": ["c9"]})]
         assert "o: not stopped: no such branch" in by_attempt[repr({"ids": ["o"]})]  # a timeline id the model never saw
-        assert "current branch" in by_attempt[repr({"ids": ["c1"]})]
+        assert "forked as the current branch" in by_attempt[repr({"ids": ["c1"]})]
         assert "is not a branch id" in by_attempt[repr({"ids": ["c2\nc3"]})]
         # one call with a good id and bad ones: the good one is cancelled, each bad one is reported
         out = await h.user_says(f"try {mixed}")
         result, is_error = script.results[-1]
         assert not is_error and result.splitlines()[0].startswith("stopped -> c2 (what you did in it")
         assert "ids[2]: not stopped" in result and "c9: not stopped: no such branch" in result
-        assert out[0] == "Stopped." and "You stopped c2" in out[1]
+        assert out[0] == "Stopped." and "c2 was stopped before it finished" in out[1]
         assert status(store=store, tl="c2") == "joined" and status(store=store, tl="c3") == "background"
         await h.user_says(f"try {again}")  # a second cancel of the same graft
         assert script.results[-1][1] and "already" in script.results[-1][0]
@@ -2209,8 +2201,8 @@ def test_a_focus_graft_whose_model_calls_cancel_is_refused(tmp_path):
     async def go():
         await h.start()
         assert await h.user_says(REQUEST) == ["I can only book things."]
-        assert holder(store) == "c1"  # the focus graft holds the conversation, and still cannot cancel
-        (name, content, is_error), = tool_results(store=store, tl="c1")
+        # the focus graft held the conversation for its turn, and still could not cancel
+        (name, content, is_error), = [x for x in tool_results(store=store, tl="c1") if x[0] != "merge"]
         assert name == "stop" and is_error and content.count("you stop branches only from main") == 2
         assert "o: not stopped: no such branch" in content  # ids resolve only through branch ids
         assert status(store=store, tl="c2") == "background"
@@ -2280,7 +2272,7 @@ def test_a_graft_stopped_right_after_a_response_with_a_tool_and_a_cancel_keeps_i
     assert results[1][0] == "stop" and results[1][2] and results[1][1].count("you stop branches only from main") == 1
     assert results[1][1].count("no such branch") == 2
     assert h.world.site == {"home": "hi"}
-    note = [r for r in join_records(store) if "your branch c1 was stopped before it finished" in r]
+    note = [r for r in join_records(store) if "c1 was stopped before it finished" in r]
     assert len(note) == 1 and "you had run there: site_write." in note[0]
     assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
 
@@ -2295,12 +2287,13 @@ def test_cancel_two_of_three_and_the_third_still_joins_done(tmp_path):
         await h.user_says(REQUEST)
         out = await h.user_says(STOP)
         assert script.results[0][0].startswith("stopped -> c1, c3 (what you did in them so far merges")
-        assert out[0] == "Stopped." and "You stopped c1, c3" in out[1] and "Still running: c2" in out[1]
+        assert out[0] == "Stopped." and "c3 was stopped before it finished" in out[1] and "Still running: c2" in out[1]
+        assert [x.split()[0] for x in join_records(store)] == ["c1", "c3"]
         assert [status(store=store, tl=c) for c in ("c1", "c2", "c3")] == ["joined", "background", "joined"]
         assert len(h.wakes) == 1 and sorted(h.wakes[0]["joined"]) == [("c1", "cancelled"), ("c3", "cancelled")]
         script.open()
         out = await h.settle()
-        assert len(out) == 1 and "c2 (done)" in out[0]
+        assert len(out) == 1 and out[0].startswith("Report: c2 merged.")
         assert [store.timeline(c)["join_reason"] for c in ("c1", "c2", "c3")] == ["cancelled", "done", "cancelled"]
         assert [status(store=store, tl=c) for c in ("c1", "c2", "c3")] == ["joined"] * 3  # nothing is left running
         assert len(holders(store)) == 1
@@ -2454,7 +2447,7 @@ def test_a_turn_cancelled_while_it_cancels_a_graft_keeps_every_real_tool_result(
 
     asyncio.run(go())
     assert violations(store=store, tl="o") == [] and said_errors(said) == []
-    assert any("your branch c1 was stopped before it finished" in r for r in join_records(store))
+    assert any("c1 was stopped before it finished" in r for r in join_records(store))
 
 
 @pytest.mark.parametrize("turn_cancelled", [False, True])
@@ -2751,7 +2744,7 @@ def test_the_cancel_record_pairs_each_tool_call_with_the_result_of_its_own_turn(
 
     asyncio.run(go())
     assert h.world.site == {"home": "hi"}
-    note = [r for r in join_records(store) if "your branch c1 was stopped before it finished" in r]
+    note = [r for r in join_records(store) if "c1 was stopped before it finished" in r]
     assert len(note) == 1 and "you had run there: site_write, site_read." in note[0]
 
 
@@ -2790,7 +2783,7 @@ class CloneOnCancelWake(CancelScript):
     def __call__(self, system, messages, tools):
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
-        if "fork" in names and is_wake(last) and "c1 (stopped)" in last["text"]:
+        if "fork" in names and is_wake(last) and last["text"].startswith("c1 was stopped before it finished"):
             return [clone_use(clone_entry(skills=["website"], focus=False), id="w1") | {"type": "tool_use"}]
         if "fork" in names and ran(last) and last["tool_use_id"] == "w1":
             return [clone_use(clone_entry(skills=["calendar"], focus=False), id="w2") | {"type": "tool_use"}]
@@ -2818,8 +2811,8 @@ def test_a_cancelled_join_wakes_a_full_run_that_clones_another_part(tmp_path):
     assert clones(store) == ["c1", "c2", "c3", "c4"]
     assert h.part_of("c3") == {"website"} and h.part_of("c4") == {"calendar"}
     assert h.wakes[0]["joined"] == [("c1", "cancelled")]
-    note = [r["content"] for r in store.view("o") if r["harness"] and "c1 (stopped) merged" in r["content"]]
-    assert "You stopped c1: tell the user it was stopped and what you had already done there." in note[0]
+    note = [r for r in join_records(store) if r.startswith("c1 was stopped before it finished")]
+    assert "Tell the user it was stopped and what you had already done there." in note[0]
     assert not [r for r in store.view("o") if r["kind"] == "tool_result" and "fork refused" in r["content"]]
 
 
@@ -2868,7 +2861,7 @@ def test_the_original_may_cancel_in_a_wake_and_the_cancel_gets_its_own_wake(tmp_
     class InWake(CancelScript):
         def __call__(self, system, messages, tools):
             last = messages[-1]["content"][-1]
-            if "fork" in {t["name"] for t in tools} and is_wake(last) and "c1 (done)" in last["text"]:
+            if "fork" in {t["name"] for t in tools} and is_wake(last) and last["text"].startswith("c1 merged."):
                 return [{"type": "text", "text": "The website is done."}, cancel_use(ids=["c2"], id="x9")]
             return super().__call__(system=system, messages=messages, tools=tools)
 
@@ -2880,7 +2873,7 @@ def test_the_original_may_cancel_in_a_wake_and_the_cancel_gets_its_own_wake(tmp_
         await h.start()
         out = await h.user_says(REQUEST) + await h.settle()
         assert out[:3] == ["Started.", "The website is done.", "Stopped."]
-        assert "You stopped c2" in out[3] and len(out) == 4
+        assert "c2 was stopped before it finished" in out[3] and len(out) == 4
         assert [w["joined"] for w in h.wakes] == [[("c1", "done")], [("c2", "cancelled")]]
         assert [status(store=store, tl=c) for c in ("c1", "c2")] == ["joined", "joined"]
         await h.close()
@@ -2923,7 +2916,7 @@ def test_the_cancel_record_lists_a_tool_that_acted_and_then_returned_an_error(tm
         await h.close()
 
     asyncio.run(go())
-    note = [r for r in join_records(store) if "your branch c1 was stopped before it finished" in r]
+    note = [r for r in join_records(store) if "c1 was stopped before it finished" in r]
     assert len(note) == 1 and "you had run there: site_write (returned an error)." in note[0]
     assert "may still have acted before it failed" in note[0]
 
@@ -2974,7 +2967,7 @@ def test_cancel_and_clone_in_one_response_replace_a_part(tmp_path):
         assert "c1" not in results["fork"][0]
         assert status(store=store, tl="c1") == "joined" and store.timeline("c1")["join_reason"] == "cancelled"
         assert status(store=store, tl="c5") == "background" and h.part_of("c5") == {"social"}
-        assert out[0] == "Started." and "You stopped c1" in out[1]
+        assert out[0] == "Started." and "c1 was stopped before it finished" in out[1]
         assert "Still running: c2" in out[1] and "c5 (skills: social)" in out[1] and "c1 (skills" not in out[1]
         script.open()
         await h.close()
@@ -3000,7 +2993,7 @@ def test_a_clone_beside_a_cancel_may_fork_the_stopped_part_again_and_the_cancel_
         assert not is_error and forked.startswith("forked -> c3")
         assert "c3" in clones(store)
         assert status(store=store, tl="c1") == "joined" and store.timeline("c1")["join_reason"] == "cancelled"
-        assert "You stopped c1" in out[-1]
+        assert "c1 was stopped before it finished" in out[-1]
         script.open()
         await h.settle()
         await h.close()
@@ -3064,7 +3057,7 @@ def test_a_cancel_beside_a_focus_clone_joins_before_the_focus_graft_does(tmp_pat
     def graft(skill, messages):
         if skill == "calendar":  # the focus graft: it books, replies and joins at once
             return [{"type": "text", "text": "Booked."},
-                    {"type": "tool_use", "id": "j1", "name": "merge", "input": {"reason": "done"}}]
+                    {"type": "tool_use", "id": "j1", "name": "merge", "input": {}}]
         return script.finish(skill=skill, messages=messages)
 
     script = Replace(entries=TWO, response=[cancel_use(ids=["c1"], id="x1"), new_clone(clone_entry(skills=["calendar"], focus=True))],
@@ -3073,11 +3066,11 @@ def test_a_cancel_beside_a_focus_clone_joins_before_the_focus_graft_does(tmp_pat
     seen = {}
     real = h.join_of
 
-    def watched(tl, reason):  # the moment the focus graft's join event is made (its machine asks)
+    def watched(tl, reason, focus=False):  # the moment the focus graft's join event is made (its machine asks)
         seen["source"] = status(store=store, tl="o")
         seen["queue"] = (status(store=store, tl="c1"), store.timeline("c1")["join_reason"])
         seen["records"] = list(join_records(store))
-        return real(tl=tl, reason=reason)
+        return real(tl=tl, reason=reason, focus=focus)
 
     h.join_of = watched
 
@@ -3087,12 +3080,12 @@ def test_a_cancel_beside_a_focus_clone_joins_before_the_focus_graft_does(tmp_pat
         out = await h.user_says(STOP)
         # when the focus graft joined, the cancelled graft's join was still waiting on its source, unapplied
         assert (seen["queue"], seen["records"]) == (("queued", "cancelled"), [])
-        assert out[0] == "Booked." and out[1].startswith("Report:") and "You stopped c1" in out[1]
-        assert h.wakes == [{"source": "o", "joined": [("c1", "cancelled")]}]
+        assert out == ["Booked."]  # the run after the merges ends on c3's result: its reply already reached the user
+        assert h.wakes == [{"source": "o", "joined": [("c1", "cancelled"), ("c3", "done")]}]
         assert [status(store=store, tl=c) for c in ("c1", "c2", "c3")] == ["joined", "background", "joined"]
         assert holder(store) == "o"
-        records = [r for r in join_records(store) if " merged, reason=" in r]
-        assert ["c1" in records[0], "c3" in records[1]] == [True, True]  # the cancelled graft first, the focus graft last
+        records = join_records(store)
+        assert [records[0].split()[0], records[1].split()[0]] == ["c1", "c3"]  # the cancelled graft first, the focus graft last
         script.open()
         await h.settle()
         await h.close()
@@ -3137,7 +3130,9 @@ def test_a_graft_whose_model_answers_as_its_cancel_is_accepted_runs_no_tool(tmp_
         before = [r["row_id"] for r in store.view("c1")]
         await h.user_says(STOP)
         assert h.world.log == [] and h.world.site == {}  # no tool ran after the cancel was accepted
-        assert [r["row_id"] for r in store.view("c1")] == before  # and the response was not stored
+        # and the response was not stored: only its close-out by the merge (the harness's merge call) follows
+        assert [r["row_id"] for r in store.view("c1")][:len(before)] == before
+        assert [r["tool_name"] for r in store.view("c1")[len(before):]] == ["merge", "merge"]
         script.open()
         await h.settle()
         await h.close()
@@ -3184,7 +3179,7 @@ def test_a_tool_whose_output_reads_like_a_harness_refusal_is_still_in_the_cancel
 
     asyncio.run(go())
     expected = "site_read" if mode == "tool_output" else "site_write (returned an error)"
-    note = [r for r in join_records(store) if "your branch c1 was stopped before it finished" in r]
+    note = [r for r in join_records(store) if "c1 was stopped before it finished" in r]
     assert len(note) == 1 and f"you had run there: {expected}." in note[0]
 
 
@@ -3216,7 +3211,7 @@ def test_a_failed_cancel_result_write_in_a_wake_run_is_reported_once_and_raised_
     class InWake(CancelScript):
         def __call__(self, system, messages, tools):
             last = messages[-1]["content"][-1]
-            if "fork" in {t["name"] for t in tools} and is_wake(last) and "c1 (done)" in last["text"]:
+            if "fork" in {t["name"] for t in tools} and is_wake(last) and last["text"].startswith("c1 merged."):
                 return [{"type": "text", "text": "The website is done."}, cancel_use(ids=["c2"], id="x9")]
             return super().__call__(system=system, messages=messages, tools=tools)
 
@@ -3510,7 +3505,7 @@ def test_a_join_whose_store_commit_landed_before_its_step_failed_is_not_written_
         await h.close()
 
     asyncio.run(go())
-    assert len([x for x in join_records(store) if "branch c1 merged" in x]) == 1
+    assert len([x for x in join_records(store) if x.startswith("c1 merged")]) == 1
 
 
 def test_a_failure_report_is_recorded_and_shown_whatever_clone_it_names(tmp_path):
@@ -3560,7 +3555,7 @@ def test_a_run_may_fork_again_after_a_committed_call(tmp_path):
         forks = sum(1 for m in messages for b in m["content"] if b["type"] == "tool_result")
         if ran(last) and forks >= 3:
             return text("Started three.")
-        if last["type"] == "text" and last.get("harness"):
+        if woke(last):
             return text("Reported.")
         skill = ["website", "slides", "calendar"][forks]
         return [clone_use(clone_entry(skills=[skill], focus=False), id=f"t{forks}") | {"type": "tool_use"}]
@@ -3710,15 +3705,14 @@ def test_a_cancelled_call_ends_the_run_that_answers_a_handed_back_message(tmp_pa
         if "fork" in names:
             if ran(last):
                 return text("ok.")
-            if any("merged, reason=out_of_scope" in b.get("text", "") for m in messages for b in m["content"]
-                   if b["type"] == "text"):  # the run that answers the handed-back message
+            if woke(last) and "merged without answering" in last["text"]:  # the run that answers the handed-back message
                 entered.set()
                 assert gate.wait(GATE_TIMEOUT)
                 return [clone_use(clone_entry(skills=["calendar"], focus=False), id="late")
                         | {"type": "tool_use"}]
             return [clone_use(clone_entry(skills=["website"], focus=True), id="t1")
                     | {"type": "tool_use"}]
-        return [{"type": "tool_use", "id": "j", "name": "merge", "input": {"reason": "out_of_scope"}}]
+        return [{"type": "tool_use", "id": "j", "name": "merge", "input": {}}]
 
     store, h, said = make(tmp_path=tmp_path, policy=policy)
 
@@ -3782,7 +3776,7 @@ def test_a_cancelled_call_ends_the_wake_run_that_follows_its_turn(tmp_path):
 # ------------------------------------------------------------------ a withdrawn request, wherever it is
 LIFECYCLE = ["waiting", "sending", "sending, a step later", "sending mid-step", "requesting", "requesting behind a run",
              "running",
-             "returning", "saying", "joining", "noting", "wake", "hand-back", "withdrawn before the hand-over",
+             "returning", "saying", "joining", "wake", "hand-back", "withdrawn before the hand-over",
              "handed over, then withdrawn", "forwarded to a focus graft", "focus graft starting",
              "background graft starting", "background graft running"]
 BACKGROUND_POINTS = ("background graft starting", "background graft running")
@@ -3807,6 +3801,8 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         request = user_texts(messages)[-1]
+        if "fork" in names and is_wake(last) and "already reached the user" in last["text"]:
+            return []  # after a current branch's merge: its replies already reached the user
         if request == "C":
             later.append(user_texts(messages))
             return text("c1 answers C")
@@ -3956,11 +3952,9 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
             cancel("B")
             gates["B"].set()
             await caller_gone("B")
-        elif point in ("joining", "noting", "wake"):  # a background join lands during the turn
+        elif point in ("joining", "wake"):  # a background join lands during the turn
             if point == "joining":
                 cancel_inside(method="apply_join", name="BG go")
-            elif point == "noting":
-                cancel_inside(method="wake_note", name="BG go")
             tasks["BG go"] = asyncio.create_task(h.user_says("BG go"))
             await until(event=entered["root"], what="the turn's reply")
             await h.join_queued("c1")
@@ -4031,12 +4025,13 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
             assert violations(store=store, tl=tl) == [], (point, tl)
     if point == "focus graft starting":
         assert [r for r in store.view("c1") if r["role"] == "assistant" and r["owner_timeline"] == "c1"
-                and r["content"] != "c1 answers C"] == []  # c1 never acted on it
+                and r["content"] != "c1 answers C" and r["tool_name"] != "merge"] == []  # c1 never acted on it
         for tl in ("o", "c1"):  # its row is marked in the conversation it was asked in
             assert [r["withdrawn"] for r in store.view(tl) if r["content"] == "FOCUS go"] == [1], tl
         assert later == [["C"]]  # the next turn reads it as withdrawn, not as a request
     if point in BACKGROUND_POINTS:  # the graft made for it stopped before acting, and woke nothing
-        assert [r for r in store.view("c1") if r["role"] == "assistant" and r["owner_timeline"] == "c1"] == [], point
+        assert [r for r in store.view("c1") if r["role"] == "assistant" and r["owner_timeline"] == "c1"
+                and r["tool_name"] != "merge"] == [], point  # only the harness's merge call
         assert store.timeline("c1")["join_reason"] == "cancelled" and h.wakes == [], point
     # a withdrawn request is marked in the view whose run never answered it; one its turn answered
     # before the cancel (the joins, wake note and wake that follow the turn) is not
@@ -4044,7 +4039,7 @@ def test_a_withdrawn_request_never_gets_a_model_call_or_an_action_wherever_it_is
     if point in ("requesting", "requesting behind a run", "running", "returning", "saying", "hand-back",
                  *BACKGROUND_POINTS):
         assert marks[{"hand-back": "FOCUS-OOS go"}.get(point, "BG go" if point in BACKGROUND_POINTS else "B")] == 1, point
-    if point in ("joining", "noting", "wake"):
+    if point in ("joining", "wake"):
         assert marks["BG go"] == 0, point
 
 
@@ -4237,15 +4232,13 @@ def test_a_compaction_that_comes_back_before_any_cancel_is_stored(tmp_path):
     assert h.compactions == ["o"] and violations(store=store, tl="o") == []
 
 
-WITHDRAWN_ROWS = ["its row is written", "its row is written behind a run", "its run is running", "it is handed back",
-                  "its wake is noted"]
+WITHDRAWN_ROWS = ["its row is written", "its row is written behind a run", "its run is running", "it is handed back"]
 
 
 @pytest.mark.parametrize("point", WITHDRAWN_ROWS)
 def test_a_withdrawn_request_whose_row_was_written_never_reaches_a_later_turn_as_a_request(tmp_path, point):
     """B's call is cancelled after its row was written: while it is written, while the run that
-    answers it runs, and when a focus graft hands it back (as its join is applied, and as the
-    wake note that would have it answered is written). The next message's model call sees B
+    answers it runs, and when a focus graft hands it back (as its join is applied). The next message's model call sees B
     only as a withdrawn message (marked, not the user's text), its view stays valid, and B is
     never the request a later turn or a hand-back answers."""
     gate, entered, task, seen = threading.Event(), threading.Event(), {}, {}
@@ -4254,7 +4247,7 @@ def test_a_withdrawn_request_whose_row_was_written_never_reaches_a_later_turn_as
         names = {t["name"] for t in tools}
         request = user_texts(messages)[-1]
         if "fork" not in names:  # the focus graft hands B back at once
-            return [{"type": "tool_use", "id": "j", "name": "merge", "input": {"reason": "out_of_scope"}}]
+            return [{"type": "tool_use", "id": "j", "name": "merge", "input": {}}]
         if request == "C":
             seen["C"] = messages
             return text("answer to C")
@@ -4262,7 +4255,7 @@ def test_a_withdrawn_request_whose_row_was_written_never_reaches_a_later_turn_as
             entered.set()
             assert gate.wait(GATE_TIMEOUT)
             return text("answer to A")
-        if point in ("it is handed back", "its wake is noted") and not messages[-1]["content"][-1].get("harness") \
+        if point == "it is handed back" and not woke(messages[-1]["content"][-1]) \
                 and messages[-1]["content"][-1]["type"] == "text":
             return [clone_use(clone_entry(skills=["website"], focus=True), id="t1") | {"type": "tool_use"}]
         if point == "its run is running":
@@ -4286,8 +4279,6 @@ def test_a_withdrawn_request_whose_row_was_written_never_reaches_a_later_turn_as
         cancel_inside("begin_request")
     elif point == "it is handed back":
         cancel_inside("apply_join")
-    elif point == "its wake is noted":
-        cancel_inside("wake_note")
 
     async def go():
         await h.start()
@@ -4318,44 +4309,41 @@ def test_a_withdrawn_request_whose_row_was_written_never_reaches_a_later_turn_as
 
 
 def test_a_focus_graft_never_hands_back_a_message_that_was_withdrawn(tmp_path):
-    """B reaches the focus graft and is withdrawn while the graft's run answers it. When the graft
-    later joins, B is not the message it hands back (its trigger): a withdrawn row is never a
-    request, though it is the last user row in the graft's view; and B, joined into the
-    original's view, is marked there as well."""
+    """The request a focus graft answers is withdrawn while its run answers it: the run is cut
+    short and the graft is left at rest. When it later joins, that message is not the one it hands
+    back (its trigger): a withdrawn row is never a request, though it is the last user row in the
+    graft's view; and it is marked in the original's view as well."""
     gate, entered, task = threading.Event(), threading.Event(), {}
 
     def policy(system, messages, tools):
         last = messages[-1]["content"][-1]
         if "fork" in {t["name"] for t in tools}:
-            if last["type"] == "text" and not last.get("harness") and last["text"] == "FOCUS go":
+            if last["type"] == "text" and not woke(last) and last["text"] == "FOCUS go":
                 return [clone_use(clone_entry(skills=["website"], focus=True), id="t1")
                         | {"type": "tool_use"}]
-            return text("original here")
-        if user_texts(messages)[-1] == "B":
-            entered.set()
-            assert gate.wait(GATE_TIMEOUT)
+            return [] if woke(last) else text("original here")
+        entered.set()
+        assert gate.wait(GATE_TIMEOUT)
         return text(f"c1 answers {user_texts(messages)[-1]}")
 
     store, h, said = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await h.start()
-        assert await h.user_says("FOCUS go") == ["c1 answers FOCUS go"]
-        task["B"] = asyncio.create_task(h.user_says("B"))
-        await until(event=entered, what="c1's model call for B")
-        task["B"].cancel()
+        task["go"] = asyncio.create_task(h.user_says("FOCUS go"))
+        await until(event=entered, what="c1's model call")
+        task["go"].cancel()
         gate.set()
         with pytest.raises(asyncio.CancelledError):
-            await task["B"]
-        assert await h.until_rest("c1") == "ended"
+            await task["go"]
+        assert await h.until_rest("c1") == "ended"  # cut short: it never answered, and rests
         await asyncio.wait_for(h.do_join(child="c1", reason="failed"), WAIT_TIMEOUT)
         await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
-    assert store.timeline("c1")["join_trigger"] is None  # B is not handed back
-    # B joined into the original's view with the graft's rows, marked there too: never a request
-    assert [r["withdrawn"] for r in store.view("o") if r["content"] == "B"] == [1]
+    assert store.timeline("c1")["join_trigger"] is None  # the withdrawn message is not handed back
+    assert [r["withdrawn"] for r in store.view("o") if r["content"] == "FOCUS go"] == [1]
     assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
 
 
@@ -4380,7 +4368,7 @@ def test_a_withdrawal_mark_binds_only_the_conversation_not_a_background_graft_se
             entered["root"].set()
             assert gates["root"].wait(GATE_TIMEOUT)
             return text("Started.")
-        if last.get("harness"):
+        if woke(last):
             seen["wake"] = messages
             return text("report")
         return [clone_use(clone_entry(skills=["website"], focus=False), id="t1")
@@ -4407,7 +4395,8 @@ def test_a_withdrawal_mark_binds_only_the_conversation_not_a_background_graft_se
     assert [r["withdrawn"] for r in store.view("c1") if r["content"] == "BG go"] == [0]
     assert [r["withdrawn"] for r in store.view("o") if r["content"] == "BG go"] == [1]
     assert store.timeline("c1")["join_reason"] == "cancelled" and "wake" not in seen
-    assert [r for r in store.view("c1") if r["role"] == "assistant" and r["owner_timeline"] == "c1"] == []  # its late response was not stored
+    assert [r for r in store.view("c1") if r["role"] == "assistant" and r["owner_timeline"] == "c1"
+            and r["tool_name"] != "merge"] == []  # its late response was not stored (only the harness's merge call)
     assert violations(store=store, tl="o") == [] and violations(store=store, tl="c1") == []
 
 
@@ -4476,7 +4465,7 @@ def _clones_on(entry_for, seen):
         if ran(last):
             seen["result"] = last["content"]
             return text("answered C")
-        if last["type"] == "text" and not last.get("harness") and last["text"] == "C":
+        if last["type"] == "text" and not woke(last) and last["text"] == "C":
             return [clone_use(entry_for(seen), id="t1") | {"type": "tool_use"}]
         return text("ok")
     return policy
@@ -4518,7 +4507,7 @@ def test_a_quote_of_a_message_withdrawn_and_sent_again_names_the_one_sent_again(
         if ran(last):
             seen["result"] = last["content"]
             return text("Started.")
-        if last["type"] == "text" and not last.get("harness") and last["text"] == WITHDRAWN:
+        if last["type"] == "text" and not woke(last) and last["text"] == WITHDRAWN:
             return [clone_use(clone_entry(skills=["website"], focus=False), id="t1")
                     | {"type": "tool_use"}]
         return text("ok")
@@ -4811,8 +4800,9 @@ def test_a_cancelled_call_followed_at_once_by_another_loses_nothing(tmp_path, wh
 
 
 def test_a_message_waiting_when_the_original_hands_over_is_answered_before_a_later_one(tmp_path):
-    """B arrives while the original's turn is cloning a focus graft; C after the hand-over. The
-    focus graft holds the conversation and answers B, then C: never C before B."""
+    """B arrives while the original's turn is cloning a focus graft; C after it. The focus graft's
+    turn answers the first message and merges; B comes back to the original with its join and is
+    answered (by a branch of its own) before C: never C before B."""
     gate, calls = threading.Event(), []
 
     def policy(system, messages, tools):
@@ -4820,6 +4810,8 @@ def test_a_message_waiting_when_the_original_hands_over_is_answered_before_a_lat
         if "fork" in {t["name"] for t in tools}:
             if ran(messages[-1]["content"][-1]):
                 return text("Handing over.")
+            if woke(messages[-1]["content"][-1]):
+                return []
             assert gate.wait(GATE_TIMEOUT)
             return [clone_use(clone_entry(skills=["website"], focus=True), id="t1") | {"type": "tool_use"}]
         calls.append(request)
@@ -4833,14 +4825,13 @@ def test_a_message_waiting_when_the_original_hands_over_is_answered_before_a_lat
         second = now(h.user_says("B"))  # waits on the original while it runs
         gate.set()
         await asyncio.wait_for(first, WAIT_TIMEOUT)
-        await asyncio.wait_for(second, WAIT_TIMEOUT)  # answered by the focus graft, not left waiting
+        await asyncio.wait_for(second, WAIT_TIMEOUT)  # answered, not left waiting
         await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
     assert calls == ["Build a website.", "B", "C"]
-    assert [r["content"] for r in store.view("c1") if r["role"] == "user" and r["kind"] == "text"] == [
-        "Build a website.", "B", "C"]
+    assert clones(store) == ["c1", "c2", "c3"]  # one current branch per turn
 
 
 def test_a_tool_that_ran_keeps_its_result_when_a_later_call_of_the_response_raises(tmp_path):
@@ -4855,7 +4846,7 @@ def test_a_tool_that_ran_keeps_its_result_when_a_later_call_of_the_response_rais
     def policy(system, messages, tools):
         if "fork" in {t["name"] for t in tools}:
             last = messages[-1]["content"][-1]
-            if ran(last) or last.get("harness"):  # its result, or the wake: no new fork
+            if ran(last) or woke(last):  # its result, or the wake: no new fork
                 return text("Started.")
             return [clone_use(clone_entry(skills=["website"], focus=False), id="t1") | {"type": "tool_use"}]
         if ran(messages[-1]["content"][-1]):
@@ -4894,7 +4885,7 @@ def test_a_tool_that_ran_keeps_its_real_result_when_its_row_cannot_be_written(tm
         if "fork" in {t["name"] for t in tools}:
             if who == "original":
                 return text("Sorry.") if ran(last) else [use]
-            if ran(last) or last.get("harness"):
+            if ran(last) or woke(last):
                 return text("Started.")
             return [clone_use(clone_entry(skills=["website"], focus=who == "focus"), id="t1") | {"type": "tool_use"}]
         return text("website finished") if ran(last) else [use]
@@ -4980,7 +4971,7 @@ def test_a_focus_clone_whose_result_row_cannot_be_written_has_it_written_before_
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if ran(last) or last.get("harness"):
+            if ran(last) or woke(last):
                 return text("Back at the original.")
             if last["text"] == REQUEST:
                 return [clone_use(clone_entry(skills=["website"], focus=True)) | {"type": "tool_use"}]
@@ -5054,7 +5045,7 @@ def test_until_rest_answers_only_what_is_true_and_close_stops_every_machine(tmp_
         names = {t["name"] for t in tools}
         last = messages[-1]["content"][-1]
         if "fork" in names:
-            if ran(last) or last.get("harness"):
+            if ran(last) or woke(last):
                 return text("ok.")
             return [clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=False))
                     | {"type": "tool_use"}]
@@ -5236,8 +5227,8 @@ STOP = "STOP"  # the original cancels c1
 
 class FaultScript:
     """The original answers each message, or clones one website graft for BG (background) and
-    FOCUS and STAY (focus); a graft replies "site done" to BG, FOCUS (it then joins) and STAY (it
-    stays, holding the conversation), and answers any other message. A model call is keyed by its message, with "graft:" in front for a
+    FOCUS and STAY (focus); a graft replies "site done" to BG, FOCUS (with a merge call) and STAY
+    (its turn's end merges it), and answers any other message. A model call is keyed by its message, with "graft:" in front for a
     graft's: `gate(key)` holds that call until `gates[key]` is set (`entered[key]` says it began);
     `arm_on` keys arm the Faults (`faults.armed`) when their call is made."""
 
@@ -5267,8 +5258,8 @@ class FaultScript:
         if "fork" in names:
             if ran(last):
                 return text("Started.")
-            if is_wake(last):
-                return text("Reported.")
+            if is_wake(last):  # after a current branch's merge its replies already reached the user
+                return [] if "already reached the user" in last["text"] else text("Reported.")
             if request in (BG, FOCUS, STAY, BAD) and last["type"] == "text" and last["text"] == request:
                 entry = clone_entry(skills=["website"], focus=request in (FOCUS, STAY),
                                     id="Not An Id" if request == BAD else None)
@@ -5671,7 +5662,7 @@ def test_a_cancel_after_the_answer_is_a_withdrawal_its_background_graft_stops_an
         if ran(last):
             assert entered.wait(GATE_TIMEOUT)  # c1's first model call is in flight
             return text("Started.")
-        if last.get("harness") or last.get("text") != "BG go":
+        if woke(last) or last.get("text") != "BG go":
             return text("report")
         return [clone_use(clone_entry(skills=["website"], focus=False), id="t1") | {"type": "tool_use"}]
 
@@ -5737,29 +5728,28 @@ def test_a_cancel_after_the_answer_of_a_plain_turn_marks_its_row_and_keeps_its_e
     assert violations(store=store, tl="o") == []
 
 
-def test_a_cancel_after_a_focus_graft_answered_marks_the_row_in_its_view_and_its_source_s(tmp_path, monkeypatch):
-    """The focus graft holding the conversation answers a message, and the call is cancelled in the
-    tick it is answered: the suspended original passes the withdrawal on, the graft that answered
-    marks the row in its view and its source's, and the conversation goes on there."""
+def test_a_cancel_after_a_focus_graft_answered_marks_the_row_in_the_source_s_view(tmp_path, monkeypatch):
+    """The focus graft answers a message and merges, and the call is cancelled in the tick it is
+    answered (at the original's rest after the merge): the cancel wins, the row is marked in the
+    view of the conversation it was asked in, and the conversation goes on there."""
     script = FaultScript()
     store, h, said = make(tmp_path=tmp_path, policy=script)
     tasks = {}
-    _cancelled_as_answered(monkeypatch=monkeypatch, holder_=tasks, tl="c1")
+    _cancelled_as_answered(monkeypatch=monkeypatch, holder_=tasks, tl="o")
 
     async def go():
         await h.start()
-        assert await asyncio.wait_for(h.user_says(STAY), WAIT_TIMEOUT) == ["site done"]
-        tasks["task"] = asyncio.create_task(h.user_says("B to the focus graft"))
+        tasks["task"] = asyncio.create_task(h.user_says(STAY))
         with pytest.raises(asyncio.CancelledError):
             await tasks["task"]
-        assert await asyncio.wait_for(h.settle(), WAIT_TIMEOUT) == ["answer to B to the focus graft"]
+        assert await asyncio.wait_for(h.settle(), WAIT_TIMEOUT) == ["site done"]  # said before the cancel
         assert await asyncio.wait_for(h.user_says("C"), WAIT_TIMEOUT) == ["answer to C"]
         await h.close()
 
     asyncio.run(go())
-    row = store.con.execute("SELECT row_id FROM turns WHERE content='B to the focus graft'").fetchone()[0]
+    row = store.con.execute("SELECT row_id FROM turns WHERE content=?", (STAY,)).fetchone()[0]
     marked = sorted(tuple(r) for r in store.con.execute("SELECT timeline_id FROM withdrawals WHERE row_id=?", (row,)))
-    assert marked == [("c1",), ("o",)]
+    assert ("o",) in marked
     for tl in ("o", "c1"):
         assert violations(store=store, tl=tl) == []
 

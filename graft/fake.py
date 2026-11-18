@@ -24,30 +24,32 @@ def _text(t: str) -> list[dict]:
     return [{"type": "text", "text": t}]
 
 
-# A wake note names the merged branches with their reasons ("... your branch c1 (failed) merged; ...");
-# a merge record does not ("... your branch c1 merged, reason=..."). Both carry the harness mark.
-_WAKE_NOTE = re.compile(r"\(harness note: your (detached )?branch(es)? [a-z0-9][a-z0-9-]* \(")
+# Main's result of a branch's merge call starts with the branch's id ("site merged. ...", "deck was
+# stopped before it finished. ..."); a wake run's view ends on one (there is no wake note).
+_MERGED = re.compile(r"[a-z0-9][a-z0-9-]* (merged\b|was stopped before it finished)")
 
 
 def woken(messages: list[dict]) -> str | None:
-    """The harness wake note, if the last user message ends with one (background clones joined)."""
+    """The merge result a wake run's view ends on, if it does (a branch merged)."""
     last = _last_block(messages)
-    if last["type"] == "text" and last.get("harness") and _WAKE_NOTE.match(last["text"]):
-        return last["text"]
+    if last["type"] == "tool_result" and isinstance(last.get("content"), str) and _MERGED.match(last["content"]):
+        return last["content"]
     return None
 
 
 def _wake_reply(messages: list[dict]) -> list[dict]:
-    """The original reports what its background clones did: the replies that joined since it
-    last spoke (each follows a join record in its view)."""
+    """main after a merge: a current branch's replies already reached the user, so it ends its turn
+    without saying anything; otherwise it reports what the branches wrote (the text of the merged
+    assistant messages since its last user turn)."""
+    results = [b for b in messages[-1]["content"] if b["type"] == "tool_result"]
+    if all("already reached the user" in str(b["content"]) for b in results):
+        return []
     replies: list[str] = []
-    for prev, m in zip(messages, messages[1:]):
-        notes = [b["text"] for b in prev["content"] if b["type"] == "text" and b.get("harness")] \
-            if prev["role"] == "user" else []
-        if any(_WAKE_NOTE.match(n) for n in notes):
-            replies = []  # an earlier wake: already reported
-        if m["role"] == "assistant" and any(n.startswith("(harness note: your branch ") for n in notes):
-            replies += [b["text"] for b in m["content"] if b["type"] == "text"]
+    for m in reversed(messages[:-1]):
+        if m["role"] == "user" and not all(b["type"] == "tool_result" for b in m["content"]):
+            break
+        if m["role"] == "assistant":
+            replies = [b["text"] for b in m["content"] if b["type"] == "text"] + replies
     return _text("Background work finished. " + " ".join(replies)[:300])
 
 
@@ -89,10 +91,10 @@ def pivot_policy(system: str, messages: list[dict], tools: list[dict]) -> list[d
     names = {t["name"] for t in tools}
     last = _last_block(messages)
     if "fork" in names:  # the original: route with one fork call
-        if last["type"] == "tool_result":
-            return _text("(waiting)")
         if woken(messages):
             return _wake_reply(messages)
+        if last["type"] == "tool_result":
+            return _text("(waiting)")
         user = [re.sub(r"^\[conversation [^\]]*\]\s*", "", t) for t in texts_of(messages)]
         wants_slides = any("slide" in t.lower() for t in user)
         return _use(tool="fork", current=_entry(messages, ["slides" if wants_slides else "website"]))
@@ -110,14 +112,14 @@ def pivot_policy(system: str, messages: list[dict], tools: list[dict]) -> list[d
         return _text("Done. Anything else?")
     msg = texts[-1] if texts else ""
     if "site_write" in names:
-        # out of scope only for a message that arrived after it started (it has acted already);
+        # it merges with a reason (handing the request back) only for a slide request after it acted;
         # a seed that also mentions slides is another instance's part
         acted = any(b["type"] == "tool_use" and b["name"] != "load_skill"
                     for m in messages if m["role"] == "assistant" for b in m["content"])
         answered = any(m["role"] == "assistant" and any(b["type"] == "text" for b in m["content"])
                        for m in messages)
         if "slide" in msg.lower() and (acted or answered):
-            return _use(tool="merge", reason="out_of_scope")
+            return _use(tool="merge", reason="This needs a skill I do not hold here.")
         if "services" in msg.lower():
             return _use("site_write", page="home", content="\n".join(_user_texts(messages)))
         return _text("Noted. What else should the site include?")
@@ -203,7 +205,7 @@ def _holder_policy(names: set[str], messages: list[dict]) -> list[dict]:
     msg = _clean(_user_texts(messages)[-1]) if _user_texts(messages) else ""
     wants = _wants(msg)
     if "merge" in names and wants and not set(wants) & set(caps):
-        return _use(tool="merge", reason="out_of_scope")
+        return _use(tool="merge", reason="This needs a skill I do not hold here.")
     return _act(names, messages)
 
 
@@ -240,10 +242,10 @@ def bench_graft_policy(system: str, messages: list[dict], tools: list[dict]) -> 
     if names == {"compact"}:
         return _fake_compact(messages)
     if "fork" in names:  # the original
-        if _last_block(messages)["type"] == "tool_result":
-            return _text("(waiting)")
         if woken(messages):
             return _wake_reply(messages)
+        if _last_block(messages)["type"] == "tool_result":
+            return _text("(waiting)")
         texts = [_clean(t) for t in _user_texts(messages)]
         texts = [t for t in texts if not t.startswith("(compaction")]
         wants = _wants(texts[-1] if texts else "") or _wants(" ".join(texts)) or ["website"]
@@ -259,10 +261,10 @@ def parallel_graft_policy(system: str, messages: list[dict], tools: list[dict]) 
     if "fork" not in names:
         return _holder_policy(names, messages)
     last = _last_block(messages)
-    if last["type"] == "tool_result":
-        return _text("I have started on that and will report back when it is done.")
     if woken(messages):
         return _wake_reply(messages)
+    if last["type"] == "tool_result":
+        return _text("I have started on that and will report back when it is done.")
     texts = [_clean(t) for t in _user_texts(messages)]
     wants = _wants(texts[-1] if texts else "") or ["website"]
     if len(wants) == 1:

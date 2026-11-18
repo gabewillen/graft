@@ -46,9 +46,15 @@ def test_pointer_dedup_and_stored_once(store):
     assert store.con.execute("SELECT count(*) FROM turns").fetchone()[0] == 1
     # a join that re-selects a row the source already holds does not duplicate it
     tx = store.begin_tx("o", "join", target="c1")
-    store.commit_join("o", "[join c1]", [rid], error=None, trigger=None, tx=tx, status="committed",
-                      committed_sql=None, scratch=None)
+    store.commit_join("o", "c1", [rid], merge=None, implicit={"use": {"id": "m", "input": {}}, "result": {
+        "tool_use_id": "m", "content": "merged", "is_error": False}}, result={"tool_use_id": "m", "content": "c1 merged.",
+        "is_error": False}, note=None, trigger=None, tx=tx, status="committed", committed_sql=None, scratch=None)
     assert [r["row_id"] for r in store.view("o")].count(rid) == 1
+    # the implicit merge call is written at the end of the branch's timeline and pointed at by the source
+    use = store.view("c1")[-2]
+    assert (use["kind"], use["tool_name"], use["harness"]) == ("tool_use", "merge", 1)
+    assert [r["row_id"] for r in store.view("o")][-2] == use["row_id"]
+    assert store.view("o")[-1]["owner_timeline"] == "o" and store.view("o")[-1]["kind"] == "tool_result"
 
 
 def test_render_merges_consecutive_roles():

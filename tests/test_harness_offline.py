@@ -15,7 +15,7 @@ from graft.skills import install
 
 def clone_use(skills, focus=True, id="t"):
     """A fork call (graft's clone call) with one entry."""
-    entry = {"skills": skills}
+    entry = {"skills": skills, "messages": []}
     return {"id": id, "name": "fork", "input": {"current": entry} if focus else {"detached": [entry]}}
 
 
@@ -27,6 +27,10 @@ def harness(tmp_path):
 
 
 def test_pivot_flow_offline(harness):
+    """Each message reaches the original, which forks a current website branch for it; each
+    branch's turn ends in its merge, and the original runs once after it (a current branch's reply
+    already reached the user, so it says nothing). On the pivot it forks a slides branch pointed at
+    the user's messages: the same rows, by pointer, never copied."""
     h = harness
 
     async def go():
@@ -34,32 +38,30 @@ def test_pivot_flow_offline(harness):
         await run_script(h, [
             "I need a website.", "It is for dentists in Ohio.", "Formal tone please.",
             "Our services: cleaning, implants, whitening.", "Instead let's build a slide show."], echo=False)
-        assert len(holders(h.store)) == 1
+        assert holders(h.store) == ["o"]
         return h
 
     asyncio.run(go())
     s = h.store
-    assert s.timeline("c1")["join_reason"] == "out_of_scope"
-    assert s.timeline("c1")["status"] == "joined"
-    tx = s.con.execute("SELECT status FROM transactions WHERE kind='join' AND target='c1'").fetchone()
-    assert tx["status"] == "committed"
+    branches = clones(s)
+    assert branches == ["c1", "c2", "c3", "c4", "c5"]
+    assert [s.timeline(c)["join_reason"] for c in branches] == ["done"] * 5
+    assert all(s.timeline(c)["status"] == "joined" for c in branches)
+    assert [r[0] for r in s.con.execute("SELECT status FROM transactions WHERE kind='join'")] == ["committed"] * 5
     ohio = s.con.execute("SELECT row_id FROM turns WHERE content='It is for dentists in Ohio.'").fetchone()[0]
-    assert s.turn(ohio)["owner_timeline"] == "c1"
-    assert ohio in s.pointed("o") and ohio in s.pointed("c2")  # same row, pointed, never copied
+    assert s.turn(ohio)["owner_timeline"] == "o"  # every message reaches the original
+    assert ohio in s.pointed("c5")  # the slides branch points at it: same row, never copied
     assert s.con.execute("SELECT count(*) FROM turns WHERE content='It is for dentists in Ohio.'").fetchone()[0] == 1
     # the default join is deterministic: no model call ran for it
-    assert set(t for t, u in h.provider.by_tag.items() if u["calls"]) <= {"original", "original:clone_tx",
-                                                                           "clone:c1", "clone:c2"}
-    tx = s.con.execute("SELECT committed_sql FROM transactions WHERE kind='join' AND target='c1'").fetchone()
-    assert tx[0].startswith("DEFAULT JOIN c1 reason=out_of_scope")
-    # one clone call per clone: every original call either routed (clone_tx) or answered
-    assert h.provider.by_tag["original:clone_tx"]["calls"] == 2
+    assert set(t for t, u in h.provider.by_tag.items() if u["calls"]) <= {
+        "original", "original:clone_tx", *(f"clone:{c}" for c in branches)}
+    tx = s.con.execute("SELECT committed_sql FROM transactions WHERE kind='join' AND target='c5'").fetchone()
+    assert tx[0].startswith("DEFAULT JOIN c5 reason=done")
+    assert h.provider.by_tag["original:clone_tx"]["calls"] == 5  # one fork call per message
     assert "ohio" in h.world.deck_text().lower()
-    assert holders(s) == ["c2"]
-    # the clone only had its linked tools
-    c2_tools = {c["tools"][i]["name"] for c in h.provider.calls if "slides_create" in str(c["tools"])
+    c5_tools = {c["tools"][i]["name"] for c in h.provider.calls if "slides_create" in str(c["tools"])
                 for i in range(len(c["tools"]))}
-    assert "site_write" not in c2_tools and "fork" not in c2_tools
+    assert "site_write" not in c5_tools and "fork" not in c5_tools
 
 
 def test_one_shot_clone_refused_with_violations_then_retry(harness):
@@ -75,7 +77,7 @@ def test_one_shot_clone_refused_with_violations_then_retry(harness):
         assert child is None
         assert "cannot be held by a branch" in text and "unknown field 'purpose'" in text
         assert text.endswith("Fix the branches and call fork once more.")
-        (child,), text = await clone_in_turn(h=h, use=dict(use, input={"current": {"skills": ["website"]}}))
+        (child,), text = await clone_in_turn(h=h, use=dict(use, input={"current": {"skills": ["website"], "messages": []}}))
         assert child == "c1" and status(store=s, tl="c1") == "active" and status(store=s, tl="o") == "cloned"
         assert [r["content"] for r in s.view("c1")] == ["hello"]
         await h.machines.stop()
@@ -104,35 +106,40 @@ def test_default_join_is_deterministic_text_rows_only(harness):
         a2 = s.add_turn(child, "assistant", "text", "Built it.")
         calls_before = len(h.provider.calls)
         await h.do_join(child, "done")
-        assert len(h.provider.calls) == calls_before  # no model call
-        joined = [r["row_id"] for r in s.view("o")][-3:]
-        assert joined == [a1, u1, a2]  # text rows only, seed row skipped (already held)
+        # no model call for the join: the one call after it is the original's run after the merge
+        assert [("fork" in str(c["tools"])) for c in h.provider.calls[calls_before:]] == [True]
+        mine = [r for r in s.view("o") if r["owner_timeline"] == child]
+        assert [r["row_id"] for r in mine][:3] == [a1, u1, a2]  # text rows, seed row skipped (already held)
+        # then the harness's merge call (its turn ended without one) and the original's merge result
+        assert [(r["kind"], r["tool_name"], r["harness"]) for r in mine[3:]] == [("tool_use", "merge", 1)]
+        result = s.view("o")[[r["row_id"] for r in s.view("o")].index(mine[3]["row_id"]) + 1]
+        assert result["owner_timeline"] == "o" and result["tool_name"] == "merge" and result["harness"] == 1
         assert status(store=s, tl="o") == "active" and status(store=s, tl=child) == "joined"
         assert not [r for r in s.view("o") if r["kind"] in ("tool_use", "tool_result")
-                    and r["owner_timeline"] == child]
+                    and r["owner_timeline"] == child and r["tool_name"] != "merge"]
         await h.machines.stop()
 
     asyncio.run(go())
 
 
-def test_default_join_out_of_scope_and_failed(harness):
+def test_default_join_failed_puts_the_merge_call_and_its_result_before_the_trigger(harness):
     h = harness
 
     async def go():
         await h.start()
         s = h.store
-        seed = s.add_turn("o", "user", "text", "Make a site.")
+        s.add_turn("o", "user", "text", "Make a site.")
         (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"]))
-        s.add_turn(child, "assistant", "text", "Sure.")
+        sure = s.add_turn(child, "assistant", "text", "Sure.")
         trig = s.add_turn(child, "user", "text", "Actually, slides.")
-        rows, err = h.default_join_rows("o", child, "out_of_scope", trig)
-        assert rows[-1] == trig and err is None
-        rows, err = h.default_join_rows("o", child, "failed", trig)
-        assert rows[-1] == trig and "failed" in err
+        assert h.default_join_rows("o", child, trig) == [sure]  # the trigger goes last, on its own
         s.set_join(child, "failed", trigger=trig)
         assert h.default_join(src="o", child=child, reason="failed", trigger=trig, running=[])
-        tail = s.view("o")[-3:]
-        assert "failed" in tail[1]["content"] and tail[2]["row_id"] == trig  # error record, then trigger last
+        tail = s.view("o")[-4:]
+        assert tail[0]["row_id"] == sure and tail[3]["row_id"] == trig  # trigger last
+        assert (tail[1]["tool_name"], tail[1]["owner_timeline"]) == ("merge", child)  # its merge call
+        result = __import__("json").loads(tail[2]["content"])
+        assert result["content"].startswith(f"{child} merged after it failed")  # the original's merge result
         await h.machines.stop()
 
     asyncio.run(go())
@@ -155,35 +162,8 @@ def test_working_view_after_compaction_bounds_the_default_join(harness):
         done = s.add_turn(child, "assistant", "text", "Done.")
         assert [r["row_id"] for r in s.working_view(child)] == [seed, comp, old_u, fresh, done]
         assert len(s.view(child)) == 7  # the full timeline is unchanged
-        rows, _ = h.default_join_rows("o", child, "done", None)
+        rows = h.default_join_rows("o", child, None)
         assert rows == [comp, old_u, fresh, done] and old_b not in rows and old_a not in rows
-        await h.machines.stop()
-
-    asyncio.run(go())
-
-
-def test_silent_done_is_refused_until_the_clone_replies(tmp_path):
-    store = Store(str(tmp_path / "d.db"))
-    install(store)
-    script = iter([
-        [{"type": "tool_use", "id": "j1", "name": "merge", "input": {"reason": "done"}}],
-        [{"type": "text", "text": "I built the deck."},
-         {"type": "tool_use", "id": "j2", "name": "merge", "input": {"reason": "done"}}],
-    ])
-    h = Harness(store, FakeProvider(lambda *a: next(script)))
-
-    async def go():
-        await h.start()
-        seed = store.add_turn("o", "user", "text", "Make a deck.")
-        (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["slides"]))
-        store.add_turn(tl="o", role="assistant", kind="tool_use", content={"id": "t", "input": {}}, tool_name="fork")
-        store.add_turn(tl="o", role="user", kind="tool_result", content={"tool_use_id": "t", "content": "branched"}, tool_name="fork")
-        await h.run(child)
-        assert h.silent_done_refusals == [child]
-        refusal = [r for r in store.view(child) if r["kind"] == "tool_result"][0]
-        assert "refused" in refusal["content"] and '"is_error": true' in refusal["content"]
-        assert status(store=store, tl=child) == "joined" and store.timeline(child)["join_reason"] == "done"
-        assert store.view("o")[-1]["content"] == "I built the deck."  # the reply was joined
         await h.machines.stop()
 
     asyncio.run(go())
@@ -277,7 +257,10 @@ def test_oversized_join_falls_back_to_last_reply_and_survives_refused_compaction
         trig = s.add_turn(child, "user", "text", "Now make slides instead.")
         await h.do_join(child, "out_of_scope")
         view = [r["row_id"] for r in s.working_view("o")]
-        assert view[-3:-1] == [last, trig]  # tier 1: the clone's last reply, then the trigger
+        # tier 1: the clone's last reply, its merge call and the original's merge result, then the trigger
+        assert view[-5] == last and view[-2] == trig
+        assert [s.turn(r)["tool_name"] for r in view[-4:-2]] == ["merge", "merge"]
+        assert "Only your last reply there is above" in s.turn(view[-3])["content"]
         assert s.turn(view[-1])["content"] == "ok"  # the source then answered
         assert not set(big) & set(view)  # oversized rows stay only in the clone's frozen timeline
         assert all(r in [x["row_id"] for x in s.view(child)] for r in big)
@@ -302,8 +285,9 @@ def test_join_without_window_is_not_size_checked(harness):
         seed = s.add_turn("o", "user", "text", "Write.")
         (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"]))
         a = s.add_turn(child, "assistant", "text", "y" * 50000)
-        rows, record = h.fit_join(src="o", child=child, reason="done", rows=[a], error=None, trigger=None, running=[])
-        assert rows == [a] and "follow" in record and h.join_fallbacks == []
+        merge, implicit = h.merge_call(child=child, closing=False)
+        rows, result = h.fit_join(src="o", child=child, reason="done", rows=[a], merge=merge, trigger=None, running=[])
+        assert implicit and rows == [a] and "did not fit" not in result and h.join_fallbacks == []
         await h.machines.stop()
 
     asyncio.run(go())

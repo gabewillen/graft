@@ -93,7 +93,7 @@ ACTIVITY_HELPERS = {"_mark_pending", "_close_out"} | _work_functions()
 # The host calls the machines make (every one from an activity, or the scribe's).
 HOST = ("run_busy", "run_background", "mirror", "report", "graft_failed", "begin_request", "mark_withdrawn",
         "prepare_clone", "roll_back_clone", "commit_clone", "refuse_clone", "store_result", "close_tool_uses",
-        "record_join", "apply_join", "wake_note", "cancel_text", "join_of", "abandon_clone", "recover",
+        "record_join", "apply_join", "cancel_text", "join_of", "abandon_clone", "recover",
         "call_tool")
 # A graft that makes a host tool call (site_write) and then replies: in the background (TOOL), or
 # holding the conversation (TOOL_FOCUS: it then joins done).

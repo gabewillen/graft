@@ -51,8 +51,7 @@ Three rules hold everywhere in this module.
   the step sends anyway), forwarded to a focus graft (also one made in `cloning`, once its machine is started), and a
   run whose request is withdrawn ends (`_run_withdrawn`, the one rule). Every point that would
   start a run or let a graft act is guarded on its request being live (not withdrawn, reply not
-  done): `requesting` -> busy, the next inbox message, the wake and hand-back runs,
-  `noting` -> busy, the clone gate, a focus graft's start (one whose request was withdrawn before
+  done): `requesting` -> busy, the next inbox message, the wake and hand-back runs, the clone gate, a focus graft's start (one whose request was withdrawn before
   it could act marks its row in `withdrawing` and rests), and a background graft's start and
   each of its steps (a background graft made for a request withdrawn never runs, or is stopped by
   the original once it stands at rest after recording the withdrawal, before or after the answer
@@ -103,14 +102,15 @@ marks that request's row, and then at rest):
                         that comes meanwhile waits for the step
               cancels: checking / waiting / writing / reporting   cancel calls, id by id; then
                         their result rows, and each row that could not be written told
-        ran           (choice) how the run ended (a RunOutcome): a focus graft that joined or spent
-                      its step budget hands back (`handing_back`, activity: its join event)
+        ran           (choice) how the run ended (a RunOutcome): a focus graft's turn, however it
+                      ended, ends in its join (`handing_back`, activity: its join event)
         unpreparing   the run was left while a clone call was prepared: the call is rolled back
                       (activity; then `unwound`, a choice: a driven turn rests, others close calls)
         recovering    a step failed: its open audit rolled back, the run's open calls closed, rows to
                       mark marked (activity); its callers get the error, the session its record;
                       then `resumed` (choice): a focus graft holds the conversation -> the hand-over
-                      finishes (`passing`), else `rest`
+                      finishes (`passing`); a focus graft itself -> `handing_back` (it joins
+                      failed: its turn ended in the fault); else `rest`
         closing_out   closing with a close-out a recovery could not write: it is written first
                       (activity), then the timeline closes
         closing_calls the run ended early: its open tool calls get results (activity); then
@@ -118,8 +118,8 @@ marks that request's row, and then at rest):
         withdrawing   the row of the withdrawn request it answers gets the withdrawal mark in its
                       view and, for a focus graft, its source's (activity); also entered at a focus
                       graft's start when that request was withdrawn before it could act, and after
-                      the joins (`after`) and the wake note (`noting`) when a focus graft handed back
-                      its request unanswered and it was withdrawn
+                      the joins (`after`) when a focus graft handed back its request unanswered and
+                      it was withdrawn
         failing       (a focus graft) its run raised: it joins `failed` (activity; `unrecorded`,
                       a choice, if that failed)
         joining       applying the joins on its queue, one per step
@@ -127,8 +127,6 @@ marks that request's row, and then at rest):
           applying      one join (activity); a failure is kept for the next commit point, or,
                         on its last attempt, `giving_up` -> `abandoning` (choices) tell the user
                         and abandon it
-        noting        writing a wake note (activity); then busy, or `withdrawing` if the request the
-                      wake would answer was withdrawn (`unnoted`, a choice, if it failed)
         rest, after   choices: what follows a run, and what follows the joins
       receiving, shutting   choices: a graft's join that wakes it; closing the original
       passing         (choice) a hand-over: the waiting messages go to the focus graft first
@@ -339,7 +337,7 @@ class Host(Protocol):
     """What the machines need from the harness: I/O only, always called from an activity (or the
     scribe's), always by keyword. Whatever the host needs to know about a timeline (its kind, the
     grafts still running) comes in the call: the host never reads a machine."""
-    def run_busy(self, tl: str, kind: str) -> Any: ...
+    def run_busy(self, tl: str, kind: str, woken: list[tuple[str, str]] | None = None) -> Any: ...
     def run_background(self, tl: str) -> Any: ...
     def mirror(self, tl: str, status: str) -> None: ...
     def report(self, kind: str, src: str | None, clones: list[str], error: BaseException, quiet: bool,
@@ -358,10 +356,8 @@ class Host(Protocol):
     def close_tool_uses(self, tl: str, known: dict[str, tuple[str, bool]]) -> None: ...
     def record_join(self, child: str, reason: str) -> None: ...
     def apply_join(self, src: str, join: QueuedJoin, running: list[str]) -> tuple[bool, bool]: ...
-    def wake_note(self, src: str, joined: list[tuple[str, str]], handed_back: bool, running: list[str],
-                  background: bool) -> None: ...
     def cancel_text(self, call: CancelCall, outcomes: dict[str, str]) -> tuple[str, bool]: ...
-    def join_of(self, tl: str, reason: str) -> QueuedJoin: ...
+    def join_of(self, tl: str, reason: str, focus: bool = False) -> QueuedJoin: ...
     def abandon_clone(self, src: str, grafts: list[str]) -> None: ...
     def recover(self, tl: str, known: dict[str, tuple[str, bool]], close_calls: bool, viewers: list[str],
                 rows: list[int], cancels: list[tuple[CancelCall, dict[str, str]]]) -> None: ...
@@ -463,7 +459,7 @@ class TimelineSM(hsm.Instance):
         self.unreported: list[tuple[str, list[str], BaseException, str | None]] = []
         self.held_grafts: set[str] = set()  # the original: background grafts made in a driven turn
         # Rows of withdrawn requests still to be marked (a mark write that failed is retried by
-        # recovery, and before the next row or wake note is written).
+        # recovery, and before the next row is written).
         self.unmarked: list[int] = []
         self.handed_back: tuple | None = None  # a focus graft: its join event, until it is sent
         self.hand_back_sent = False  # a focus graft: its join event reached its source
@@ -1002,7 +998,7 @@ def cancel_refusal(inst: TimelineSM, child: str) -> str:
     if child not in inst.made:
         return "no such branch"
     if inst.made[child]:
-        return "it is the current branch; only a detached branch can be stopped"
+        return "it was forked as the current branch; only a detached branch can be stopped"
     return "it has already finished or was already stopped; nothing to stop"
 
 
@@ -1178,12 +1174,6 @@ def withdrawn_after(ctx, inst, event) -> bool:
     return not inst.final and _marks_after(inst)
 
 
-def noted_withdrawn(ctx, inst, event) -> bool:
-    """The wake note is written, but the request the wake would answer was withdrawn meanwhile;
-    a wake for a request a focus graft handed back leaves it unanswered."""
-    return _marks_after(inst)
-
-
 def handed_live(ctx, inst, event) -> bool:
     inbox, withdrawn = event.data
     return any(r.id not in withdrawn and _live(inst=inst, request=r) for r in inbox)
@@ -1350,8 +1340,14 @@ def has_joined(ctx, inst, event) -> bool:
 
 
 def joins_back(ctx, inst, event) -> bool:
-    """A focus graft's run that ended by joining, or with its step budget spent (it joins failed)."""
-    return inst.kind == "focus" and event.data.kind in ("join", "exhausted")
+    """A focus graft's run, however it ended (a merge call, a reply, an empty response, a spent
+    step budget): its turn ends in its join (spec: Join, step 1)."""
+    return inst.kind == "focus"
+
+
+def rejoins(ctx, inst, event) -> bool:
+    """A focus graft that recovered from a fault: its turn ended in it, so it joins `failed`."""
+    return inst.kind == "focus" and inst.focus is None
 
 
 def run_joined(ctx, inst, event) -> bool:
@@ -1493,8 +1489,8 @@ def answers_handback(ctx, inst, event) -> bool:
 
 
 def wakes_to_run(ctx, inst, event) -> bool:
-    """The rest of the wakes: a full run, after a wake note (coming to rest is the unguarded
-    default)."""
+    """The rest of the wakes: a full run, on a view that ends on the merge results (coming to rest
+    is the unguarded default)."""
     return _wakes(inst) and not inst.ends_on_request
 
 
@@ -1523,7 +1519,8 @@ async def busy_activity(ctx, inst: TimelineSM, event) -> None:
     try:
         _close_out(inst)
         _mark_pending(inst)
-        outcome = await inst.host.run_busy(tl=inst.timeline_id, kind=inst.kind)
+        woken = list(inst.news) if inst.mode.name == "wake" else None
+        outcome = await inst.host.run_busy(tl=inst.timeline_id, kind=inst.kind, woken=woken)
     except BaseException as error:  # noqa: BLE001 - the outcome event carries it, Exception or not
         error = _failure(ctx, error)
         if not ctx.is_done():
@@ -1671,7 +1668,7 @@ def _mark_pending(inst: TimelineSM) -> None:
 def _close_out(inst: TimelineSM) -> None:
     """A close-out a recovery could not write (the run's open calls, the clone call's rollback, the
     rows to mark) is written first by every activity that next writes to or reads the view at
-    rest: a message's row, a run's start, a join's copy, a wake note, a mark, a recovery. So no
+    rest: a message's row, a run's start, a join's copy, a mark, a recovery. So no
     row lands after a tool call left without its result. Writing it again changes nothing."""
     for args in inst.close_out:
         inst.host.recover(**args)
@@ -1754,9 +1751,13 @@ def _reject(inst, event):
 
 
 def _join_back(inst, event):
-    """A focus graft's run ended by joining (or with its step budget spent: it joins failed): its
-    join event, with the user message it leaves unanswered."""
-    return inst.host.join_of(tl=inst.timeline_id, reason=event.data.reason or "failed")
+    """A focus graft's turn ended: its join event, with the user message it leaves unanswered. A
+    merge call, a reply or an empty response joins `done` (`out_of_scope` without a reply to the
+    user: the harness words it from the view); a spent step budget, or a turn a fault ended (the
+    recovery's event), joins `failed`."""
+    outcome = event.data if isinstance(event.data, RunOutcome) else None
+    reason = "done" if outcome is not None and outcome.kind in ("join", "replied", "empty") else "failed"
+    return inst.host.join_of(tl=inst.timeline_id, reason=reason, focus=True)
 
 
 def _cancel_rows(inst, event):
@@ -1795,13 +1796,6 @@ def _apply(inst, event):
     join = inst.queue[0]
     return inst.host.apply_join(src=inst.timeline_id, join=join,
                                 running=_still_running(inst))
-
-
-def _wake_note(inst, event):
-    _close_out(inst)
-    inst.host.wake_note(src=inst.timeline_id, joined=list(inst.news), handed_back=inst.mode.answers,
-                        running=_still_running(inst),
-                        background=_background(inst=inst, clones=[c for c, _ in inst.news]))
 
 
 def _record(inst, event):
@@ -2738,7 +2732,7 @@ def applied(ctx, inst, event) -> None:
     join = inst.queue.pop(HEAD)
     inst.grafts.pop(join.child, None)
     inst.stopping.discard(join.child)
-    news = (not inst.made.get(join.child) or join.reason != "done") and not _unwanted(inst=inst, child=join.child)
+    news = not _unwanted(inst=inst, child=join.child)  # every merge wakes it, but a graft's made for a withdrawn request
     inst.news += [(join.child, join.reason)] if news else []
     # the wake its news sets off is for the request the graft was made for, if any
     inst.woken_for += [r for r in [inst.graft_requests.pop(join.child, None)] if news and r is not None]
@@ -2784,11 +2778,6 @@ def wake_run(ctx, inst, event) -> None:
 
 def note_written(ctx, inst, event) -> None:
     closed_out(inst)
-
-
-def note_failed(ctx, inst, event) -> None:
-    """The wake note could not be written: the user is told; the original comes to rest next."""
-    _report(inst=inst, kind="wake", clones=[c for c, _ in inst.news], error=event.data)
 
 
 # ------------------------------------------------------------------ effects: a focus graft's join
@@ -3781,7 +3770,7 @@ def _timeline(name: str) -> hsm.Model:
                     T(S("closing_calls"), Effect(checked(is_driven))),
                 ),
                 hsm.Choice(
-                    "ran",  # how the run ended: a focus graft that joins hands back; anything else rests
+                    "ran",  # how the run ended: a focus graft's turn ends in its join; the original rests
                     T(S("handing_back"), G(joins_back)),
                     T(S("rest"), Effect(checked(joins_back))),
                 ),
@@ -3833,18 +3822,6 @@ def _timeline(name: str) -> hsm.Model:
                     hsm.Choice("giving_up", T(S("abandoning"), Effect(report_abandoned))),
                     hsm.Choice("abandoning", T(S("next"), Effect(abandon_head))),
                 ),
-                hsm.State(
-                    "noting", mirrored("active"), io(done="noted", work=_wake_note),
-                    T(On("noted"), S("../busy/run"), G(answering_live), Effect(note_written)),
-                    T(On("noted"), S("../withdrawing"), G(noted_withdrawn), Effect(note_written)),  # its caller withdrew meanwhile
-                    T(On("noted"), S("../rest"), Effect(checked(answering_live, noted_withdrawn, effects=(note_written,)))),
-                    T(On(E), S("../unnoted"), Effect(note_failed)),
-                ),
-                hsm.Choice(
-                    "unnoted",
-                    T(S("../idle"), G(step_intact), Effect(come_to_rest)),
-                    T(S("../idle"), Effect(checked(step_intact))),  # a step that failed: its callers wait for its recovery
-                ),
                 hsm.Choice(
                     # after a run: grafts made for a request withdrawn meanwhile are stopped first
                     "rest",
@@ -3877,7 +3854,7 @@ def _timeline(name: str) -> hsm.Model:
                     T(S("requesting"), G(inbox_after), Effect(take_inbox)),
                     T(S("../idle"), G(quiet_after), Effect(come_to_rest)),
                     T(S("busy/run"), G(answers_handback), Effect(answer_handback)),
-                    T(S("noting"), G(wakes_to_run), Effect(wake_run)),
+                    T(S("busy/run"), G(wakes_to_run), Effect(wake_run)),  # its view ends on the merge results
                     # the guards above cover every case: this is a step that failed (at rest, its
                     # callers wait for its recovery) or a guard that raised (reported)
                     T(S("../idle"), Effect(checked(final_clean, final_out_first, final_waits, withdrawn_after, inbox_after,
@@ -3902,9 +3879,12 @@ def _timeline(name: str) -> hsm.Model:
                     T(On(E), S("../../shutting"), Effect(close_out_failed), into("active")),
                 ),
                 hsm.Choice(
-                    "resumed",  # a focus graft it made holds the conversation: the hand-over finishes
+                    # a focus graft it made holds the conversation: the hand-over finishes; a focus
+                    # graft whose turn a fault ended joins `failed`
+                    "resumed",
                     T(S("../passing"), G(hands_over), Effect(pass_inbox)),
-                    T(S("rest"), Effect(checked(hands_over))),
+                    T(S("handing_back"), G(rejoins)),
+                    T(S("rest"), Effect(checked(hands_over, rejoins))),
                 ),
             ),
             hsm.Choice("shutting", T(S("../closed"), Effect(close_root))),

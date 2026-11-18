@@ -8,7 +8,7 @@ import re
 
 import pytest
 
-from _util import clone_in_turn, ran, started
+from _util import clone_in_turn, ran, started, woke
 from graft.db import Store
 from graft.harness import GRAFT_ID, MAX_NAME_DRAWS, Harness, new_names
 from graft.providers import FakeProvider
@@ -65,7 +65,7 @@ def test_ids_given_and_drawn_name_the_branch_everywhere_and_never_its_timeline_i
         await h.do_join(child=c1, reason="done")
         await h.drain_and_wake("o")
         notes = [r["content"] for r in store.view("o") if r["harness"]]
-        assert any(n.startswith("(harness note: your branch site merged, reason=done;") for n in notes), notes
+        assert any('"merge-site"' in n for n in notes) and any('"site merged. ' in n for n in notes), notes
         assert any("Still running: 3fa9c1 (skills: slides)." in n for n in notes), notes
         assert not any(__import__("re").search(r"\bc[12]\b", n) for n in notes), notes
         await h.machines.stop()
@@ -127,10 +127,10 @@ def test_stop_takes_branch_ids_and_a_timeline_id_names_nothing(tmp_path):
         if "fork" not in names:
             gate.wait(10)
             return text("Built.")
-        if last["type"] == "text" and not last.get("harness") and last["text"] == REQUEST:
+        if last["type"] == "text" and not woke(last) and last["text"] == REQUEST:
             return [{"type": "tool_use", "id": "f1", "name": "fork",
                      "input": {"detached": [{"id": "site", "skills": ["website"]}]}}]
-        if last["type"] == "text" and not last.get("harness") and last["text"] == "Stop it.":
+        if last["type"] == "text" and not woke(last) and last["text"] == "Stop it.":
             return [{"type": "tool_use", "id": "s1", "name": "stop", "input": {"ids": ["c1", "site"]}}]
         return text("Okay.")
 
@@ -150,7 +150,7 @@ def test_stop_takes_branch_ids_and_a_timeline_id_names_nothing(tmp_path):
     assert "c1: not stopped: no such branch" in result[0]
     assert store.timeline("c1")["join_reason"] == "cancelled"
     notes = [r["content"] for r in store.view("o") if r["harness"]]
-    assert any("site (stopped)" in n and "You stopped site" in n for n in notes), notes
+    assert any('"site was stopped before it finished.' in n for n in notes), notes
 
 
 def test_error_lines_name_a_branch_by_its_id_even_when_another_branchs_timeline_id_is_that_id(tmp_path):

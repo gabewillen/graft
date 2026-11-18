@@ -2,6 +2,8 @@
 machine's state is copied to `timelines.status` in the step that enters it, so after any awaited
 call the store says where every timeline is."""
 
+import re
+
 
 def conversation(store, src="o"):
     """The row ids of src's conversation a test branch starts from by default: its messages (text
@@ -84,18 +86,18 @@ def branch_input(*entries):
 
 
 def _quotes(messages):
-    """The user's own messages in a rendered view, as quotes (no harness rows, no nonce, no repeats)."""
-    import re
-    out = []
+    """The user's own messages in a rendered view, as quotes (no harness rows, no nonce). A text
+    sent more than once is left out: a quote of it would match more than one message."""
+    texts = []
     for m in messages:
         if m["role"] != "user":
             continue
         for b in m["content"]:
             if b["type"] == "text" and not b.get("harness"):
                 q = re.sub(r"^\[conversation [^\]]*\]\s*", "", b["text"]).strip()
-                if q and q not in out:
-                    out.append(q)
-    return out
+                if q:
+                    texts.append(q)
+    return [q for q in dict.fromkeys(texts) if texts.count(q) == 1]
 
 
 def quoting(policy):
@@ -129,7 +131,24 @@ def started(block):
             and block["content"].startswith("You are now on branch "))
 
 
+def merged(block):
+    """Is this block main's result of a branch's merge call (spec: Join), which ends main's view
+    when it is woken?"""
+    content = block.get("content")
+    return (block.get("type") == "tool_result" and isinstance(content, str)
+            and bool(re.match(r"[a-z0-9][a-z0-9-]* (merged\b|was stopped before it finished)", content)))
+
+
 def ran(block):
     """Is this block the result of a tool call the timeline made itself (not a branch's fork
-    result, which ends a branch's first view)?"""
-    return block.get("type") == "tool_result" and not started(block)
+    result, which ends a branch's first view, nor main's result of a branch's merge call)?"""
+    return block.get("type") == "tool_result" and not started(block) and not merged(block)
+
+
+def woke(block):
+    """Is this block what the harness wrote for main to read, a note or a merge result (what a
+    wake run's view ends on)?"""
+    if merged(block):
+        block.setdefault("text", block["content"])  # read like a note's text
+        return True
+    return bool(block.get("harness"))

@@ -304,7 +304,7 @@ def test_worktree_diff_includes_submodule_changes(tmp_path):
 
 def test_arm_g_clones_runs_and_joins_offline(tmp_path, monkeypatch):
     """The graft arm of the replay, with a scripted provider and a fake seeder: one focus clone
-    for the recorded subtask, run to the end of its turn, joined `done` by the harness."""
+    for the recorded subtask, run to the end of its turn, which merges it (`done`)."""
     import asyncio
 
     from graft import seeder as sd
@@ -330,8 +330,10 @@ def test_arm_g_clones_runs_and_joins_offline(tmp_path, monkeypatch):
     sb = sandbox.Sandbox(str(tmp_path / "repo"))
     res = asyncio.run(replay_run.arm_g(e, sb, max_steps=4, workdir=str(tmp_path)))
     assert res["clone"] == "c1" and res["clone_text"].startswith("forked -> c1 (current")
-    assert res["forced_join"] is True  # the clone answered and stopped: no live user, so the harness joins it
+    assert res["forced_join"] is False  # its turn ended on its answer, and that merged it
     assert res["returned"] == "Report: parse_token lacks bounds checks." and res["joined_rows"] == 1
     assert res["seed_rows"] == 3 and res["candidates"] == 3 and res["seeder"]["fallback"] is None
     assert res["usage"]["calls"] == 1 and res["by_model"]["fake-1"]["input"] == 50
-    assert res["parent_messages"][-1]["role"] == "assistant"
+    last = res["parent_messages"][-1]  # the parent's view ends on its result of the clone's merge call
+    assert last["role"] == "user" and last["content"][-1]["type"] == "tool_result"
+    assert last["content"][-1]["content"].startswith("c1 merged.")

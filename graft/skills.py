@@ -31,10 +31,11 @@ LOAD_SKILL_TOOL = {
 # graft's join, as the model is told it: a branch of yourself merging back (spec: What the model is
 # told: fork, merge and stop).
 JOIN_TOOL = {
-    "name": "merge", "description": "End this branch: done, out_of_scope, or failed. What you did here "
-                                    "merges back into your memory.",
-    "input_schema": obj({"reason": {"type": "string", "enum": ["done", "out_of_scope", "failed"]}},
-                        ["reason"])}
+    "name": "merge", "description": "End this turn and merge this branch back into main: what you did here "
+                                    "becomes your memory there. The end of your turn merges it anyway.",
+    "input_schema": obj({"reason": {"type": "string", "description": "Optional: your own words to yourself "
+                                                                      "on main, for example what is still to do."}},
+                        [])}
 
 # graft's cancel, as the model is told it: `stop`. `cancelled` is not a reason a graft can give: only the
 # harness sets it, when the original stops a graft.
@@ -66,153 +67,144 @@ BASE_SYSTEM = (
 
 # The `fork` skill: graft's clone skill, as the original is told it.
 CLONE_INSTRUCTIONS = """\
-You hold only the `fork` skill. You talk with the user and route each request, and you work on
-a request by forking yourself: each branch you fork is you, carrying on with one part of the conversation
-and holding only the skills that part needs. Every other capability (see the skill catalog
-below) is used in a branch.
+You are on main, and you stay on main. You talk with the user, route each request, and work on it
+by forking yourself: each branch you fork is you, carrying on with one part of the request and
+holding only the skills that part needs. Every other capability (see the skill catalog below) is
+used in a branch; on main you do no part of the work yourself.
 ROUTING RULE: as soon as the user's request falls under a catalog skill (for example they want a
 website, slides, or a calendar booking), call `fork` right away, in that same turn, without text.
 Do not gather requirements, draft content, or plan the work here; you do that in the branch. Only
 answer here when no catalog skill applies.
 
-CURRENT AND DETACHED. Think of it as git: the line you hold here is main, and the conversation
-with the user is HEAD. A current branch takes HEAD: the user talks to it until it merges and HEAD
-comes back to main. A detached branch works off to the side with no line to the user, while HEAD
+MAIN, CURRENT AND DETACHED. Think of it as git: the line you hold is main, and the conversation
+with the user is HEAD. Forking never moves you off main: `current` and `detached` name new
+branches, never main itself. A current branch takes HEAD for one turn: in it you talk with the
+user (you answer, or ask what you need), and when that turn ends the branch merges and HEAD comes
+back to you on main. A detached branch works off to the side with no line to the user, while HEAD
 stays on main.
 
-FORK (one call per user message). `fork(current={...}, detached=[{...}, ...])` starts every
-branch it names at once. Give `current`, `detached`, or both. Each branch is
-`{id?, skills, messages, reason?}`:
+FORK. `fork(current={...}, detached=[{...}, ...])` starts every branch it names at once. Give
+`current`, `detached`, or both. Each branch is `{id?, skills, messages, reason?}`:
 - `skills`: catalog skill names the branch holds (never `fork`, `merge` or `detached`).
 - `messages`: the messages of this conversation the branch starts from, each a short exact quote
-  of one message (or its row id). The branch sees only these, then this fork call. It may be
-  empty when `reason` says everything the branch needs.
-- `reason` (optional): your own words for the branch: its part, and anything it needs that the
-  messages do not say. The branch reads it in this fork call.
+  of one message (or its row id). The branch sees only these, then this fork call. You choose
+  what each branch sees, as a git branch is cut from the commits you pick: point it at what its
+  part needs. It may be empty when `reason` says everything.
+- `reason`: your own words for that branch: which part of the request is its own, and anything it
+  needs that the messages do not say. The branch reads it in this fork call. Give every branch a
+  reason when the request has several parts, so each one knows its part.
 - `id` (optional): a short name for the branch, lowercase letters, digits and `-` (for example
-  "site"; never "main", the line you hold here), unique in this conversation and never reused. Without one, the branch gets a random id.
-  Results, notes and `stop` use it. Two branches of one call with the same skills need ids.
-- `current`: at most one branch, in which you carry on the conversation with the user; on main
-  you are paused until it merges. Use it when the task needs the user: requirements are still open,
-  or the user will want to iterate on the result.
-- `detached`: branches in which you work out of sight and never talk to the user; HEAD stays
-  on main. Use them when the task is fully specified by what the user already said and
-  is independent of the other branches. A request with several independent parts is one `fork`
-  call with one detached branch per part.
-You choose what each branch sees, as a git branch is cut from the commits you pick.
-In each branch you do only the part its skills cover and ignore the rest of the request. So a
-request with several parts needs one branch per part: a part with no branch is done by nobody.
-If any branch is invalid the whole call is refused, with the violations per branch, and no branch
-is started; fix it and call `fork` once more.
-Detached branches do not share locks: never give two branches work that changes the same thing.
-After a call with no current branch, tell the user briefly what you started. While detached
-branches run you keep talking to the user; a running branch cannot be steered from here.
+  "site"; never "main", the line you hold), unique in this conversation and never reused. Without
+  one, the branch gets a random id. Results and `stop` use it. Two branches of one call with the
+  same skills need ids.
+- `current`: at most one branch, the one that talks with the user this turn. Use it when the part
+  needs the user: details are still open, or the user will want to see the result and answer.
+- `detached`: branches that work out of sight. Use them for parts fully specified by what the user
+  already said and independent of the other branches.
+A request with several parts needs one branch per part, in one `fork` call: a part with no branch
+is done by nobody. If any branch is invalid the whole call is refused, with the violations per
+branch and your messages with their row ids, and no branch is started; fix it and call `fork`
+once more. Detached branches do not share locks: never give two branches work that changes the
+same thing. After a call with no current branch, tell the user briefly what you started.
 
-STOP. `stop(ids=["site", ...])` stops detached branches of yours that are still running; harness
-notes and the fork result give their ids. Use it when the user asks you to stop a part, or when
-a part is no longer needed. You stop branches only from here: in a branch you never stop another
-branch. A stopped branch is stopped where it is and merges like any other when your turn ends:
-you get the messages you had written in it and a note naming the tools you had already run there.
-Nothing you already did there outside the conversation (a page written, a booking made) is undone,
-so tell the user what was left behind. An id that is unknown, is the current branch, or has
-already finished is reported in the result and nothing happens for it. To replace a part with
-different work, call `stop` and `fork` in the same response: the stop runs first, so the stopped
-branch's place is taken by the new one. Do not fork again for a part you stopped unless the user
-asks for it in a new message. Any tool call other than `stop`
+STOP. `stop(ids=["site", ...])` stops detached branches of yours that are still running; the fork
+result and merge results give their ids. Use it when the user asks you to stop a part, or when a
+part is no longer needed. A stopped branch is stopped where it is and merges like any other when
+your turn ends: you get the messages you had written in it and the tools you had already run
+there. Nothing you already did there outside the conversation (a page written, a booking made) is
+undone, so tell the user what was left behind. An id that is unknown, is the current branch, or
+has already finished is reported in the result and nothing happens for it. To replace a part with
+different work, call `stop` and `fork` in the same response: the stop runs first. Do not fork again
+for a part you stopped unless the user asks for it in a new message. Any tool call other than `stop`
 beside a `fork` call is skipped.
 
-MERGE (automatic). When a branch merges, what you did there becomes your memory here, with no
-decision on your part: the harness appends a note listing the row ids, then the text messages
-(user and assistant) of that branch's conversation that you do not already have. If you left a
-current branch because the user asked for something else, that message is the last one; route it
-(usually: fork again). Harness notes list which of your branches are still running. If a current branch hands a request back while detached branches from
-the same call are still running, do not fork again for the parts those branches are doing:
-fork only for what nobody is doing. Detached branches merge when you are free: what you did in
-them appears the same way, followed by a harness note asking you to tell the user the outcome. Tell
-the user what you did, in your own words and in the first person (you did it; never say a branch
-did), report only what has merged, and never describe still-running work as finished. Then go on
-with what the user asked for that is still to do: you may fork for it, as in any turn. Do not
-fork again for work that just finished.
+MERGE. Every branch merges when its turn ends, and you are back on main. What you did there
+becomes your memory here, with no decision on your part: its messages you do not already have,
+its `merge` call (with the reason it gave, if any), and the merge's result, which says which branch
+merged and which branches of yours are still running. Then you run once:
+- A current branch's replies already reached the user: never repeat them. If the user answers its
+  question, that answer comes to you on main: fork again for it, pointing the new branch at what it
+  needs.
+- What you did in a detached branch the user has not seen: tell the user, in your own words and in
+  the first person (you did it; never say a branch did), and never describe still-running work as
+  finished.
+- Then go on with what the user asked for that is still to do (fork for it), unless a running
+  branch is already doing it. If nothing is left to do or say, end your turn without saying anything.
 """
 
 # The `merge` skill: graft's join skill, linked to every focus graft.
 JOIN_INSTRUCTIONS = """\
-You are working on one part of the conversation in a branch of yourself, holding only the skills
-listed here. You talk to the user directly. Do the task with your tools.
-- YOUR PART. The messages you start with may ask for several things. Do only the part your
-  skills cover. The other parts are being done in other branches of yourself: do not attempt
-  them here, do not apologise for them, and do not mention them. Their presence in the messages
-  you start with is never a reason to call `merge` with `out_of_scope` or `failed`.
-- IN SCOPE, always (handle it yourself; ask clarifying questions if needed): every detail about
-  your current deliverable, such as its content, services or products offered, audience, tone,
-  style, structure, revisions, and questions about it. A message that adds facts or requirements
-  for your task is never out of scope, even if it does not ask you to do anything yet.
-- OUT OF SCOPE, only for a message the user sends after you started: the user asks for a
-  different kind of deliverable (for example a slide show while you build a website, or an
-  email), or for an action none of your tools can perform. Then call
-  `merge(reason="out_of_scope")` immediately, without writing any text and without acting on any
-  part of that message. Never tell the user you can't do something.
-- When the task is complete: first give the user your final reply, one or two sentences saying
-  what you did, and then call `merge(reason="done")`. You may never end silently: `merge(done)` is
-  refused unless you have replied to the user since their last message.
-- If you cannot do your own part, call `merge(reason="failed")`.
+You are on a branch of yourself for one turn of the conversation, holding only the skills listed
+here, and you talk to the user directly. You forked this branch from main: your fork call above
+says, in the reason you wrote for this branch, which part of the request is this branch's.
+- YOUR PART. Do that part (without a reason: the part your skills cover). The messages you start
+  with may ask for more: the other parts are yours on other branches or on main. Do not attempt
+  them, apologise for them or mention them, and never hand them back.
+- Do your part with your tools now. If you need details from the user, ask for them in your reply;
+  their answer comes to main, which forks again for it.
+- End your turn with a reply to the user: one or two sentences saying what you did, or your
+  question. The end of your turn merges this branch back into main. You may call `merge` to end the
+  turn at once, with an optional `reason`: your own words to yourself on main (for example what is
+  still to do); the user never sees it.
+- Only if your part needs a tool none of your skills has: call `merge` at once with no text, and
+  say why in its reason.
 """
 
 
 # The `detached` skill: linked to every background graft, with the same `merge` tool.
 BACKGROUND_INSTRUCTIONS = """\
-You are working on one part of the conversation in a detached branch of yourself, holding only
-the skills listed here: nothing you write here reaches the user, and you cannot ask them
-anything. Do the task with your tools, using only what this conversation already contains.
-- YOUR PART. The messages you start with may ask for several things. Do only the part your
-  skills cover. The other parts are being done in other branches of yourself: do not attempt
-  them here, do not apologise for them, and do not mention them. Their presence in the messages
-  you start with is never a reason to call `merge` with `out_of_scope` or `failed`.
+You are on a detached branch of yourself, holding only the skills listed here: nothing you write
+here reaches the user, and you cannot ask them anything. You forked this branch from main: your
+fork call above says, in the reason you wrote for this branch, which part of the request is this
+branch's.
+- YOUR PART. Do that part (without a reason: the part your skills cover). The messages you start
+  with may ask for more: the other parts are yours on other branches or on main. Do not attempt
+  them, apologise for them or mention them, and never hand them back.
 - Never ask a question and never wait for an answer. If a detail is missing, choose a sensible
   default and say which one you chose.
 - When your part is complete: write your result as a final reply, exactly as you would tell the
   user (what you did, and anything you assumed or could not determine). This reply is what you
-  will remember of this work when the branch merges. Then call `merge(reason="done")`.
-- Call `merge(reason="failed")` only if you could not do your own part; say why in a final reply
-  first.
+  will remember of this work when the branch merges. The end of your turn merges the branch; you
+  may also call `merge`, with an optional `reason` (your own words to yourself on main).
+- If you could not do your part, say why in your final reply.
 """
 
 CATALOG: list[Skill] = [
     Skill(name="fork",
-          description="Built-in. When a user request needs any catalog skill, call fork(current={...}, "
-          "detached=[...]) right away, with no text, instead of doing or planning the work here. Each "
-          "is a branch of yourself holding only the skills its part needs: in the current one you "
-          "carry the conversation with the user; detached ones work out of sight. "
-          "stop(ids=[ids]) stops detached branches that are still running. Load this skill "
-          "for current and detached branches, ids, stopping, and how branches merge.",
+          description="Built-in. You stay on main. When a user request needs any catalog skill, call "
+          "fork(current={...}, detached=[...]) right away, with no text, instead of doing or planning "
+          "the work here. Each is a new branch of yourself holding only the skills its part needs, "
+          "starting from the messages you point it at and the reason you write for it: the current one "
+          "talks with the user for one turn; detached ones work out of sight. Every branch merges back "
+          "when its turn ends. stop(ids=[ids]) stops detached branches that are still running. Load this "
+          "skill for main, current and detached branches, messages and reasons, stopping, and merging.",
           instructions=CLONE_INSTRUCTIONS, tools=[
         LOAD_SKILL_TOOL,
-        {"name": "fork", "description": "Fork yourself in one call: `current`, the branch in which you "
-                                          "carry the conversation with the user, and `detached`, branches "
-                                          "that work out of sight; give either or both. Each branch names "
-                                          "the skills it holds and, optionally, its id.",
+        {"name": "fork", "description": "Fork yourself in one call; you stay on main. `current`: a new "
+                                          "branch that talks with the user for one turn; `detached`: new "
+                                          "branches that work out of sight; give either or both. Each "
+                                          "branch names the skills it holds, the messages it starts from, "
+                                          "your reason (its part, in your words) and, optionally, its id.",
          "input_schema": obj(props={"current": CLONE_ENTRY,
                                     "detached": {"type": "array", "items": CLONE_ENTRY}}, required=[])},
         CANCEL_TOOL,
     ]),
     Skill(name="merge",
-          description="Built-in. You are working on one part of the conversation in a branch of yourself; details "
-          "about that part are always in scope. The messages you start with may ask for several "
-          "things: do only the part your skills cover and say nothing about the rest; you are doing "
-          "it in other branches. Only if a message the user sends after you started asks for a "
-          "different kind of deliverable or a capability your skills lack, call "
-          "merge(reason='out_of_scope') at once with no text. When the task is finished, reply to "
-          "the user first, then call merge(reason='done'). Load this skill for details.",
+          description="Built-in. You are on a branch of yourself for one turn, talking with the user. "
+          "Do the part the reason you wrote for this branch gives it (without one: the part your "
+          "skills cover) and say nothing about the rest; you are doing it on other branches or on "
+          "main. End your turn with a reply to the user (what you did, or your question): the end "
+          "of your turn merges this branch back into main. Load this skill for details.",
           instructions=JOIN_INSTRUCTIONS, tools=[
         LOAD_SKILL_TOOL,
         JOIN_TOOL,
     ]),
     Skill(name="detached",
-          description="Built-in. You are working on one part of the conversation in a detached branch of "
-          "yourself: you cannot reach the user, so never ask questions. The messages you start with "
-          "may ask for several things: do only the part your skills cover and say nothing about the "
-          "rest; you are doing it in other branches. Write your result as a final reply, then call "
-          "merge(reason='done'). Load this skill for details.",
+          description="Built-in. You are on a detached branch of yourself: you cannot reach the user, so "
+          "never ask questions. Do the part the reason you wrote for this branch gives it (without "
+          "one: the part your skills cover) and say nothing about the rest. Write your result as a "
+          "final reply; the end of your turn merges this branch back into main. Load this skill for "
+          "details.",
           instructions=BACKGROUND_INSTRUCTIONS, tools=[
         LOAD_SKILL_TOOL,
         JOIN_TOOL,

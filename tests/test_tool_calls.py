@@ -4,7 +4,7 @@ shutdown) cancels the tool where it waits, and the call is recorded as run with 
 as not executed: it may have acted, or may still act."""
 
 import asyncio
-from _util import ran, started
+from _util import ran, started, woke
 import threading
 
 import pytest
@@ -331,7 +331,7 @@ def test_a_cancelled_graft_whose_close_out_cannot_be_written_still_names_the_run
 
 def test_a_failed_focus_graft_whose_close_out_cannot_be_written_carries_it_with_its_join(tmp_path):
     def original(last, messages):
-        if ran(last) or is_wake(last) or last.get("harness"):
+        if ran(last) or is_wake(last) or woke(last):
             return text("Back.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
@@ -442,7 +442,7 @@ def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_r
     row write's outcome is taken (`storing`): the call is closed with what the tool returned, marked run,
     not as cut short."""
     def original(last, messages):
-        if ran(last) or last.get("harness"):
+        if ran(last) or woke(last):
             return text("Back.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
@@ -517,7 +517,7 @@ def test_a_tool_that_is_cancelled_by_its_host_ends_as_run_with_an_error_and_its_
 
 def test_a_focus_graft_whose_tool_is_cancelled_by_its_host_goes_on(tmp_path):
     def original(last, messages):
-        if ran(last) or last.get("harness"):
+        if ran(last) or woke(last):
             return text("Back.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
@@ -525,7 +525,7 @@ def test_a_focus_graft_whose_tool_is_cancelled_by_its_host_goes_on(tmp_path):
 
     async def go():
         await h.start()
-        assert await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT) == ["done"]
+        assert await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT) == ["done", "Back."]  # main runs once after the merge
         await h.close()
 
     asyncio.run(go())
@@ -1146,10 +1146,10 @@ class BadExc(Exception):
 def test_a_refusal_row_whose_write_error_has_a_bad_message_still_ends_the_run(tmp_path):
     def policy(system, messages, tools):
         last = messages[-1]["content"][-1]
-        if ran(last):
+        if ran(last) or woke(last):
             return text("Refused.")
-        return [clone_use(clone_entry(skills=["website"], focus=True), clone_entry(skills=["slides"], focus=True),
-                          id="k1") | {"type": "tool_use"}]  # two focus entries: refused in its preparation
+        return [clone_use(clone_entry(skills=["fork"], focus=True),
+                          id="k1") | {"type": "tool_use"}]  # a branch cannot hold fork: refused in its preparation
 
     store, h, _ = make(tmp_path=tmp_path, policy=policy)
     real = h.store_result
