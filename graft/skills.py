@@ -41,8 +41,9 @@ JOIN_TOOL = {
 # harness sets it, when the original stops a graft.
 CANCEL_TOOL = {
     "name": "stop",
-    "description": "Stop detached branches of yours that are still running, by id. Each one is "
-                   "stopped where it is and what you did in it so far merges back when your turn ends.",
+    "description": "Stop detached branches of yours that are still running, by id, only when the user "
+                   "no longer wants their parts. Each one is stopped where it is and what you did in it so "
+                   "far merges back when your turn ends. It does not end your turn: to end it, say nothing.",
     "input_schema": obj(props={"ids": {"type": "array", "minItems": 1, "items": S}},
                         required=["ids"])}
 
@@ -126,7 +127,8 @@ merged and which branches of yours are still running. Then you run once:
   something, end your turn without saying anything and wait: the answer comes to you on main, and
   then you fork again for it, pointing the new branch at the question and the answer.
 - A detached branch goes on with its own part whatever another branch did: never stop it or fork
-  its part again because a current branch merged or asked the user something.
+  its part again because a current branch merged or asked the user something. Ending your turn
+  needs no tool: say nothing.
 - What you did in a detached branch the user has not seen: tell the user, in your own words and in
   the first person (you did it; never say a branch did), and never describe still-running work as
   finished.
