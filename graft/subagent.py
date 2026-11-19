@@ -85,7 +85,6 @@ class SubagentRunner:
     trace: object = None
     messages: list[dict] = field(default_factory=list)
     delegations: list[Delegation] = field(default_factory=list)
-    out: list[str] = field(default_factory=list)
     tasks: dict[str, a2a.Task] = field(default_factory=dict)
     context_id: str = "subagent"
 
@@ -158,7 +157,7 @@ class SubagentRunner:
 
     # ------------------------------------------------------------ parent
     async def _turn(self, text: str) -> list[str]:
-        start = len(self.out)
+        said: list[str] = []
         self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
         self.messages = self._maybe_compact("parent", self.parent_system(), self.messages)
         for _ in range(self.max_steps):
@@ -169,9 +168,9 @@ class SubagentRunner:
             self.messages.append({"role": "assistant",
                                   "content": [b for b in blocks if b["type"] in ("text", "tool_use")]
                                   or [{"type": "text", "text": "(empty)"}]})
-            self.out += [b["text"] for b in blocks if b["type"] == "text"]
+            said += [b["text"] for b in blocks if b["type"] == "text"]
             if not uses:
-                return self.out[start:]
+                return said
             results = []
             for u in uses:
                 if u["name"] != "delegate":
@@ -182,7 +181,7 @@ class SubagentRunner:
                 results.append({"type": "tool_result", "tool_use_id": u["id"], "content": d.summary,
                                 "is_error": False})
             self.messages.append({"role": "user", "content": results})
-        return self.out[start:]
+        return said
 
     def _call(self, name: str, args: dict) -> tuple[str, bool]:
         """A host tool, called synchronously (this baseline runs no tool concurrently); an async

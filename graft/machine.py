@@ -153,13 +153,15 @@ host's messages (`submit`) and cancels (`cancel_task`), decides each task's stat
 timelines tell it (`answering`, `said`, `grafts_made`, `graft_received`, `rested`, `resync`,
 `report`), writes the events it decided as the activity of its `writing` state, makes its sends
 to the timelines one per step from its outbox (`sending`), and answers the consumers waiting for
-events (`events_wait`). `close` is `shutdown`. A timeline that recovers from a fault re-states its
+events (`events_wait`). Its graph is `open`, `closing` and `ending`: each event it takes is its
+own transition with disjoint guarded effects, every step ends in the choice `flush` (send, write,
+and while closing tell the original, then end), and `close` is `shutdown` (`open` -> `closing`). A timeline that recovers from a fault re-states its
 whole record (`resync`, a Record); a fault of the session's own steps (which change nothing: a
 step commits its data only at its end) fails the consumers waiting and asks the original to
 re-state (`restate`): suspended, the original passes the question on to its focus graft with its
 own record, and the graft re-states both in one event. At the end of `close` it stops every
-machine (`stopping`); one that cannot be stopped is reported (`telling`) and raised by `close`,
-and the rest are still stopped.
+machine (`ending/stopping`); one that cannot be stopped is reported (`telling`) and raised by
+`close`, and the rest are still stopped; in `ending` every wait is answered with the log final.
 
 Rules the graph enforces. Only the original clones, only in a turn or wake (every wake is a full run), never while
 closing, never for a request that was withdrawn, and never more than one focus graft per call.
