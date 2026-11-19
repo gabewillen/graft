@@ -2038,12 +2038,12 @@ def note_late_withdrawal(ctx, inst, event) -> None:
     """A request it answered is withdrawn: its caller was cancelled before it took the answer, and
     the cancel wins. Recorded, so the background grafts made for it are stopped once it stands at
     rest (`stop_one`) and join `cancelled`, and their joins wake nothing. Its row
-    gets the withdrawal mark (a write of the scribe's) in the views it was asked in; an error it
-    was answered with, which its caller never took, is told after that write (one line, which the
-    the session tells as a harness error event)."""
+    gets the withdrawal mark (a write of the scribe's) in the views it was asked in. An error it
+    was answered with is the session's to tell (it has it from the answer: `rested` or the
+    re-stated record), once."""
     request, = _late(inst=inst, rid=event.data)
     inst.withdrawn.add(request.id)
-    _note(inst=inst, method="mark_withdrawn", keep=_reply_error(request.reply), timelines=_viewers(inst),
+    _note(inst=inst, method="mark_withdrawn", timelines=_viewers(inst),
           rows=[request.row] if request.row is not None else [])
 
 
