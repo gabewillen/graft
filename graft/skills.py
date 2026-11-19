@@ -61,6 +61,13 @@ REASON = {"type": "string", "maxLength": REASON_CHARS, "description": "Your own 
                                            "it needs to know that the messages do not say."}
 BRANCH_ENTRY = obj({"id": {"type": "string", "pattern": BRANCH_ID_PATTERN}, "skills": STRS,
                    "messages": MESSAGES, "reason": REASON}, ["skills", "messages"])
+WAKE = {"type": "boolean",
+        "description": "Current branch only (default true). Set false when this branch finishes the "
+                       "user's turn (or asks them a question) and nothing else needs to run after it "
+                       "replies: main waits quietly for the user's next message. Keep true when main "
+                       "must continue with a follow-up stage after this branch merges."}
+CURRENT_ENTRY = obj({"id": {"type": "string", "pattern": BRANCH_ID_PATTERN}, "skills": STRS,
+                    "messages": MESSAGES, "reason": REASON, "wake": WAKE}, ["skills", "messages"])
 
 BASE_SYSTEM = (
     "You are a helpful assistant talking with one user in one ongoing conversation. "
@@ -102,6 +109,11 @@ FORK. `fork(current={...}, detached=[{...}, ...])` starts every branch it names 
   same skills need ids.
 - `current`: at most one branch, the one that talks with the user this turn. Use it when the part
   needs the user: details are still open, or the user will want to see the result and answer.
+  It also accepts an optional `wake` boolean (default `true`): set `wake: false` whenever this
+  branch finishes the user's turn (or asks the user a question) and nothing else needs to run on
+  main after it replies, so main waits quietly for the user's next message without waking. Keep
+  `wake: true` when main must continue with a follow-up stage after this branch merges (for
+  example, a first step whose result feeds a second branch).
 - `detached`: branches that work out of sight. Use them for parts fully specified by what the user
   already said and independent of the other branches.
 A request with several parts needs one branch per part, in one `fork` call: a part with no branch
@@ -216,7 +228,7 @@ CATALOG: list[Skill] = [
                                           "branches that work out of sight; give either or both. Each "
                                           "branch names the skills it holds, the messages it starts from, "
                                           "your reason (its part, in your words) and, optionally, its id.",
-         "inputSchema": obj(props={"current": BRANCH_ENTRY,
+         "inputSchema": obj(props={"current": CURRENT_ENTRY,
                                     "detached": {"type": "array", "items": BRANCH_ENTRY}}, required=[])},
         CANCEL_TOOL,
     ]),

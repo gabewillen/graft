@@ -137,7 +137,7 @@ def test_branch_entries_shape():
     assert branch_entries({"detached": []})[1] == branch_entries({})[1]  # empty detached and no current
     assert branch_entries({"detached": {"skills": ["website"]}})[1]  # not a list
     _, v = branch_entries({"current": {"skills": ["website"], "focus": True, **m}})
-    assert v == [f"current: unknown field 'focus' (a branch is {shape})"]
+    assert v == ["current: unknown field 'focus' (a branch is {id?, skills, messages, reason?, wake?})"]
     _, v = branch_entries({"detached": [{"skills": ["website"], **m}], "branch": []})
     assert v == ["unknown field 'branch' (`fork` takes `current` and `detached`)"]
     es, v = branch_entries({"current": {"skills": ["website"], **m}, "detached": [{"skills": ["slides"], **m}]})

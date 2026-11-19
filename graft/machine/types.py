@@ -50,6 +50,7 @@ class QueuedJoin(NamedTuple):
     reason: str
     trigger: int | None
     closing: dict[str, tuple[str, bool]] | None = None
+    replied_cleanly: bool = False  # focus graft ended via plain reply (no explicit merge(), not failed/withdrawn)
 
 
 class Mode(NamedTuple):
@@ -74,6 +75,7 @@ class Prepared(NamedTuple):
     pairs: list[tuple[str, bool]]
     data: Any
     names: Any = None
+    wake: Any = None
 
 
 @dataclass(eq=False)
@@ -115,6 +117,7 @@ class Branch:
     pairs: list[tuple[str, bool]] = field(default_factory=list)
     data: Any = None
     names: dict[str, str] = field(default_factory=dict)
+    wake: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass
@@ -185,6 +188,7 @@ class GraftState:
     """Child grafts owned by this timeline (original only)."""
     live: dict[str, bool] = field(default_factory=dict)  # child -> focus, until join applied
     made: dict[str, bool] = field(default_factory=dict)  # every child ever made -> focus
+    wake: dict[str, bool] = field(default_factory=dict)  # child -> whether main wants to wake after clean reply
     requests: dict[str, tuple[Request, ...]] = field(default_factory=dict)  # bg child -> owning requests
     focus: str | None = None
     stopped_unwanted: set[str] = field(default_factory=set)
@@ -199,8 +203,10 @@ class JoinState:
     hold: bool = False
     attempts: dict[str, int] = field(default_factory=dict)
     news: list[tuple[str, str]] = field(default_factory=list)
+    needs_wake: bool = False  # source: whether any join in this drain requires waking main
     ends_on_request: bool = False
     join_reason: str = "done"  # focus graft: decided on entry of handing_back
+    replied_cleanly: bool = False  # focus graft: ended via plain reply (no explicit merge())
     reason: str = ""  # background graft: join reason while recording
     close_first: bool = False  # background graft: close open calls before recording join
     forced: asyncio.Future | None = None

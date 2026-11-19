@@ -78,7 +78,7 @@ def test_entry_shape_messages_and_reason():
     _, v = branch_entries({"current": {"skills": ["website"], "messages": [1], "reason": 3}})
     assert v == ["current: reason must be a string (your own words for what this branch is for)"]
     _, v = branch_entries({"current": {"skills": ["website"], "messages": [1], "purpose": "x"}})
-    assert v == ["current: unknown field 'purpose' (a branch is {id?, skills, messages, reason?})"]
+    assert v == ["current: unknown field 'purpose' (a branch is {id?, skills, messages, reason?, wake?})"]
 
 
 def test_a_branch_sees_only_the_messages_main_points_at_then_main_fork_turn_and_its_own_result(tmp_path):

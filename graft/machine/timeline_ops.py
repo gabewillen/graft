@@ -508,8 +508,8 @@ def inbox_after(ctx, inst: Timeline, event) -> bool:
 
 
 def quiet_after(ctx, inst: Timeline, event) -> bool:
-    return (_after_open(inst) and not _inbox_live(inst)
-            and (not inst.joins.news or inst.closing or _run_withdrawn(inst)))
+    return (_after_open(inst) and not _inbox_live(inst) and not inst.joins.ends_on_request
+            and (not inst.joins.news or not inst.joins.needs_wake or inst.closing or _run_withdrawn(inst)))
 
 
 def answers_handback(ctx, inst: Timeline, event) -> bool:
@@ -995,8 +995,10 @@ def take_prepared(ctx, inst: Timeline, event) -> None:
     if isinstance(event.data, str):
         inst.step.rejection = event.data
     else:
-        inst.step.branch.pairs, inst.step.branch.data, names = event.data
-        inst.step.branch.names = dict(names or {})
+        inst.step.branch.pairs = event.data.pairs
+        inst.step.branch.data = event.data.data
+        inst.step.branch.names = dict(event.data.names or {})
+        inst.step.branch.wake = dict(event.data.wake or {})
 
 
 def preparation_crashed(ctx, inst: Timeline, event) -> None:
@@ -1036,6 +1038,7 @@ def spawned(ctx, inst: Timeline, event) -> None:
     for child, focus in branch.pairs:
         inst.grafts.live[child] = focus
         inst.grafts.made[child] = focus
+        inst.grafts.wake[child] = branch.wake.get(child, True) if focus else True
         if not focus and owners:
             inst.grafts.requests[child] = owners
     inst.grafts.focus = next((g for g, f in branch.pairs if f), None)
@@ -1208,6 +1211,7 @@ def focus_back(ctx, inst: Timeline, event) -> None:
 def start_joining(ctx, inst: Timeline, event) -> None:
     inst.joins.hold = False
     inst.joins.news = []
+    inst.joins.needs_wake = False
     inst.joins.ends_on_request = False
     inst.req.woken_for = []
 
@@ -1217,10 +1221,13 @@ def applied(ctx, inst: Timeline, event) -> None:
     closed_out(inst)
     join = inst.joins.queue.pop(HEAD)
     inst.grafts.live.pop(join.child, None)
+    wants_wake = inst.grafts.wake.pop(join.child, True)
     made_for = inst.grafts.requests.pop(join.child, ())
     news = not any(_withdrawn(inst, r) for r in made_for)
     if news:
         inst.joins.news.append((join.child, join.reason))
+        if wants_wake or not join.replied_cleanly or bool(inst.grafts.live):
+            inst.joins.needs_wake = True
         inst.req.woken_for += [r for r in made_for if all(r is not w for w in inst.req.woken_for)]
     inst.joins.ends_on_request = ends
     _forward(inst.machines.timelines.get(join.child), "join_commit" if committed_ else "join_rollback")
@@ -1245,6 +1252,7 @@ def report_abandoned(ctx, inst: Timeline, event) -> None:
 def abandon_head(ctx, inst: Timeline, event) -> None:
     join = inst.joins.queue.pop(HEAD)
     inst.grafts.live.pop(join.child, None)
+    inst.grafts.wake.pop(join.child, None)
     inst.grafts.requests.pop(join.child, None)
     _forward(inst.machines.timelines.get(join.child), "join_abandon")
 
@@ -1262,6 +1270,7 @@ def decide_join_reason(ctx, inst: Timeline, event) -> None:
     outcome = event.data if isinstance(event.data, RunOutcome) else None
     reason = "done" if outcome is not None and outcome.kind in ("join", "replied", "empty") else "failed"
     inst.joins.join_reason = CANCELLED if _focus_withdrawn(inst) else reason
+    inst.joins.replied_cleanly = (not _focus_withdrawn(inst)) and outcome is not None and outcome.kind == "replied"
 
 
 def _hand_back(inst: Timeline, event: hsm.Event | None) -> None:
@@ -1276,6 +1285,9 @@ def _hand_back(inst: Timeline, event: hsm.Event | None) -> None:
     join = join or QueuedJoin(child=inst.timeline_id, reason="failed", trigger=None)
     if inst.joins.unclosed is not None:
         join = join._replace(closing=inst.joins.unclosed)
+    if inst.joins.replied_cleanly and join.reason == "done" and join.trigger is None:
+        join = join._replace(replied_cleanly=True)
+    inst.joins.replied_cleanly = False
     users = [w for w in inst.req.waiters if w.user] + also
     others = [w for w in inst.req.waiters if not w.user]
     payload = (join, users, list(inst.req.inbox), inst.req.answering,

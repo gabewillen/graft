@@ -248,10 +248,13 @@ class BranchEntry:
     focus: bool
     messages: list[int] = field(default_factory=list)  # pointers: integer row ids
     reason: str | None = None  # the source's own words for the branch; never read by the harness
+    wake: bool = True  # current branch only: whether to wake main after a plain reply
 
 
 ENTRY_FIELDS = ("id", "skills", "messages", "reason")
+CURRENT_ENTRY_FIELDS = ("id", "skills", "messages", "reason", "wake")
 ENTRY_SHAPE = "{id?, skills, messages, reason?}"
+CURRENT_ENTRY_SHAPE = "{id?, skills, messages, reason?, wake?}"
 
 
 def _strings(entry: dict, *, name: str, label: str, violations: list[str]) -> list[str]:
@@ -281,13 +284,15 @@ def _messages(e: dict, label: str, v: list[str]) -> list[int]:
 
 
 def _entry(e: object, label: str, focus: bool, v: list[str]) -> BranchEntry | None:
+    fields = CURRENT_ENTRY_FIELDS if focus else ENTRY_FIELDS
+    shape = CURRENT_ENTRY_SHAPE if focus else ENTRY_SHAPE
     if not isinstance(e, dict):
-        v.append(f"{label}: must be an object {ENTRY_SHAPE}")
+        v.append(f"{label}: must be an object {shape}")
         return None
-    extra = sorted(str(k) for k in e if k not in ENTRY_FIELDS)
+    extra = sorted(str(k) for k in e if k not in fields)
     if extra:
         v.append(f"{label}: unknown field{'s' if len(extra) > 1 else ''} {', '.join(map(_echo, extra))} "
-                 f"(a branch is {ENTRY_SHAPE})")
+                 f"(a branch is {shape})")
     name = e.get("id")
     if name is not None and not (isinstance(name, str) and GRAFT_ID.fullmatch(name)):
         v.append(f"{label}: id {_echo(name)} is not a branch id (lowercase letters, digits and -, "
@@ -314,7 +319,14 @@ def _entry(e: object, label: str, focus: bool, v: list[str]) -> BranchEntry | No
     if "messages" in e and isinstance(e.get("messages"), list) and not e["messages"] and (reason is None) \
             and (not given or blank):
         v.append(f"{label}: give it messages, a reason, or both: with neither it would start from nothing")
-    return BranchEntry(label=label, raw=e, name=name, skills=skills, focus=focus, messages=messages, reason=reason)
+    wake = True
+    if focus and "wake" in e:
+        if isinstance(e["wake"], bool):
+            wake = e["wake"]
+        else:
+            v.append(f"{label}: wake must be a boolean (true or false)")
+    return BranchEntry(label=label, raw=e, name=name, skills=skills, focus=focus, messages=messages,
+                       reason=reason, wake=wake)
 
 
 def branch_entries(args: object) -> tuple[list[BranchEntry], list[str]]:
@@ -1579,8 +1591,8 @@ class Host:
             return f"fork refused; no branch was started: internal error ({err}).\nCall fork once more."
         if isinstance(prepared, str):
             return prepared
-        batch, pairs, names = prepared
-        return Prepared(pairs=pairs, data=batch, names=names)
+        batch, pairs, names, wake = prepared
+        return Prepared(pairs=pairs, data=batch, names=names, wake=wake)
 
     def roll_back_branch(self, src: str) -> None:
         """A branch call whose preparation was cut short (the run was ended while it was being
@@ -1686,4 +1698,4 @@ class Host:
             audits.append((tx, f"BRANCH {g.child} NAME {g.name} {mode} SEED {g.seed} TURN {g.turn} SKILLS {g.skills}", sc))
             parts.append(f"{g.name} ({'current' if g.focus else 'detached, running'}; skills {g.skills})")
         batch = BranchBatch(grafts=grafts, audits=audits, text="forked -> " + ", ".join(parts), txs=list(txs))
-        return batch, pairs, dict(zip(ids, names))
+        return batch, pairs, dict(zip(ids, names)), dict(zip(ids, (e.wake for e in entries)))

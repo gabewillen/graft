@@ -132,6 +132,40 @@ def test_a_current_branch_plain_reply_wakes_main_to_fork_a_second_stage(tmp_path
     assert [w["joined"] for w in h.wakes] == [[("c1", "done")], [("c2", "done")]]
 
 
+def test_current_wake_false_skips_wake_on_plain_reply_but_still_wakes_on_explicit_merge(tmp_path):
+    # 1. wake: false + plain reply + nothing else running -> merges quietly, 0 wake calls
+    quiet_site = dict(SITE, wake=False)
+    script = Script(entry=quiet_site, branch=lambda m: text("What pages should the site have?"))
+    qdir = tmp_path / "quiet"
+    qdir.mkdir()
+    store, h, _ = make(tmp_path=qdir, policy=script)
+    out = run(h=h, says=[REQUEST, "Home and contact."])
+    assert out[0] == ["What pages should the site have?"]
+    assert h.wakes == []
+    assert len(script.main_after_merge) == 1  # ran ONLY on the next user message, not on merge
+    assert script.main_after_merge[0][-1]["content"][-1]["text"].endswith("Home and contact.")
+    assert store.timeline("c1")["status"] == "joined" and validate(store.view("o"), "o") == []
+
+    # 2. wake: false + explicit merge(reason=...) -> STILL wakes main!
+    branch = lambda m: [{"type": "tool_use", "id": "m1", "name": "merge",
+                         "input": {"reason": "Also needs slides."}}]
+    script2 = Script(entry=quiet_site, branch=branch, after=lambda m: text("Starting slides."))
+    edir = tmp_path / "explicit"
+    edir.mkdir()
+    store2, h2, _ = make(tmp_path=edir, policy=script2)
+    out2 = run(h=h2, says=[REQUEST])
+    assert out2 == [["Starting slides."]]
+    assert len(script2.main_after_merge) == 1
+
+
+def test_wake_validation_rejects_non_bool_and_detached_wake():
+    from graft.harness import branch_entries
+    _, v_bad = branch_entries({"current": {"skills": ["website"], "messages": [1], "wake": "no"}})
+    assert any("wake must be a boolean" in x for x in v_bad), v_bad
+    _, v_det = branch_entries({"detached": [{"skills": ["website"], "messages": [1], "wake": False}]})
+    assert any("unknown field 'wake'" in x for x in v_det), v_det
+
+
 def test_the_next_message_goes_to_main_never_to_the_merged_branch(tmp_path):
     seen = []
 

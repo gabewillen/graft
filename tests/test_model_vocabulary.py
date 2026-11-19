@@ -136,7 +136,8 @@ def test_the_built_in_skills_and_tools_say_branch_and_merge():
     assert set(merge_tool["inputSchema"]["properties"]) == {"reason"} and merge_tool["inputSchema"]["required"] == []
     assert merge_tool["inputSchema"]["properties"]["reason"]["type"] == "string"  # its own words: no enum
     assert "enum" not in merge_tool["inputSchema"]["properties"]["reason"]
-    assert set(branch_tool["inputSchema"]["properties"]["current"]["properties"]) == {"id", "skills", "messages", "reason"}
+    assert set(branch_tool["inputSchema"]["properties"]["current"]["properties"]) == {"id", "skills", "messages", "reason", "wake"}
+    assert set(branch_tool["inputSchema"]["properties"]["detached"]["items"]["properties"]) == {"id", "skills", "messages", "reason"}
     # the first-person framing: a branch is you, and what you did there is your memory
     focus, background, original = (" ".join(t.split()) for t in (JOIN_INSTRUCTIONS, BACKGROUND_INSTRUCTIONS,
                                                                    BRANCH_INSTRUCTIONS))
@@ -395,7 +396,7 @@ from graft import compaction as compaction_mod, db as db_mod, harness as harness
 # added here, not missed.
 PRODUCERS = {
     harness_mod: ["merge_result", "SKIPPED_NOTE", "MERGED", "check_skill_link", "branch_entries", "_strings", "_messages", "cancel_ids",
-                  "fork_result", "Host.resolve_messages", "Host.message_index", "ENTRY_SHAPE",
+                  "fork_result", "Host.resolve_messages", "Host.message_index", "ENTRY_SHAPE", "CURRENT_ENTRY_SHAPE",
                   "Host.cancel_text", "Host.system", "Host.search", "Host._names", "Host._running_note",
                   "Host.merge_call", "Host.fit_join", "Host.default_join",
                   "Host.task_of", "Host._stop_call", "_entry", "NOT_A_DRAWN_ID", "NO_FREE_ID", "Host.prepare_branch", "Host.refuse_branch",
@@ -409,7 +410,7 @@ PRODUCERS = {
     compaction_mod: ["COMPACT_TOOL", "EXTRACT_INSTRUCTION", "WITHDRAWN_INDEX", "index_text", "extract_request",
                      "SUMMARY_HEADER", "COMPACT_INSTRUCTION", "summary_turn"],
     seeder_mod: ["NOUL_TRUE", "NOUL_FALSE", "reduced_state", "reduced_question", "jev_request"],
-    skills_mod: ["LOAD_SKILL_TOOL", "JOIN_TOOL", "CANCEL_TOOL", "SEARCH_TOOL", "MESSAGES", "REASON", "BRANCH_INSTRUCTIONS", "JOIN_INSTRUCTIONS",
+    skills_mod: ["LOAD_SKILL_TOOL", "JOIN_TOOL", "CANCEL_TOOL", "SEARCH_TOOL", "MESSAGES", "REASON", "WAKE", "BRANCH_INSTRUCTIONS", "JOIN_INSTRUCTIONS",
                  "BACKGROUND_INSTRUCTIONS", "SEARCH_INSTRUCTIONS", "load_skill", "skill_listing", "skill_instructions"],
 }
 # graft's own identifiers (store and transaction kinds, a graft's kind, its reason, the keys of the
