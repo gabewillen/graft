@@ -3233,7 +3233,12 @@ def _failing_requests(inst: TimelineSM, replies: list[asyncio.Future]) -> list[R
              *[w.request for w in inst.waiters], *inst.inbox]
     out: list[Request] = []
     for r in known:
-        if isinstance(r, Request) and not r.reply.done() and any(r.reply is x for x in replies) \
+        # unanswered, or failed by a handling of this fault that itself failed before keeping it
+        # as answered (`_drop_failed`): the record still owes the session its failure
+        if not isinstance(r, Request):
+            continue
+        open_ = not r.reply.done() or (_reply_error(r.reply) is not None and all(r is not k for k in inst.returned))
+        if open_ and any(r.reply is x for x in replies) \
                 and all(r is not o for o in out):
             out.append(r)
     return out
