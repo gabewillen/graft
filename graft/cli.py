@@ -48,6 +48,8 @@ async def _follow(agent: GraftAgent, stream, seen: set[str]) -> None:
                 _show(event.status_update.status.message, seen)
     except HarnessError:
         pass  # its line was printed as it was told
+    except a2a.A2AError as error:  # the agent closed before the task ended
+        print(f"(task not followed to its end: {error})", file=sys.stderr)
 
 
 async def chat(db_path: str, trace: bool) -> None:
@@ -78,19 +80,27 @@ async def chat(db_path: str, trace: bool) -> None:
                 continue
             stream = agent.stream(user_message(text))
             turn_over = False
-            async for event in stream:
-                if event.task is not None:
-                    seen |= {m.message_id for m in event.task.history if m.role == a2a.ROLE_AGENT}
-                    continue
-                _show(event.status_update.status.message, seen)
-                if event.status_update.status.state in a2a.INTERRUPTED:
-                    turn_over = True
-                    break
+            try:
+                async for event in stream:
+                    if event.task is not None:
+                        seen |= {m.message_id for m in event.task.history if m.role == a2a.ROLE_AGENT}
+                        continue
+                    _show(event.status_update.status.message, seen)
+                    if event.status_update.status.state in a2a.INTERRUPTED:
+                        turn_over = True
+                        break
+            except HarnessError:
+                continue  # its line was printed as it was told; the task has failed
+            except a2a.A2AError as error:
+                print(f"(not sent: {error})", file=sys.stderr)
+                continue
             if turn_over:
                 followers.append(asyncio.create_task(_follow(agent, stream, seen)))
         if any(not f.done() for f in followers):
             print("waiting for background branches to merge...", file=sys.stderr)
-        await asyncio.gather(*followers, return_exceptions=True)
+        for outcome in await asyncio.gather(*followers, return_exceptions=True):
+            if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                print(f"(a follower failed: {type(outcome).__name__}: {outcome})", file=sys.stderr)
     finally:
         # Also on Ctrl-C (the task is cancelled): running branches stop, open tasks fail.
         for f in followers:
