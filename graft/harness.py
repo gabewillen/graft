@@ -1,23 +1,23 @@
-"""The Graft harness: the state machines' host (graft/machine.py).
+"""The machines' host (graft/machine.py): internal. The host's interface is graft.agent.GraftAgent.
 
 1. Read a timeline's context view (validated).
 2. Resolve its tools through timeline_skills -> skill_tools.
 3. Call the model (in a daemon worker thread, so background grafts run concurrently).
 4. Insert the new turns once and append their pointers; each host tool call is made by the
-   timeline's machine, as the activity of its `calling` state (awaited if `execute` is async).
+   timeline's machine, as the activity of its `calling` state (awaited if the tool is async).
 
 Who decides what. The state machines decide everything that is coordination: what may happen,
 who waits, and in what order. A run of the model loop (`_loop`) is the activity of a machine
 state, so leaving that state is what ends it; a user message that arrives mid-run, a join that
-waits for its source, a cancel that waits for a graft to stop, `settle` and `close` are all
-events and states of the machines. The harness does only I/O for them: model calls, store reads
+waits for its source, a cancel that waits for a graft to stop, a host's wait for events and
+`close` are all events and states of the machines. The harness does only I/O for them: model calls, store reads
 and writes (the ones that belong to a machine step are made by that step's effect, through the
-host methods below), tool execution, emitting text, building prompts. It holds no lock, no task
+host methods below), tool execution, the event log's writes, building prompts. It holds no lock, no task
 of its own, and no future except a reply carried in an event's data, whose answer it never
 inspects. It never reads a machine: what it needs to know about a timeline (its kind, its
 source's grafts still running) comes in the host call the machine's activity makes, and whether a
 run may take its next step is the machine's answer to the run's `may_continue` request. A user's
-call is a request the original's machine owns (see `user_says`); a cancelled call withdraws it.
+message is a request the original's machine owns; a canceled task withdraws its requests.
 
 Clone is one call, `fork(current={id?, skills, messages, reason?}, detached=[{...}, ...])` as the
 model is told it, and one atomic batch, put to the original's machine as the model made it. The
@@ -1088,7 +1088,7 @@ class Host:
                 cancel = self._cancel_request(tl=tl, uses=cancels) if cancels else None
                 await self.clone_call(src=tl, use=clone_use, store=True, cancels=cancel)
                 if cancel is not None:
-                    await self._settle_cancel(tl=tl, uses=cancels, reply=cancel.reply)
+                    await self._cancel_answered(tl=tl, uses=cancels, reply=cancel.reply)
                 continue
             cancels = []
             # Each result is stored as soon as its call returns, so a later call of the same
@@ -1150,9 +1150,9 @@ class Host:
     async def _cancels(self, tl: str, uses: list[dict]) -> None:
         cancel = self._cancel_request(tl=tl, uses=uses)
         self.machines.post(tl=tl, name="cancel_request", data=cancel)  # the run's only await is the reply
-        await self._settle_cancel(tl=tl, uses=uses, reply=cancel.reply)
+        await self._cancel_answered(tl=tl, uses=uses, reply=cancel.reply)
 
-    async def _settle_cancel(self, tl: str, uses: list[dict], reply: asyncio.Future) -> None:
+    async def _cancel_answered(self, tl: str, uses: list[dict], reply: asyncio.Future) -> None:
         answer = await reply
         if isinstance(answer, str):  # refused whole: every id gets the reason; ours to store
             self.trace(f"[{tl}] cancel refused: {answer}")

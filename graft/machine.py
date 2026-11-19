@@ -38,10 +38,10 @@ Three rules hold everywhere in this module.
   handled again with its error added (`_handling_failed`; every handler is safe to run again)
   (spec: Internal faults). Fire-and-forget writes (the store copy of each state, report
   lines, trace) go to the scribe machine, which does them one at a time in its `writing` state.
-* Machines talk only by events. A caller outside the machines (`user_says`, `settle`, `close`, a
-  clone or cancel call made by a model loop) gets its answer from a future carried in the event's
-  data, which an effect resolves.
-* A user's call is a Request (id, text, reply) the original's machine owns from arrival until it
+* Machines talk only by events. A caller outside the machines (the host interface's `submit`,
+  `cancel_task` and `events_wait`, `close`, a clone or cancel call made by a model loop) gets its
+  answer from a future carried in the event's data, which an effect resolves.
+* A user's message is a Request (id, text, task, reply) the original's machine owns from arrival until it
   is answered or withdrawn, wherever it is (inbox, `requesting`, the request a run answers, the
   waiters, handed to a focus graft with the conversation). `withdraw` (by id) is handled in every
   state: recorded while the request is held, or answered and its call not done (a cancel after
@@ -148,15 +148,18 @@ cancelled)-->
 calls and its join reason; then each failure told, one per step, in `reporting`) --> `queued`
 --join commit | rollback--> `joined`, --join abandon--> `abandoned`.
 
-The session machine knows whether anything is in flight (the original or a running focus graft
-engaged, a background graft whose join has not reached it) and answers `settle` when nothing is;
-`close` is `shutdown`. It keeps the errors `settle` raises, each once, unless a user's call was in
-flight when the line telling it went out (the harness says when each call begins and is done,
-`call_began` and `call_done`): that call's output shows it. A timeline that recovers from a fault
-re-states its whole record (`resync`, a Record); a fault of the session's own steps fails the
-settles waiting and asks the original to (`restate`): suspended, the original passes the question
-on to its focus graft with its own record, and the graft re-states both in one event. At the end of `close` it stops every machine (`stopping`); one that cannot be
-stopped is reported (`telling`) and raised by `close`, and the rest are still stopped.
+The session machine owns the host's tasks and the event log (spec: Host Interface): it takes the
+host's messages (`submit`) and cancels (`cancel_task`), decides each task's state from what the
+timelines tell it (`answering`, `said`, `grafts_made`, `graft_received`, `rested`, `resync`,
+`report`), writes the events it decided as the activity of its `writing` state, makes its sends
+to the timelines one per step from its outbox (`sending`), and answers the consumers waiting for
+events (`events_wait`). `close` is `shutdown`. A timeline that recovers from a fault re-states its
+whole record (`resync`, a Record); a fault of the session's own steps (which change nothing: a
+step commits its data only at its end) fails the consumers waiting and asks the original to
+re-state (`restate`): suspended, the original passes the question on to its focus graft with its
+own record, and the graft re-states both in one event. At the end of `close` it stops every
+machine (`stopping`); one that cannot be stopped is reported (`telling`) and raised by `close`,
+and the rest are still stopped.
 
 Rules the graph enforces. Only the original clones, only in a turn or wake (every wake is a full run), never while
 closing, never for a request that was withdrawn, and never more than one focus graft per call.
@@ -250,7 +253,9 @@ class Prepared(NamedTuple):
 
 @dataclass(eq=False)
 class Request:
-    """One user's call (`user_says`): its id, its text, and the future that carries its answer.
+    """One user's message (a host's SendMessage): its id, its text, its task, and the future the
+    machine that answers it resolves (its answer marker: the answer reaches the host through the
+    session's `rested`).
     The original's machine holds it from arrival until it is answered or withdrawn, wherever it
     is (the inbox, the row being written, the run answering it, the waiters, a focus graft it was
     handed to), and, once answered, until its call is done (`call_done`: a cancel that lands
@@ -578,8 +583,8 @@ def _session(inst: TimelineSM, name: str, data: Any = None) -> None:
 
 def _note(inst, method: str, keep: BaseException | None = None, **args: Any) -> None:
     """A fire-and-forget write (store copy of a state, a report line, trace): the scribe calls the
-    host's `method` with `args`, by name. `keep`: an error the session keeps for `settle` once the
-    line is out (or failed to go out)."""
+    host's `method` with `args`, by name. `keep`: an error the write carries, told (a report line)
+    once the write is made."""
     _forward(target=inst.machines.scribe, name="note", data=((method, args), keep))
 
 
@@ -643,7 +648,7 @@ def _handling_failed(inst: hsm.Instance, event: hsm.Event, error: BaseException,
     get its error once. Past MAX_FAULT_RETRIES (a handler that raises every time) the raise is
     reported instead, and the fault's own callers get its error: a behavior that was re-stating
     its record sends that record, the error added to what the session keeps and shows; otherwise
-    it is reported, its one event, and kept for `settle` (the scribe's own goes to the session).
+    it is reported, its one event, as a harness error event (the scribe's own goes to the session).
     Lost only if that report cannot be sent either."""
     fault = inst.fault or (event.data if event.name in FAULTS else inst.handling) or Fault(event=event, errors=[])
     errors = list(fault.errors) + ([] if any(error is e for e in fault.errors) else [error])
@@ -1750,7 +1755,7 @@ def _closing_out(inst, event):
 
 
 def close_out_failed(ctx, inst, event) -> None:
-    """The kept close-out could not be written as the timeline closes: the user is told (settle
+    """The kept close-out could not be written as the timeline closes: the user is told (as a harness error event
     raises it), and it closes."""
     _report(inst=inst, kind="task", clones=[], error=event.data)
 
@@ -1911,7 +1916,6 @@ def _drop_dead(inst: TimelineSM) -> None:
 
 def take_message(ctx, inst, event) -> None:
     inst.request, inst.recoveries = event.data, 0
-    _session(inst=inst, name="engaged", data=inst.timeline_id)
 
 
 def drop_message(ctx, inst, event) -> None:
@@ -1971,7 +1975,6 @@ def stash_message(ctx, inst, event) -> None:
 def stash_and_engage(ctx, inst, event) -> None:
     inst.inbox.append(event.data)
     inst.recoveries = 0
-    _session(inst=inst, name="engaged", data=inst.timeline_id)
 
 
 def note_withdrawn(ctx, inst, event) -> None:
@@ -2030,7 +2033,7 @@ def note_late_withdrawal(ctx, inst, event) -> None:
     rest (`stop_one`) and join `cancelled`, and their joins wake nothing. Its row
     gets the withdrawal mark (a write of the scribe's) in the views it was asked in; an error it
     was answered with, which its caller never took, is told after that write (one line, which the
-    next call's output shows, or else `settle` raises)."""
+    the session tells as a harness error event)."""
     request, = _late(inst=inst, rid=event.data)
     inst.withdrawn.add(request.id)
     _note(inst=inst, method="mark_withdrawn", keep=_reply_error(request.reply), timelines=_viewers(inst),
@@ -2178,26 +2181,22 @@ def take_handed_and_begin(ctx, inst, event) -> None:
     take_handed(ctx=ctx, inst=inst, event=event)
     _drop_dead(inst)
     inst.request = inst.inbox.pop(HEAD)
-    _session(inst=inst, name="engaged", data=inst.timeline_id)
 
 
 def take_handed_and_engage(ctx, inst, event) -> None:
     """Handed messages reach it at rest with joins queued: the joins are applied first."""
     take_handed(ctx=ctx, inst=inst, event=event)
-    _session(inst=inst, name="engaged", data=inst.timeline_id)
 
 
 def begin_run(ctx, inst, event) -> None:
     mode, reply = event.data
     inst.mode, inst.answering, inst.recoveries = mode, None, 0
     inst.waiters.append(Waiter(reply=reply, user=False))
-    _session(inst=inst, name="engaged", data=inst.timeline_id)
 
 
 def begin_driven(ctx, inst, event) -> None:
     mode, reply = event.data
     inst.mode, inst.answering, inst.recoveries = mode, None, 0
-    _session(inst=inst, name="engaged", data=inst.timeline_id)
     _resolve(reply=reply, value="started")
 
 
@@ -2278,7 +2277,7 @@ def end_driven(ctx, inst, event) -> None:
 
 
 def unprepare_failed(ctx, inst, event) -> None:
-    """Rolling the cut-short call back failed: the user is told, and settle raises it. The rollback
+    """Rolling the cut-short call back failed: the user is told (a harness error event). The rollback
     is kept, and written before anything next writes to the view (`_close_out`)."""
     inst.close_out = [*inst.close_out, _close_out_of(inst)]
     _report(inst=inst, kind="task", clones=[], error=event.data)
@@ -2682,7 +2681,6 @@ def hand_over(ctx, inst, event) -> None:
     _prune(inst)
     if clone is not None:
         _resolve(reply=clone.reply, value=([g for g, _ in clone.pairs], inst.focus, inst.clone_text))
-    _session(inst=inst, name="suspended", data=inst.timeline_id)
 
 
 def clone_done(ctx, inst, event) -> None:
@@ -2772,17 +2770,15 @@ def enqueue(ctx, inst, event) -> None:
 
 
 def engage(ctx, inst, event) -> None:
-    _session(inst=inst, name="engaged", data=inst.timeline_id)
+    return None
 
 
 def engage_with_waiter(ctx, inst, event) -> None:
     add_run_waiter(ctx=ctx, inst=inst, event=event)
-    _session(inst=inst, name="engaged", data=inst.timeline_id)
 
 
 def close_and_engage(ctx, inst, event) -> None:
     inst.closing = inst.final = True
-    _session(inst=inst, name="engaged", data=inst.timeline_id)
 
 
 def focus_back(ctx, inst, event) -> None:
@@ -2793,7 +2789,6 @@ def focus_back(ctx, inst, event) -> None:
     done (a late cancel of one is withdrawn here)."""
     focus = inst.focus
     _take_focus_join(inst=inst, handed=event.data)
-    _session(inst=inst, name="handed", data=(focus, inst.timeline_id))
 
 
 def _take_focus_join(inst: TimelineSM, handed: tuple) -> None:
@@ -2987,7 +2982,7 @@ def join_raised(ctx, inst, event) -> None:
 
 def close_abandoned(ctx, inst, event) -> None:
     """Its join was given up, so the close-out it carried (`unclosed`) will not be written with it:
-    the scribe writes it into its own timeline (a write that fails is told and kept for settle)."""
+    the scribe writes it into its own timeline (a write that fails is told, as an event)."""
     if inst.unclosed is not None:
         _note(inst=inst, method="close_tool_uses", tl=inst.timeline_id, known=dict(inst.unclosed))
 
@@ -3116,7 +3111,7 @@ def recover_call(ctx, inst, event) -> None:
 
 def _caller_of(event: hsm.Event | None) -> list[asyncio.Future]:
     """The replies the event whose step failed carries: a caller outside the machines waits on
-    each (a user's call, a settle, a run's clone or cancel request or its `may_continue`), so
+    each (a host's message or wait, a run's clone or cancel request or its `may_continue`), so
     each is that caller's to be given the error. Read from the payload, whatever the event: a
     clone request carries its own reply and that of the cancel calls it brought."""
     if event is None:
@@ -3523,7 +3518,7 @@ def bg_take_end_fault(ctx, inst, event) -> None:
 
 
 def bg_tell_end_fault(ctx, inst, event) -> None:
-    """Its errors are told (one line, kept for settle)."""
+    """Its errors are told (one harness error event)."""
     errors, inst.unreported = [e for _, _, e, _ in inst.unreported], []
     if errors:
         error = errors[HEAD] if len(errors) == 1 else BaseExceptionGroup("a step failed", errors)
@@ -4856,7 +4851,7 @@ SESSION = hsm.Define(
         # while sending or writing, an event only changes the session's data: the choice after the
         # send or the write picks up what it added
         _T(_On(*TAKEN), Effect(s_take)),
-        _T(_On("engaged", "suspended", "handed", "sent", "written", "write_failed"), Effect(s_ignore)),
+        _T(_On("sent", "written", "write_failed"), Effect(s_ignore)),
         _T(_On(FAULT), Effect(s_fault)),
         hsm.State(
             "ready",
@@ -4967,8 +4962,8 @@ class Machines:
         then sets off fails only as an activity (handled by the graph's `hsm/error` transitions)
         or as a guard, effect, entry or exit, which is a fault the machine recovers from
         (`_step`): the caller waiting on the event's reply gets the error, whichever task
-        processes the event; a fault no caller waits on (a withdrawal's) is told and kept for
-        `settle`."""
+        processes the event; a fault no caller waits on (a withdrawal's) is told as a harness
+        error event."""
         hsm.Dispatch(None, self._target(tl=tl, name=name), hsm.Event(name=name, data=data))
 
     async def ask(self, tl: str, name: str, build: Callable[[asyncio.Future], Any]) -> Any:

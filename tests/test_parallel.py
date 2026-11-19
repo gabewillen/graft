@@ -85,7 +85,7 @@ class Script:
         return self.graft(skill, messages)
 
 
-def make(tmp_path, policy, **kw):
+def make(*, tmp_path, policy, **kw):
     store = Store(str(tmp_path / "p.db"))
     install_fake(store)
     h = conversation(store, policy, seeder=None, **kw).h
@@ -166,7 +166,7 @@ def test_branch_ids_are_checked_and_the_same_skills_twice_need_ids():
 
 
 def test_refused_batch_is_atomic(tmp_path):
-    store, h, _ = make(tmp_path, lambda *a: text("ok"))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("ok"))
 
     async def go():
         await chat_of(h).start()
@@ -196,7 +196,7 @@ def test_refused_batch_is_atomic(tmp_path):
 
 
 def test_background_and_join_are_not_selectable_skills(tmp_path):
-    store, h, _ = make(tmp_path, lambda *a: text("ok"))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("ok"))
 
     async def go():
         await chat_of(h).start()
@@ -211,7 +211,7 @@ def test_background_and_join_are_not_selectable_skills(tmp_path):
 # ------------------------------------------------------------------ background grafts end to end
 def test_source_keeps_the_conversation_and_is_woken_when_grafts_join(tmp_path):
     script = Script([clone_entry(skills=["website"], focus=False), clone_entry(skills=["slides"], focus=False)])
-    store, h, said = make(tmp_path, script)
+    store, h, said = make(tmp_path=tmp_path, policy=script)
 
     async def go():
         await chat_of(h).start()
@@ -249,7 +249,7 @@ def test_joins_wait_for_the_source_to_be_at_rest_and_one_wake_covers_them(tmp_pa
     script = Script([clone_entry(skills=["website"], focus=False), clone_entry(skills=["slides"], focus=False)])
     script.root_gate_on_reply = True  # the source is mid-turn until the gate opens
     script.open("website", "slides")
-    store, h, _ = make(tmp_path, script)
+    store, h, _ = make(tmp_path=tmp_path, policy=script)
 
     async def go():
         await chat_of(h).start()
@@ -280,7 +280,7 @@ def test_joins_wait_for_the_source_to_be_at_rest_and_one_wake_covers_them(tmp_pa
 
 
 def test_queued_joins_commit_before_the_next_user_message_without_a_wake(tmp_path):
-    store, h, _ = make(tmp_path, lambda *a: text("Noted."))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("Noted."))
 
     async def go():
         await chat_of(h).start()
@@ -310,7 +310,7 @@ def test_queued_joins_commit_before_the_next_user_message_without_a_wake(tmp_pat
 
 
 def test_background_joins_commit_before_a_focus_join_so_its_trigger_stays_last(tmp_path):
-    store, h, _ = make(tmp_path, lambda *a: text("Routing that."))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("Routing that."))
 
     async def go():
         await chat_of(h).start()
@@ -340,7 +340,7 @@ def test_background_joins_commit_before_a_focus_join_so_its_trigger_stays_last(t
 
 
 def test_focus_done_with_queued_background_joins_wakes_the_source_once(tmp_path):
-    store, h, _ = make(tmp_path, lambda *a: text("Both are finished."))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("Both are finished."))
 
     async def go():
         await chat_of(h).start()
@@ -369,7 +369,7 @@ def test_background_step_budget_and_empty_response_join_failed(tmp_path):
 
     script = Script(entries=[clone_entry(skills=["website"], focus=False), clone_entry(skills=["slides"], focus=False)], graft=graft)
     script.open()
-    store, h, _ = make(tmp_path, script, max_steps=3)
+    store, h, _ = make(tmp_path=tmp_path, policy=script, max_steps=3)
 
     async def go():
         await chat_of(h).start()
@@ -395,7 +395,7 @@ def test_background_mechanical_error_joins_failed(tmp_path):
 
     script = Script(entries=[clone_entry(skills=["website"], focus=False)], graft=graft)
     script.open()
-    store, h, _ = make(tmp_path, script)
+    store, h, _ = make(tmp_path=tmp_path, policy=script)
 
     async def go():
         await chat_of(h).start()
@@ -414,7 +414,7 @@ def test_a_background_merge_without_a_result_is_accepted_and_merges(tmp_path):
     steps = iter([[{"type": "tool_use", "id": "j1", "name": "merge", "input": {}}]])
     script = Script(entries=[clone_entry(skills=["website"], focus=False)], graft=lambda skill, messages: next(steps))
     script.open()
-    store, h, _ = make(tmp_path, script)
+    store, h, _ = make(tmp_path=tmp_path, policy=script)
 
     async def go():
         await chat_of(h).start()
@@ -479,7 +479,7 @@ def test_a_failed_wake_is_visible_when_it_happens_and_still_raises_at_settle(tmp
             return text("It joined.")
         return script(system, messages, tools)
 
-    store, h, said = make(tmp_path, policy)
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await chat_of(h).start()
@@ -519,7 +519,7 @@ def test_a_done_join_wakes_a_full_run_that_clones_the_next_task(tmp_path):
             return text("The deck is done too.")
         return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
-    store, h, said = make(tmp_path, policy)
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await chat_of(h).start()
@@ -554,7 +554,7 @@ def test_a_failed_join_wakes_a_full_run_that_clones_another_part(tmp_path):
             return text("The deck is done.")
         return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
-    store, h, _ = make(tmp_path, policy)
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await chat_of(h).start()
@@ -588,7 +588,7 @@ def test_a_focus_hand_back_wakes_a_full_run_that_clones_another_part(tmp_path):
             return text("The deck is done.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id="k1") | {"type": "tool_use"}]
 
-    store, h, _ = make(tmp_path, policy)
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await chat_of(h).start()
@@ -641,7 +641,7 @@ def test_a_focus_graft_seeded_with_a_multi_part_message_does_its_part(tmp_path):
                               id="k1") | {"type": "tool_use"}]
         return [] if woke(last) else text("Okay.")
 
-    store, h, _ = make(tmp_path, policy)
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await chat_of(h).start()
@@ -679,7 +679,7 @@ def test_pivot_policy_website_graft_keeps_a_multi_part_seed(tmp_path):
 
 # ------------------------------------------------------------------ notes name the grafts still running
 def test_merge_results_name_the_grafts_still_running(tmp_path):
-    store, h, _ = make(tmp_path, lambda *a: text("Reporting."))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("Reporting."))
 
     async def go():
         await chat_of(h).start()
@@ -718,7 +718,7 @@ def test_focus_merge_result_names_live_background_grafts(tmp_path):
                            if merged(b)]
         return text("Routing that.")
 
-    store, h, _ = make(tmp_path, policy)
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await chat_of(h).start()
@@ -781,7 +781,7 @@ def test_a_failed_wake_at_the_end_of_a_user_turn_still_returns_the_turn(tmp_path
             raise ValueError("wake exploded")
         return script(system, messages, tools)
 
-    store, h, said = make(tmp_path, policy)
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await chat_of(h).start()
@@ -810,7 +810,7 @@ def test_settle_raises_every_failed_background_task(tmp_path):
             raise ValueError(f"wake exploded {len(exploded)}")
         return script(system, messages, tools)
 
-    store, h, _ = make(tmp_path, policy)
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await chat_of(h).start()
@@ -830,7 +830,7 @@ def test_settle_raises_every_failed_background_task(tmp_path):
 
 
 def test_a_merge_result_does_not_point_at_rows_the_size_backstop_dropped(tmp_path):
-    store, h, _ = make(tmp_path, lambda *a: text("Reporting."), window_tokens=120)
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("Reporting."), window_tokens=120)
 
     async def go():
         await chat_of(h).start()
@@ -869,7 +869,7 @@ def test_clone_entries_validates_model_written_fields_and_keeps_raw_indexes():
 def test_clone_call_refuses_bad_entries_by_raw_index_and_bounds_no_live_detached_branches(tmp_path):
     """Bad entries are refused by their index; any number of detached branches may be live at once
     (the harness has no cap: a host bounds how much an agent forks)."""
-    store, h, _ = make(tmp_path, lambda *a: text("ok"))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("ok"))
 
     async def go():
         await chat_of(h).start()
@@ -892,7 +892,7 @@ def test_clone_call_refuses_bad_entries_by_raw_index_and_bounds_no_live_detached
 
 def test_a_failed_commit_of_the_clone_batch_is_a_refusal(tmp_path, monkeypatch):
     import sqlite3
-    store, h, _ = make(tmp_path, lambda *a: text("ok"))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("ok"))
 
     async def go():
         await chat_of(h).start()
@@ -933,7 +933,7 @@ async def drain(h):
 
 
 def test_a_queued_commit_that_raises_is_reported_kept_and_retried(tmp_path, monkeypatch):
-    store, h, said = make(tmp_path, lambda *a: text("Reporting."))
+    store, h, said = make(tmp_path=tmp_path, policy=lambda *a: text("Reporting."))
 
     async def go():
         c1, c2 = await _two_queued(store, h)
@@ -964,7 +964,7 @@ def test_a_queued_commit_that_raises_is_reported_kept_and_retried(tmp_path, monk
 
 
 def test_a_rolled_back_queued_join_ends_its_graft_joined_and_the_queue_moves_on(tmp_path, monkeypatch):
-    store, h, _ = make(tmp_path, lambda *a: text("Reporting."))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("Reporting."))
 
     async def go():
         c1, c2 = await _two_queued(store, h)
@@ -990,7 +990,7 @@ def _wake_raises(system, messages, tools):
 
 
 def test_a_failed_wake_from_settle_is_shown_and_raised(tmp_path):
-    store, h, said = make(tmp_path, _wake_raises)
+    store, h, said = make(tmp_path=tmp_path, policy=_wake_raises)
 
     async def go():
         c1, c2 = await _two_queued(store, h)
@@ -1007,7 +1007,7 @@ def test_a_failed_wake_from_settle_is_shown_and_raised(tmp_path):
 
 
 def test_a_failed_wake_after_a_focus_done_join_is_contained(tmp_path):
-    store, h, said = make(tmp_path, _wake_raises)
+    store, h, said = make(tmp_path=tmp_path, policy=_wake_raises)
 
     async def go():
         await chat_of(h).start()
@@ -1028,7 +1028,7 @@ def test_a_failed_wake_after_a_focus_done_join_is_contained(tmp_path):
 
 def test_close_cancels_running_background_grafts_and_joins_them_failed(tmp_path):
     script = Script([clone_entry(skills=["website"], focus=False), clone_entry(skills=["slides"], focus=False)])  # gates closed: both hang
-    store, h, _ = make(tmp_path, script)
+    store, h, _ = make(tmp_path=tmp_path, policy=script)
 
     async def go():
         await chat_of(h).start()
@@ -1199,7 +1199,7 @@ def test_chat_end_of_input_exits_cleanly(tmp_path, monkeypatch):
 
 # ------------------------------------------------------------------ per-part blocks, atomic commits, the experiment
 def test_a_join_is_one_sql_transaction(tmp_path, monkeypatch):
-    store, h, _ = make(tmp_path, lambda *a: text("Reporting."))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("Reporting."))
 
     async def go():
         await chat_of(h).start()
@@ -1244,7 +1244,7 @@ def test_a_join_is_one_sql_transaction(tmp_path, monkeypatch):
 @pytest.mark.parametrize("focus", [True, False])
 def test_a_machine_failure_in_a_clone_call_leaves_no_graft_anywhere(tmp_path, monkeypatch, focus):
     from graft.machine import TransitionRefused
-    store, h, _ = make(tmp_path, lambda *a: text("ok"))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("ok"))
 
     async def go():
         await chat_of(h).start()
@@ -1348,7 +1348,7 @@ def test_a_graft_starts_from_the_conversation_and_never_from_rows_the_source_doe
     """The seed is the source's conversation (its text rows through the last user message): never a
     running sibling's rows, never tool calls or their output, never a harness note. Once a sibling
     has merged, its text rows are the source's own memory and the next graft starts with them."""
-    store, h, _ = make(tmp_path, lambda *a: text("ok"))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("ok"))
 
     async def go():
         await chat_of(h).start()
@@ -1394,7 +1394,7 @@ def _focus_script(reply="Routing that."):
 
 
 def test_a_focus_join_whose_commit_raises_is_reported_kept_and_retried(tmp_path, monkeypatch):
-    store, h, said = make(tmp_path, _focus_script())
+    store, h, said = make(tmp_path=tmp_path, policy=_focus_script())
 
     async def go():
         await chat_of(h).start()
@@ -1424,7 +1424,7 @@ def test_a_focus_join_whose_commit_raises_is_reported_kept_and_retried(tmp_path,
 
 def test_a_refused_join_leaves_the_store_untouched(tmp_path):
     from graft.machine import TransitionRefused
-    store, h, _ = make(tmp_path, lambda *a: text("Reporting."))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("Reporting."))
 
     async def go():
         await chat_of(h).start()
@@ -1464,7 +1464,7 @@ def test_a_focus_graft_whose_run_raises_joins_failed_without_the_model(tmp_path)
             return text("Sorry, I could not build that.")
         return [clone_use(clone_entry(skills=["website"], focus=True), id="k1") | {"type": "tool_use"}]
 
-    store, h, _ = make(tmp_path, policy)
+    store, h, _ = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await chat_of(h).start()
@@ -1480,7 +1480,7 @@ def test_a_focus_graft_whose_run_raises_joins_failed_without_the_model(tmp_path)
 
 
 def test_close_joins_failed_a_background_graft_that_never_started(tmp_path):
-    store, h, _ = make(tmp_path, lambda *a: text("never called"))
+    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("never called"))
 
     async def go():
         await chat_of(h).start()
@@ -1497,7 +1497,7 @@ def test_close_joins_failed_a_background_graft_that_never_started(tmp_path):
 
 def test_close_gives_a_graft_whose_join_cannot_be_raised_a_terminal_state(tmp_path, monkeypatch):
     script = Script([clone_entry(skills=["website"], focus=False)])
-    store, h, said = make(tmp_path, script)
+    store, h, said = make(tmp_path=tmp_path, policy=script)
 
     async def go():
         await chat_of(h).start()
@@ -1613,7 +1613,7 @@ def _fails_after_speaking(raises):
 
 @pytest.mark.parametrize("raises", [True, False], ids=["its run raises", "its step budget runs out"])
 def test_a_focus_graft_that_fails_after_speaking_still_gets_the_user_an_answer(tmp_path, raises):
-    store, h, _ = make(tmp_path, _fails_after_speaking(raises), max_steps=3)
+    store, h, _ = make(tmp_path=tmp_path, policy=_fails_after_speaking(raises), max_steps=3)
 
     async def go():
         await chat_of(h).start()
@@ -1645,7 +1645,7 @@ def _once(real, when, error):
 
 
 def test_a_store_error_while_a_focus_graft_joins_does_not_strand_the_source(tmp_path, monkeypatch):
-    store, h, said = make(tmp_path, _focus_script())
+    store, h, said = make(tmp_path=tmp_path, policy=_focus_script())
 
     async def go():
         await chat_of(h).start()
@@ -1665,7 +1665,7 @@ def test_a_store_error_while_a_focus_graft_joins_does_not_strand_the_source(tmp_
 
 
 def test_a_store_error_right_after_a_drain_begins_does_not_strand_the_source(tmp_path, monkeypatch):
-    store, h, said = make(tmp_path, lambda *a: text("Reporting."))
+    store, h, said = make(tmp_path=tmp_path, policy=lambda *a: text("Reporting."))
 
     async def go():
         c1, c2 = await _two_queued(store, h)
@@ -1682,7 +1682,7 @@ def test_a_store_error_right_after_a_drain_begins_does_not_strand_the_source(tmp
 
 
 def test_a_store_error_right_after_a_wake_begins_does_not_strand_the_source(tmp_path, monkeypatch):
-    store, h, said = make(tmp_path, lambda *a: text("Reporting."))
+    store, h, said = make(tmp_path=tmp_path, policy=lambda *a: text("Reporting."))
 
     async def go():
         c1, c2 = await _two_queued(store, h)
@@ -1748,7 +1748,7 @@ def test_a_cancelled_turn_leaves_a_valid_view_and_no_open_transaction(tmp_path):
 
 def test_do_join_stops_a_running_background_graft_before_it_freezes_it(tmp_path):
     script = Script([clone_entry(skills=["website"], focus=False)])  # the graft's model call hangs on its gate
-    store, h, _ = make(tmp_path, script)
+    store, h, _ = make(tmp_path=tmp_path, policy=script)
 
     async def go():
         await chat_of(h).start()
@@ -1783,7 +1783,7 @@ def test_a_model_call_that_never_returns_times_out_and_the_graft_joins_failed(tm
             return text("Started.")
         return [clone_use(clone_entry(skills=["website"], focus=focus), id="k1") | {"type": "tool_use"}]
 
-    store, h, _ = make(tmp_path, policy, call_timeout=0.1)
+    store, h, _ = make(tmp_path=tmp_path, policy=policy, call_timeout=0.1)
 
     async def go():
         await chat_of(h).start()
@@ -1809,7 +1809,7 @@ def test_the_call_timeout_is_configurable_and_can_be_disabled(tmp_path):
 
 def test_a_join_that_can_never_be_applied_is_abandoned_and_the_queue_moves_on(tmp_path, monkeypatch):
     from graft.machine import MAX_JOIN_ATTEMPTS
-    store, h, said = make(tmp_path, lambda *a: text("Reporting."))
+    store, h, said = make(tmp_path=tmp_path, policy=lambda *a: text("Reporting."))
 
     async def go():
         c1, c2 = await _two_queued(store, h)
@@ -5310,13 +5310,8 @@ class FaultScript:
 FAULT_ROWS = [
     # the sends that keep the session's record, each at the step that sends it first (or, `#n`,
     # the nth time it is sent)
-    ("engaged", ["plain"], "raises", "injected"),  # taking the message
-    ("engaged#2", [BG], "told", "injected"),  # the graft's join wakes the idle original
     ("rested", ["plain"], "told", "injected"),
     ("root_closed", ["plain", "close"], "told", "injected"),
-    ("handed", [FOCUS], "told", "injected"),  # the focus graft's answer had reached its caller
-    ("suspended", [FOCUS], "told", "injected"),
-    ("suspended while the focus graft stays", [STAY], "told", "injected"),
     ("grafts_made", [BG], "raises", "injected"),
     ("graft_received", [BG], "told", "injected"),
     # the clone rules, worked out by the step before each gate
@@ -5356,7 +5351,7 @@ FAULT_ROWS = [
     ("no_cancels", [BG], "raises", "decision"),  # a clone call's own step: its reply gets the error
     # the session's own steps
 ]
-SENDS = {"engaged", "rested", "root_closed", "handed", "suspended", "grafts_made", "graft_received"}
+SENDS = {"rested", "root_closed", "grafts_made", "graft_received", "answering"}
 # rows whose failed step lets work it did not gate go on (a graft already started, a focus graft's run,
 # a cancelled graft's join reported by a wake)
 GOES_ON = {"grafts_made", "stash_message at a focus graft", "cancels_only", "cancel_landed", "spawned"}
@@ -5451,7 +5446,7 @@ def test_a_fault_in_a_step_is_recovered_from_and_nothing_it_gated_acts(tmp_path,
             faults.armed.set()
             await call(chat_of(h).say(STOP))
         else:
-            if name in ("engaged", "graft_received", "own_graft", "made_for_live", "is_held") \
+            if name in ("graft_received", "own_graft", "made_for_live", "is_held") \
                     or first in (FOCUS, STAY):
                 script.open()
             await call(chat_of(h).say(first))
@@ -5608,8 +5603,8 @@ def test_one_failure_read_by_every_guard_of_a_message_is_reported_once(tmp_path,
     assert len(said_errors(said)) == 1  # reported once
 
 
-RECURRING = [("rested", "plain"), ("engaged", "plain"), ("take_message", "plain"), ("suspended", STAY), ("root_closed", "plain"),
-             ("engaged", BG), ("_prune", "plain"), ("_prune", STAY), ("_record_of", "plain"), ("_live", "plain"),
+RECURRING = [("rested", "plain"), ("answering", "plain"), ("take_message", "plain"), ("root_closed", "plain"),
+             ("_prune", "plain"), ("_prune", STAY), ("_record_of", "plain"), ("_live", "plain"),
              ("_answer_dead", "plain"), ("_still_running", BG)]
 
 
