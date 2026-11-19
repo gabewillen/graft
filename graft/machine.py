@@ -516,7 +516,6 @@ class SessionSM(hsm.Instance):
         self.root_closed = False
         self.scribe_flushed = False  # closing: the scribe wrote every note sent before the session's last
         self.closers: list[asyncio.Future] = []
-        self.lost: list[BaseException] = []  # errors the scribe could not word or write, for the next wait
         self.blocked = False  # writes failed MAX_WRITE_ATTEMPTS times: tried again at the next event
         self.attempts = NONE_YET
         self.write_error: BaseException | None = None
@@ -2419,9 +2418,11 @@ def come_to_rest(ctx, inst, event) -> None:
             _fail(reply=w.reply, error=w.error)
         else:
             _resolve(reply=w.reply, value="ended")
-    inst.waiters = [w for w in inst.waiters if all(w is not a for a in waiters)]
     _returned(inst=inst, requests=[w.request for w in waiters
                                    if w.request is not None and not _withdrawn(inst=inst, request=w.request)])
+    # they leave the data only once kept as answered: a step that fails before leaves them for the
+    # recovery's rest, which keeps them then
+    inst.waiters = [w for w in inst.waiters if all(w is not a for a in waiters)]
     _drop_dead(inst)
     inst.answering, inst.woken_for, inst.in_turn = None, [], False
     _prune(inst)
@@ -4297,7 +4298,6 @@ CLOSED_TEXT = "the agent was closed before this request finished"
 # of the machines, and the machines nothing of the interface)
 a2a_SUBMITTED, a2a_WORKING, a2a_INPUT_REQUIRED = "TASK_STATE_SUBMITTED", "TASK_STATE_WORKING", "TASK_STATE_INPUT_REQUIRED"
 a2a_COMPLETED, a2a_FAILED, a2a_CANCELED = "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"
-MAX_LOST = 32  # errors kept for the next consumers' waits (no consumer was waiting): bounded, the newest beyond are dropped
 # Times a batch of events is written again before the session waits for its next event to try once
 # more: a store that keeps failing never keeps the session writing.
 MAX_WRITE_ATTEMPTS = 3
@@ -4370,7 +4370,6 @@ class _Draft:
         self.root_told, self.root_closed = inst.root_told, inst.root_closed
         self.scribe_flushed = inst.scribe_flushed
         self.closers = list(inst.closers)
-        self.lost = list(inst.lost)
         self.answers: list[tuple[asyncio.Future, Any]] = []  # replies answered once the step commits
         self.failures: list[tuple[asyncio.Future, BaseException]] = []
 
@@ -4382,7 +4381,7 @@ class _Draft:
         inst.waits = [(c, r) for c, r in self.waits if not r.done()]
         inst.root_told, inst.root_closed = self.root_told, self.root_closed
         inst.scribe_flushed = self.scribe_flushed
-        inst.closers, inst.lost = self.closers, self.lost
+        inst.closers = self.closers
         inst.blocked = False  # a new event: a write that failed may be tried again
         for reply, value in self.answers:
             _resolve(reply=reply, value=value)
@@ -4528,12 +4527,6 @@ def h_answer_wait(draft: _Draft, event) -> None:
     draft.answers.append((event.data[1], (draft.inst.written, False)))
 
 
-def h_fail_wait(draft: _Draft, event) -> None:
-    """An error the scribe could not word or write: the next consumer's wait raises it."""
-    draft.failures.append((event.data[1], draft.lost[HEAD]))
-    draft.lost = draft.lost[1:]
-
-
 def h_keep_wait(draft: _Draft, event) -> None:
     draft.waits.append(event.data)
 
@@ -4662,14 +4655,13 @@ def h_report(draft: _Draft, event) -> None:
 
 
 def h_failure(draft: _Draft, event) -> None:
-    """Errors the scribe could not word or write: every consumer waiting gets them (`HarnessError`
-    at the interface); with none waiting, they are kept for the next wait (each once)."""
-    errors = [e for e in event.data if all(e is not k for k in draft.lost)]
-    waiting = [r for _, r in draft.waits if not r.done()]
-    if waiting and errors:
-        draft.failures += [(r, errors[HEAD]) for r in waiting]
-        draft.waits, errors = [], errors[1:]
-    draft.lost += errors[:MAX_LOST - len(draft.lost)]
+    """Errors the scribe could not word or write: the session words each itself and tells it, an
+    event in the log like any harness error (each once: the same error object twice is one line)."""
+    seen: list[BaseException] = []
+    for error in event.data:
+        if all(error is not k for k in seen):
+            seen.append(error)
+            draft.tell(line=f"(harness error: {described(error)})")
 
 
 # ---- closing
@@ -4717,7 +4709,6 @@ s_refuse_not_found = _session_effect(_refusal("not_found"), "s_refuse_not_found"
 s_refuse_closing = _session_effect(_refusal("closing"), "s_refuse_closing")
 s_cancel = _session_effect(h_cancel, "s_cancel")
 s_answer_wait = _session_effect(h_answer_wait, "s_answer_wait")
-s_fail_wait = _session_effect(h_fail_wait, "s_fail_wait")
 s_keep_wait = _session_effect(h_keep_wait, "s_keep_wait")
 s_said = _session_effect(h_said, "s_said")
 s_answering = _session_effect(h_answering, "s_answering")
@@ -4768,8 +4759,6 @@ def log_past(ctx, inst, event) -> bool:
     return inst.written > event.data[0]
 
 
-def lost_kept(ctx, inst, event) -> bool:
-    return inst.written <= event.data[0] and bool(inst.lost)
 
 
 def rested_root(ctx, inst, event) -> bool:
@@ -4852,12 +4841,12 @@ def s_written(ctx, inst, event) -> None:
     due = [send for s, send in inst.after_write if s <= written]
     after = [(s, send) for s, send in inst.after_write if s > written]
     passed = [r for c, r in inst.waits if c < written]
+    for reply in passed:  # answered first: a raise here leaves the data as it was (the fault fails the rest)
+        _resolve(reply=reply, value=(written, False))
     inst.written, inst.pending, inst.after_write = written, pending, after
     inst.outbox = inst.outbox + due
     inst.waits = [(c, r) for c, r in inst.waits if c >= written and not r.done()]
     inst.attempts = NONE_YET
-    for reply in passed:
-        _resolve(reply=reply, value=(written, False))
 
 
 def s_write_failed(ctx, inst, event) -> None:
@@ -4866,12 +4855,12 @@ def s_write_failed(ctx, inst, event) -> None:
     error = event.data
     waiting = [r for _, r in inst.waits]
     attempts = inst.attempts + 1
+    for reply in waiting:  # failed first: a raise here leaves the data as it was
+        _fail(reply=reply, error=error)
     inst.waits = []
     inst.attempts = attempts if attempts < MAX_WRITE_ATTEMPTS else NONE_YET
     inst.blocked = attempts >= MAX_WRITE_ATTEMPTS
     inst.write_error = error
-    for reply in waiting:
-        _fail(reply=reply, error=error)
 
 
 def s_fault(ctx, inst, event) -> None:
@@ -4993,24 +4982,27 @@ def s_ignore(ctx, inst, event) -> None:
 def _writer(flush: tuple, takes: tuple) -> list:
     """The session's working part, under `open` and under `closing` alike: `ready`, the choice
     `flush` every step ends in (`flush`: its branches, the first one sending, the last the default to
-    `ready`), `sending` (ticks once on entry, back to `flush`) and `writing` (the activity that
+    `ready`), `sending` (ticks once on entry, back to `flush`; a fault there, whose step sent no
+    tick, goes back to `flush` too) and `writing` (the activity that
     appends what was decided). `takes`: the transitions of each event the session takes, as
     (event, [(guard or None, effect)]); while sending or writing they only change the data (internal
     on the composite, which the effect's draft commits), and from `ready` they end in `flush`."""
     T, S, On = _T, _S, _On
-    at_ready, on_composite = [], []
+    at_ready, on_composite, sending_fault = [], [], []
     for name, branches in takes:
         for guard, effect in branches:
             extra = (_G(guard),) if guard is not None else ()
             at_ready.append(T(On(name), S("../flush"), *extra, Effect(effect)))
             on_composite.append(T(On(name), *extra, Effect(effect)))
+            if name == FAULT:  # a step that entered `sending` and failed sent no tick: back to the choice
+                sending_fault.append(T(On(FAULT), S("../flush"), *extra, Effect(effect)))
     return [
         *on_composite,
         T(On("sent", "written", "write_failed"), Effect(s_ignore)),
         hsm.Initial(S("ready")),
         hsm.State("ready", *at_ready),
         hsm.Choice("flush", *flush),
-        hsm.State("sending", Entry(s_tick), T(On("sent"), S("../flush"))),
+        hsm.State("sending", Entry(s_tick), T(On("sent"), S("../flush")), *sending_fault),
         hsm.State(
             "writing", io(done="written", work=_write_events),
             hsm.Defer(FAULT, "shutdown"),  # a fault, and a close, wait for the write's outcome
@@ -5027,7 +5019,7 @@ def _with_default(*guarded: tuple, default: Callable) -> list:
 
 # What the session takes in both modes (the host's waits, what the timelines tell).
 COMMON_TAKES = (
-    ("events_wait", _with_default((log_past, s_answer_wait), (lost_kept, s_fail_wait), default=s_keep_wait)),
+    ("events_wait", _with_default((log_past, s_answer_wait), default=s_keep_wait)),
     ("said", [(None, s_said)]),
     ("answering", [(None, s_answering)]),
     ("graft_received", [(None, s_graft_received)]),
