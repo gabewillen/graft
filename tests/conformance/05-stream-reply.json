@@ -1,0 +1,206 @@
+{
+ "name": "SendStreamingMessage with a plain reply: the task, WORKING, the reply, COMPLETED",
+ "script": {
+  "main": [
+   [
+    {
+     "type": "text",
+     "text": "Hello!"
+    }
+   ]
+  ]
+ },
+ "steps": [
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "SendStreamingMessage",
+    "params": {
+     "message": {
+      "messageId": "u1",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "Hi"
+       }
+      ]
+     }
+    }
+   },
+   "expect": [
+    {
+     "jsonrpc": "2.0",
+     "id": 1,
+     "result": {
+      "task": {
+       "id": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_SUBMITTED"
+       },
+       "history": [
+        {
+         "messageId": "u1",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_USER",
+         "parts": [
+          {
+           "text": "Hi"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "jsonrpc": "2.0",
+     "id": 1,
+     "result": {
+      "statusUpdate": {
+       "taskId": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_WORKING"
+       }
+      }
+     }
+    },
+    {
+     "jsonrpc": "2.0",
+     "id": 1,
+     "result": {
+      "statusUpdate": {
+       "taskId": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_WORKING",
+        "message": {
+         "messageId": "ctx-m3",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "Hello!"
+          }
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "jsonrpc": "2.0",
+     "id": 1,
+     "result": {
+      "statusUpdate": {
+       "taskId": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_COMPLETED",
+        "message": {
+         "messageId": "ctx-m3",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "Hello!"
+          }
+         ]
+        }
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "GetAgentCard"
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "result": {
+     "name": "graft",
+     "description": "One assistant that works on several parts of a request at once.",
+     "supportedInterfaces": [
+      {
+       "url": "urn:graft:in-process",
+       "protocolBinding": "GRAFT-INPROC",
+       "protocolVersion": "1.0"
+      }
+     ],
+     "version": "0.1.0",
+     "capabilities": {
+      "streaming": true,
+      "pushNotifications": false,
+      "extendedAgentCard": false
+     },
+     "defaultInputModes": [
+      "text/plain"
+     ],
+     "defaultOutputModes": [
+      "text/plain"
+     ],
+     "skills": [
+      {
+       "id": "website",
+       "name": "website",
+       "description": "Build and edit a small website (pages with text content).",
+       "tags": [
+        "website"
+       ]
+      },
+      {
+       "id": "slides",
+       "name": "slides",
+       "description": "Create slide decks / slide shows / presentations.",
+       "tags": [
+        "slides"
+       ]
+      },
+      {
+       "id": "calendar",
+       "name": "calendar",
+       "description": "Book and list appointments on a calendar.",
+       "tags": [
+        "calendar"
+       ]
+      },
+      {
+       "id": "newsletter",
+       "name": "newsletter",
+       "description": "Write and send email newsletters.",
+       "tags": [
+        "newsletter"
+       ]
+      },
+      {
+       "id": "social",
+       "name": "social",
+       "description": "Write social media posts.",
+       "tags": [
+        "social"
+       ]
+      },
+      {
+       "id": "recipes",
+       "name": "recipes",
+       "description": "Save and format recipes.",
+       "tags": [
+        "recipes"
+       ]
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

@@ -1,0 +1,217 @@
+{
+ "name": "Invalid params, unknown tasks, unsupported parts and operations",
+ "script": {
+  "main": []
+ },
+ "steps": [
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "no id"
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "error": {
+     "code": -32602,
+     "message": "params.message.messageId is required",
+     "data": [
+      {
+       "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+       "reason": "InvalidParamsError",
+       "domain": "a2a-protocol.org"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "messageId": "u1",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "url": "https://example.com/a.png"
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "error": {
+     "code": -32005,
+     "message": "params.message.parts[0]: only text parts are supported, not url",
+     "data": [
+      {
+       "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+       "reason": "ContentTypeNotSupportedError",
+       "domain": "a2a-protocol.org"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "messageId": "u1",
+      "taskId": "nope",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "x"
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "error": {
+     "code": -32001,
+     "message": "task 'nope' not found",
+     "data": [
+      {
+       "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+       "reason": "TaskNotFoundError",
+       "domain": "a2a-protocol.org"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "GetTask",
+    "params": {
+     "id": "nope"
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "error": {
+     "code": -32001,
+     "message": "task 'nope' not found",
+     "data": [
+      {
+       "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+       "reason": "TaskNotFoundError",
+       "domain": "a2a-protocol.org"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "method": "CancelTask",
+    "params": {
+     "id": "nope"
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "error": {
+     "code": -32001,
+     "message": "task 'nope' not found",
+     "data": [
+      {
+       "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+       "reason": "TaskNotFoundError",
+       "domain": "a2a-protocol.org"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 6,
+    "method": "CreateTaskPushNotificationConfig",
+    "params": {}
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 6,
+    "error": {
+     "code": -32003,
+     "message": "push notifications are not supported",
+     "data": [
+      {
+       "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+       "reason": "PushNotificationNotSupportedError",
+       "domain": "a2a-protocol.org"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "method": "GetExtendedAgentCard"
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "error": {
+     "code": -32004,
+     "message": "there is no extended agent card",
+     "data": [
+      {
+       "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+       "reason": "UnsupportedOperationError",
+       "domain": "a2a-protocol.org"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 8,
+    "method": "NoSuchMethod"
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 8,
+    "error": {
+     "code": -32601,
+     "message": "Method not found"
+    }
+   }
+  }
+ ]
+}

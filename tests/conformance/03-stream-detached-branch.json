@@ -1,0 +1,307 @@
+{
+ "name": "SendStreamingMessage with a detached branch: WORKING, the reply, INPUT_REQUIRED at the turn end, then the branch's merge, the report and COMPLETED",
+ "script": {
+  "main": [
+   [
+    {
+     "type": "tool_use",
+     "id": "f1",
+     "name": "fork",
+     "input": {
+      "detached": [
+       {
+        "id": "site",
+        "skills": [
+         "website"
+        ],
+        "messages": [
+         "Build the website."
+        ],
+        "reason": "Build the practice's website."
+       }
+      ]
+     }
+    }
+   ],
+   [
+    {
+     "type": "text",
+     "text": "I am building the website now."
+    }
+   ],
+   [
+    {
+     "type": "text",
+     "text": "The website is built."
+    }
+   ]
+  ],
+  "website": [
+   [
+    {
+     "type": "text",
+     "text": "Home page written."
+    }
+   ]
+  ]
+ },
+ "steps": [
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "messageId": "u1",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "Build the website."
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+     "task": {
+      "id": "t1",
+      "contextId": "ctx",
+      "status": {
+       "state": "TASK_STATE_INPUT_REQUIRED",
+       "message": {
+        "messageId": "ctx-m3",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "I am building the website now."
+         }
+        ]
+       }
+      },
+      "history": [
+       {
+        "messageId": "u1",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_USER",
+        "parts": [
+         {
+          "text": "Build the website."
+         }
+        ]
+       },
+       {
+        "messageId": "ctx-m3",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "I am building the website now."
+         }
+        ]
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "release": "website"
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "SubscribeToTask",
+    "params": {
+     "id": "t1"
+    }
+   },
+   "expect": [
+    {
+     "jsonrpc": "2.0",
+     "id": 2,
+     "result": {
+      "task": {
+       "id": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_INPUT_REQUIRED",
+        "message": {
+         "messageId": "ctx-m3",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "I am building the website now."
+          }
+         ]
+        }
+       },
+       "history": [
+        {
+         "messageId": "u1",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_USER",
+         "parts": [
+          {
+           "text": "Build the website."
+          }
+         ]
+        },
+        {
+         "messageId": "ctx-m3",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "I am building the website now."
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "jsonrpc": "2.0",
+     "id": 2,
+     "result": {
+      "statusUpdate": {
+       "taskId": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_WORKING"
+       }
+      }
+     }
+    },
+    {
+     "jsonrpc": "2.0",
+     "id": 2,
+     "result": {
+      "statusUpdate": {
+       "taskId": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_WORKING",
+        "message": {
+         "messageId": "ctx-m6",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "The website is built."
+          }
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "jsonrpc": "2.0",
+     "id": 2,
+     "result": {
+      "statusUpdate": {
+       "taskId": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_COMPLETED",
+        "message": {
+         "messageId": "ctx-m6",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "The website is built."
+          }
+         ]
+        }
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "GetTask",
+    "params": {
+     "id": "t1"
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": {
+     "id": "t1",
+     "contextId": "ctx",
+     "status": {
+      "state": "TASK_STATE_COMPLETED",
+      "message": {
+       "messageId": "ctx-m6",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "The website is built."
+        }
+       ]
+      }
+     },
+     "history": [
+      {
+       "messageId": "u1",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_USER",
+       "parts": [
+        {
+         "text": "Build the website."
+        }
+       ]
+      },
+      {
+       "messageId": "ctx-m3",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "I am building the website now."
+        }
+       ]
+      },
+      {
+       "messageId": "ctx-m6",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "The website is built."
+        }
+       ]
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

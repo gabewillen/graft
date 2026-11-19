@@ -1,0 +1,272 @@
+{
+ "name": "SendMessage: a reply with no branch out completes the task; GetTask, ListTasks, a terminal task's errors",
+ "script": {
+  "main": [
+   [
+    {
+     "type": "text",
+     "text": "Hello! How can I help?"
+    }
+   ]
+  ]
+ },
+ "steps": [
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "messageId": "u1",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "Hi"
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+     "task": {
+      "id": "t1",
+      "contextId": "ctx",
+      "status": {
+       "state": "TASK_STATE_COMPLETED",
+       "message": {
+        "messageId": "ctx-m3",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "Hello! How can I help?"
+         }
+        ]
+       }
+      },
+      "history": [
+       {
+        "messageId": "u1",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_USER",
+        "parts": [
+         {
+          "text": "Hi"
+         }
+        ]
+       },
+       {
+        "messageId": "ctx-m3",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "Hello! How can I help?"
+         }
+        ]
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "GetTask",
+    "params": {
+     "id": "t1",
+     "historyLength": 1
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "result": {
+     "id": "t1",
+     "contextId": "ctx",
+     "status": {
+      "state": "TASK_STATE_COMPLETED",
+      "message": {
+       "messageId": "ctx-m3",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "Hello! How can I help?"
+        }
+       ]
+      }
+     },
+     "history": [
+      {
+       "messageId": "ctx-m3",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "Hello! How can I help?"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "ListTasks",
+    "params": {}
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": {
+     "tasks": [
+      {
+       "id": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_COMPLETED",
+        "message": {
+         "messageId": "ctx-m3",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "Hello! How can I help?"
+          }
+         ]
+        }
+       },
+       "history": [
+        {
+         "messageId": "u1",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_USER",
+         "parts": [
+          {
+           "text": "Hi"
+          }
+         ]
+        },
+        {
+         "messageId": "ctx-m3",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "Hello! How can I help?"
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "nextPageToken": "",
+     "pageSize": 50,
+     "totalSize": 1
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "CancelTask",
+    "params": {
+     "id": "t1"
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "error": {
+     "code": -32002,
+     "message": "task 't1' is in a terminal state",
+     "data": [
+      {
+       "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+       "reason": "TaskNotCancelableError",
+       "domain": "a2a-protocol.org"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "messageId": "u2",
+      "taskId": "t1",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "More"
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "error": {
+     "code": -32004,
+     "message": "task 't1' is in a terminal state",
+     "data": [
+      {
+       "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+       "reason": "UnsupportedOperationError",
+       "domain": "a2a-protocol.org"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 6,
+    "method": "SubscribeToTask",
+    "params": {
+     "id": "t1"
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 6,
+    "error": {
+     "code": -32004,
+     "message": "task 't1' is in a terminal state",
+     "data": [
+      {
+       "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+       "reason": "UnsupportedOperationError",
+       "domain": "a2a-protocol.org"
+      }
+     ]
+    }
+   }
+  }
+ ]
+}
