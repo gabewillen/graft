@@ -18,7 +18,7 @@ from test_parallel import REQUEST, text
 def make(*, tmp_path, names=None, policy=None):
     store = Store(str(tmp_path / "ids.db"))
     install_fake(store)
-    h = conversation(store, policy or (lambda *a: text("ok")), seeder=None, names=names).h
+    h = conversation(store, policy or (lambda *a: text("ok")), seeder=None, names=names, quote=True).h
     return store, h
 
 
@@ -158,7 +158,7 @@ def test_error_lines_name_a_branch_by_its_id_even_when_another_branchs_timeline_
     (here `c1`, the model's name for timeline c2) never names a different branch."""
     store = Store(str(tmp_path / "err.db"))
     install_fake(store)
-    h = conversation(store, lambda *a: text("ok"), seeder=None).h
+    h = conversation(store, lambda *a: text("ok"), seeder=None, quote=True).h
     said = chat_of(h)
 
     async def go():
@@ -221,7 +221,7 @@ def test_an_error_line_is_still_told_when_the_store_cannot_name_the_branch(tmp_p
     (never the timeline id in its place), and the line is still told."""
     store = Store(str(tmp_path / "err2.db"))
     install_fake(store)
-    h = conversation(store, lambda *a: text("ok"), seeder=None).h
+    h = conversation(store, lambda *a: text("ok"), seeder=None, quote=True).h
     said = chat_of(h)
 
     def broken(tl):

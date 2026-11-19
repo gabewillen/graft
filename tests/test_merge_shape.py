@@ -26,7 +26,7 @@ def fork_use(use_id="f1", **inp):
 def make(*, tmp_path, policy, **kw):
     store = Store(str(tmp_path / "merge.db"))
     install_fake(store)
-    h = conversation(store, policy, seeder=None, **kw).h
+    h = conversation(store, policy, seeder=None, **kw, quote=True).h
     said = chat_of(h)
     return store, h, said
 
@@ -196,7 +196,7 @@ def test_a_malformed_or_oversized_merge_call_still_ends_the_turn_but_main_reads_
         (tmp_path / f"b{len(json.dumps(bad))}").mkdir()
         store = Store(str(tmp_path / f"b{len(json.dumps(bad))}" / "m.db"))
         install_fake(store)
-        h = conversation(store, script, seeder=None).h
+        h = conversation(store, script, seeder=None, quote=True).h
         run(h=h, says=[REQUEST])
         refusal = [json.loads(r["content"]) for r in store.view("c1") if r["kind"] == "tool_result"
                    and r["tool_name"] == "merge" and not r["harness"]][0]

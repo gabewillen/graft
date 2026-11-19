@@ -22,7 +22,7 @@ def clone_use(skills, focus=True, id="t"):
 def harness(tmp_path):
     store = Store(str(tmp_path / "h.db"))
     install_fake(store)
-    return conversation(store, pivot_policy).h
+    return conversation(store, pivot_policy, quote=True).h
 
 
 def test_pivot_flow_offline(harness):
@@ -215,7 +215,7 @@ def test_load_skill_scoped_to_linked_skills(harness):
 def test_load_skill_result_is_an_ordinary_row(tmp_path):
     store = Store(str(tmp_path / "p.db"))
     install_fake(store)
-    h = conversation(store, pivot_policy).h
+    h = conversation(store, pivot_policy, quote=True).h
 
     async def go():
         await chat_of(h).start()
@@ -240,7 +240,7 @@ def test_oversized_join_falls_back_to_last_reply_and_survives_refused_compaction
     from graft.harness import JOIN_WINDOW_FRACTION
     store = Store(str(tmp_path / "w.db"))
     install_fake(store)
-    h = conversation(store, _no_compact_policy, compact_tokens=50, window_tokens=400).h
+    h = conversation(store, _no_compact_policy, compact_tokens=50, window_tokens=400, quote=True).h
     limit = int(400 * JOIN_WINDOW_FRACTION)
 
     async def go():

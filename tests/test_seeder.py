@@ -42,7 +42,7 @@ def setup(tmp_path, fake, monkeypatch, threshold="0.4"):
     monkeypatch.setenv("GRAFT_SEED_THRESHOLD", threshold)
     store = Store(str(tmp_path / "s.db"))
     install_fake(store)
-    h = conversation(store, lambda *a: [], seeder=seeder(fake)).h
+    h = conversation(store, lambda *a: [], seeder=seeder(fake), quote=True).h
     return store, h
 
 

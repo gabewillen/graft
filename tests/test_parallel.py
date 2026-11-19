@@ -88,7 +88,7 @@ class Script:
 def make(*, tmp_path, policy, **kw):
     store = Store(str(tmp_path / "p.db"))
     install_fake(store)
-    h = conversation(store, policy, seeder=None, **kw).h
+    h = conversation(store, policy, seeder=None, **kw, quote=True).h
     said = chat_of(h)
     return store, h, said
 
@@ -661,7 +661,7 @@ def test_pivot_policy_website_graft_keeps_a_multi_part_seed(tmp_path):
     from graft.fake import pivot_policy
     store = Store(str(tmp_path / "v.db"))
     install_fake(store)
-    h = conversation(store, pivot_policy, seeder=None).h
+    h = conversation(store, pivot_policy, seeder=None, quote=True).h
 
     async def go():
         await chat_of(h).start()
@@ -752,7 +752,7 @@ def test_an_exception_inside_clone_handling_ends_as_a_refused_tool_result(tmp_pa
 
     store = Store(str(tmp_path / "e.db"))
     install_fake(store)
-    h = conversation(store, policy, seeder=Boom()).h
+    h = conversation(store, policy, seeder=Boom(), quote=True).h
 
     async def go():
         await chat_of(h).start()
@@ -1097,7 +1097,7 @@ def test_multi_entry_clone_call_with_an_async_seeder_and_one_fallback(tmp_path):
     store = Store(str(tmp_path / "m.db"))
     install_fake(store)
     seeder = Seeder()
-    h = conversation(store, lambda *a: text("ok"), seeder=seeder).h
+    h = conversation(store, lambda *a: text("ok"), seeder=seeder, quote=True).h
 
     async def go():
         await chat_of(h).start()
@@ -1537,7 +1537,7 @@ def test_a_seeder_failure_cancels_the_sibling_seeder_calls(tmp_path):
 
     store = Store(str(tmp_path / "s.db"))
     install_fake(store)
-    h = conversation(store, lambda *a: text("ok"), seeder=Seeder()).h
+    h = conversation(store, lambda *a: text("ok"), seeder=Seeder(), quote=True).h
 
     async def go():
         await chat_of(h).start()
@@ -1723,7 +1723,7 @@ def test_a_cancelled_turn_leaves_a_valid_view_and_no_open_transaction(tmp_path):
     store = Store(str(tmp_path / "c.db"))
     install_fake(store)
     slow = Slow()
-    h = conversation(store, policy, seeder=slow).h
+    h = conversation(store, policy, seeder=slow, quote=True).h
 
     async def go():
         await chat_of(h).start()
@@ -3536,7 +3536,7 @@ def test_a_run_may_make_any_number_of_fork_calls_each_refused_with_its_violation
 
     store = Store(str(tmp_path / "r.db"))
     install_fake(store)
-    h = conversation(store, policy, seeder=None, max_steps=6).h
+    h = conversation(store, policy, seeder=None, max_steps=6, quote=True).h
 
     async def go():
         await chat_of(h).start()
@@ -4565,7 +4565,7 @@ def test_the_seeder_never_seeds_a_message_the_user_withdrew(tmp_path, seeder_ans
 
     store = Store(str(tmp_path / "s.db"))
     install_fake(store)
-    h = conversation(store, _clones_on(entry_for=entry, seen=seen), seeder=Seeder()).h
+    h = conversation(store, _clones_on(entry_for=entry, seen=seen), seeder=Seeder(), quote=True).h
     real = h.begin_request
     h.begin_request = lambda **kw: seen.setdefault("row", real(**kw))
 
@@ -4594,7 +4594,7 @@ def test_a_final_seed_holding_a_message_the_user_withdrew_is_refused_whoever_cho
     store = Store(str(tmp_path / "g.db"))
     install_fake(store)
     h = conversation(store, _clones_on(
-        entry_for=lambda seen: clone_entry(skills=["website"], focus=False), seen=seen), seeder=Seeder()).h
+        entry_for=lambda seen: clone_entry(skills=["website"], focus=False), seen=seen), seeder=Seeder(), quote=True).h
 
     async def seed_with_actor(src, skills, fallback, exclude):
         return [seen["row"]] + fallback, {}
@@ -4714,7 +4714,7 @@ def test_a_run_that_fails_while_a_clone_call_is_prepared_is_the_runs_failure(tmp
     slow = Slow()
     store = Store(str(tmp_path / "f.db"))
     install_fake(store)
-    h = conversation(store, policy, seeder=slow).h
+    h = conversation(store, policy, seeder=slow, quote=True).h
 
     async def go():
         await chat_of(h).start()
@@ -5047,7 +5047,7 @@ def test_close_during_a_clone_calls_preparation_answers_the_call(tmp_path):
     slow = Slow()
     store = Store(str(tmp_path / "c.db"))
     install_fake(store)
-    h = conversation(store, lambda *a: text("hi"), seeder=slow).h
+    h = conversation(store, lambda *a: text("hi"), seeder=slow, quote=True).h
 
     async def go():
         await chat_of(h).start()
@@ -5800,7 +5800,7 @@ def test_a_withdrawal_whose_guard_raises_while_a_clone_call_is_prepared_ends_the
     waiting = Waiting()
     store = Store(str(tmp_path / "w.db"))
     install_fake(store)
-    h = conversation(store, policy, seeder=waiting).h
+    h = conversation(store, policy, seeder=waiting, quote=True).h
     real, raised = machine.ends_run, []
     once = True  # the guard raises the first time it is read
 

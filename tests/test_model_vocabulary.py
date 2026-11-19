@@ -114,7 +114,7 @@ def make(*, tmp_path, policy, name, **kw):
     store = Store(str(tmp_path / f"{name}.db"))
     install_fake(store)
     rec = Recorder(policy)
-    h = conversation(store, rec, seeder=None, **kw).h
+    h = conversation(store, rec, seeder=None, **kw, quote=True).h
     return store, h, rec
 
 

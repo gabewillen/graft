@@ -29,7 +29,7 @@ def fork_use(use_id="f1", **inp):
 def make(*, tmp_path, policy, **kw):
     store = Store(str(tmp_path / "fork.db"))
     install_fake(store)
-    h = conversation(store, policy, seeder=kw.pop("seeder", None), **kw).h
+    h = conversation(store, policy, seeder=kw.pop("seeder", None), **kw, quote=True).h
     return store, h
 
 

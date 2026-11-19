@@ -165,6 +165,7 @@ from graft.agent import GraftAgent, GraftConfig, HarnessError, fold
 from graft.fake import FakeWorld
 from graft.providers import FakeProvider
 from graft.skills import install
+from a2a_schema import check
 
 _CHATS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
@@ -217,6 +218,8 @@ class Chat:
     def _sync(self) -> None:
         """Every text told so far, in order, into `said`."""
         events = self.store.events_after(self.cursor, limit=10 ** 9)
+        for _seq, event in events:  # every event the log tells is an A2A StreamResponse
+            check(event, "Stream Response")
         if events:
             self.cursor = events[-1][0]
         self.said += self._texts(events)
@@ -356,9 +359,9 @@ class Chat:
         return list(self.said) == list(other)
 
 
-def conversation(store, policy=None, *, provider=None, world=None, tools=None, quote=True, **config) -> Chat:
-    """An agent on `store` with a scripted model (`policy`, wrapped by `quoting` unless `quote` is
-    false) or a `provider`, and the simulated tools of `world`; returns its Chat."""
+def conversation(store, policy=None, *, provider=None, world=None, tools=None, quote=False, **config) -> Chat:
+    """An agent on `store` with a scripted model (`policy`; with `quote`, wrapped by `quoting`) or a
+    `provider`, and the simulated tools of `world`; returns its Chat."""
     if provider is None:
         provider = FakeProvider(quoting(policy) if quote else policy)
     world = world if world is not None else FakeWorld()

@@ -1248,7 +1248,7 @@ def test_a_seeder_that_raises_a_base_exception_refuses_the_clone_call_and_leaves
 
     store = Store(str(tmp_path / "p.db"))
     install_fake(store)
-    h = conversation(store, policy, seeder=AbortingSeeder()).h
+    h = conversation(store, policy, seeder=AbortingSeeder(), quote=True).h
     out = {}
 
     async def go():
@@ -1349,7 +1349,7 @@ def test_a_seeder_that_raises_cancelled_error_leaves_no_audit_open(tmp_path):
 
     store = Store(str(tmp_path / "p.db"))
     install_fake(store)
-    h = conversation(store, policy, seeder=CancellingSeeder()).h
+    h = conversation(store, policy, seeder=CancellingSeeder(), quote=True).h
     out = say_and_close(h)
     assert out["said"] != "TIMEOUT" and out["closed"] is True
     assert store.con.execute("SELECT count(*) FROM transactions WHERE status='open'").fetchone()[0] == 0

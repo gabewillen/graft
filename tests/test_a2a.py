@@ -4,6 +4,7 @@ with all the work it sets off, a blocking SendMessage returns when main's turn e
 Stop, and everything is told through the event log."""
 
 import asyncio
+import itertools
 import json
 import threading
 
@@ -25,9 +26,12 @@ def text(t):
     return [{"type": "text", "text": t}]
 
 
+FORK_IDS = itertools.count(1)
+
+
 def fork(**inp):
-    return [{"type": "tool_use", "id": f"f{json.dumps(inp, sort_keys=True).__hash__() & 0xffff}", "name": "fork",
-             "input": inp}]
+    """A fork call (each with its own tool_use id)."""
+    return [{"type": "tool_use", "id": f"f{next(FORK_IDS)}", "name": "fork", "input": inp}]
 
 
 def last_block(messages):
