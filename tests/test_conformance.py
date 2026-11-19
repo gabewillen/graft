@@ -8,7 +8,9 @@ a list of content blocks (text, tool_use); main's replies are taken in order by 
 skill's by the calls of the branch that holds it (a branch's call waits until a `release` step for
 its skill, so the order of events is fixed). A step is {"request": <JSON-RPC request>, "expect":
 <JSON-RPC response, or for SendStreamingMessage and SubscribeToTask the list of results>} or
-{"release": "<skill>"}. Ids: the context is "ctx", task ids are t1, t2, ... in order, and agent
+{"release": "<skill>"}, or {"await_call": "<skill>"} (wait until the branch holding that skill has
+called the model, so it exists and is running), or {"await_text": ["<task id>", "<agent text>"]} (wait
+until the task's history holds that agent text). Ids: the context is "ctx", task ids are t1, t2, ... in order, and agent
 message ids are "ctx-m<log position>". Set GRAFT_RECORD_CONFORMANCE=1 to write `expect` for steps
 that have none (then review the file by hand)."""
 
@@ -40,6 +42,7 @@ class Scripted:
     def __init__(self, script):
         self.queues = {who: list(replies) for who, replies in script.items()}
         self.gates = {who: threading.Event() for who in script if who != "main"}
+        self.called = {who: threading.Event() for who in script if who != "main"}
 
     def __call__(self, system, messages, tools):
         names = {t["name"] for t in tools}
@@ -48,6 +51,7 @@ class Scripted:
         else:
             who = next(w for w in self.gates if any(n.startswith({"website": "site_", "slides": "slides_",
                                                                   "calendar": "calendar_"}.get(w, w)) for n in names))
+            self.called[who].set()
             assert self.gates[who].wait(GATE), f"{who} was never released"
         assert self.queues[who], f"the script has no reply left for {who}"
         return self.queues[who].pop(0)
@@ -108,6 +112,19 @@ def test_conformance(tmp_path, path):
             for step in fixture["steps"]:
                 if "release" in step:
                     model.gates[step["release"]].set()
+                    continue
+                if "await_text" in step:
+                    task_id, text = step["await_text"]
+                    for _ in range(GATE * 100):
+                        if any(m.role == a2a.ROLE_AGENT and m.text == text
+                               for m in agent.get_task({"id": task_id}).history):
+                            break
+                        await asyncio.sleep(0.01)
+                    else:
+                        raise AssertionError(step)
+                    continue
+                if "await_call" in step:
+                    assert await asyncio.to_thread(model.called[step["await_call"]].wait, GATE), step
                     continue
                 out = await dispatch(agent, step["request"])
                 for item in _results(out):

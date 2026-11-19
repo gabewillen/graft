@@ -1,0 +1,344 @@
+{
+ "name": "A fork made by the wake belongs to the task whose merge woke main; CancelTask stops it, it merges cancelled and wakes nothing",
+ "script": {
+  "main": [
+   [
+    {
+     "type": "tool_use",
+     "id": "f1",
+     "name": "fork",
+     "input": {
+      "detached": [
+       {
+        "id": "site",
+        "skills": [
+         "website"
+        ],
+        "messages": [
+         "Build the website, then a slide deck."
+        ],
+        "reason": "Build the website."
+       }
+      ]
+     }
+    }
+   ],
+   [
+    {
+     "type": "text",
+     "text": "I am building the website now."
+    }
+   ],
+   [
+    {
+     "type": "tool_use",
+     "id": "f2",
+     "name": "fork",
+     "input": {
+      "detached": [
+       {
+        "id": "deck",
+        "skills": [
+         "slides"
+        ],
+        "messages": [
+         "Build the website, then a slide deck."
+        ],
+        "reason": "Make a slide deck."
+       }
+      ]
+     }
+    }
+   ],
+   [
+    {
+     "type": "text",
+     "text": "The website is built; I am making the deck now."
+    }
+   ],
+   [
+    {
+     "type": "text",
+     "text": "You are welcome."
+    }
+   ]
+  ],
+  "website": [
+   [
+    {
+     "type": "text",
+     "text": "Home page written."
+    }
+   ]
+  ],
+  "slides": [
+   [
+    {
+     "type": "text",
+     "text": "Deck made."
+    }
+   ]
+  ]
+ },
+ "steps": [
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "messageId": "u1",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "Build the website, then a slide deck."
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+     "task": {
+      "id": "t1",
+      "contextId": "ctx",
+      "status": {
+       "state": "TASK_STATE_INPUT_REQUIRED",
+       "message": {
+        "messageId": "ctx-m3",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "I am building the website now."
+         }
+        ]
+       }
+      },
+      "history": [
+       {
+        "messageId": "u1",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_USER",
+        "parts": [
+         {
+          "text": "Build the website, then a slide deck."
+         }
+        ]
+       },
+       {
+        "messageId": "ctx-m3",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "I am building the website now."
+         }
+        ]
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "release": "website"
+  },
+  {
+   "await_call": "slides"
+  },
+  {
+   "await_text": [
+    "t1",
+    "The website is built; I am making the deck now."
+   ]
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "CancelTask",
+    "params": {
+     "id": "t1"
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": {
+     "id": "t1",
+     "contextId": "ctx",
+     "status": {
+      "state": "TASK_STATE_CANCELED"
+     },
+     "history": [
+      {
+       "messageId": "u1",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_USER",
+       "parts": [
+        {
+         "text": "Build the website, then a slide deck."
+        }
+       ]
+      },
+      {
+       "messageId": "ctx-m3",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "I am building the website now."
+        }
+       ]
+      },
+      {
+       "messageId": "ctx-m6",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "The website is built; I am making the deck now."
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "release": "slides"
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "messageId": "u2",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "Thanks."
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "result": {
+     "task": {
+      "id": "t2",
+      "contextId": "ctx",
+      "status": {
+       "state": "TASK_STATE_COMPLETED",
+       "message": {
+        "messageId": "ctx-m10",
+        "contextId": "ctx",
+        "taskId": "t2",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "You are welcome."
+         }
+        ]
+       }
+      },
+      "history": [
+       {
+        "messageId": "u2",
+        "contextId": "ctx",
+        "taskId": "t2",
+        "role": "ROLE_USER",
+        "parts": [
+         {
+          "text": "Thanks."
+         }
+        ]
+       },
+       {
+        "messageId": "ctx-m10",
+        "contextId": "ctx",
+        "taskId": "t2",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "You are welcome."
+         }
+        ]
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "method": "GetTask",
+    "params": {
+     "id": "t1"
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "result": {
+     "id": "t1",
+     "contextId": "ctx",
+     "status": {
+      "state": "TASK_STATE_CANCELED"
+     },
+     "history": [
+      {
+       "messageId": "u1",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_USER",
+       "parts": [
+        {
+         "text": "Build the website, then a slide deck."
+        }
+       ]
+      },
+      {
+       "messageId": "ctx-m3",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "I am building the website now."
+        }
+       ]
+      },
+      {
+       "messageId": "ctx-m6",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "The website is built; I am making the deck now."
+        }
+       ]
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

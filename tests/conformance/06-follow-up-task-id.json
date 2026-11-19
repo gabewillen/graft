@@ -1,0 +1,446 @@
+{
+ "name": "A follow-up with the taskId continues an INPUT_REQUIRED task; the branch's merge completes it",
+ "script": {
+  "main": [
+   [
+    {
+     "type": "tool_use",
+     "id": "f1",
+     "name": "fork",
+     "input": {
+      "detached": [
+       {
+        "id": "site",
+        "skills": [
+         "website"
+        ],
+        "messages": [
+         "Build the website."
+        ],
+        "reason": "Build the practice's website."
+       }
+      ]
+     }
+    }
+   ],
+   [
+    {
+     "type": "text",
+     "text": "I am building the website now."
+    }
+   ],
+   [
+    {
+     "type": "text",
+     "text": "Noted: an about page too."
+    }
+   ],
+   [
+    {
+     "type": "text",
+     "text": "The website is built."
+    }
+   ]
+  ],
+  "website": [
+   [
+    {
+     "type": "text",
+     "text": "Home page written."
+    }
+   ]
+  ]
+ },
+ "steps": [
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "messageId": "u1",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "Build the website."
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+     "task": {
+      "id": "t1",
+      "contextId": "ctx",
+      "status": {
+       "state": "TASK_STATE_INPUT_REQUIRED",
+       "message": {
+        "messageId": "ctx-m3",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "I am building the website now."
+         }
+        ]
+       }
+      },
+      "history": [
+       {
+        "messageId": "u1",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_USER",
+        "parts": [
+         {
+          "text": "Build the website."
+         }
+        ]
+       },
+       {
+        "messageId": "ctx-m3",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "I am building the website now."
+         }
+        ]
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "messageId": "u2",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "Add an about page too."
+       }
+      ],
+      "taskId": "t1"
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "result": {
+     "task": {
+      "id": "t1",
+      "contextId": "ctx",
+      "status": {
+       "state": "TASK_STATE_INPUT_REQUIRED",
+       "message": {
+        "messageId": "ctx-m7",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "Noted: an about page too."
+         }
+        ]
+       }
+      },
+      "history": [
+       {
+        "messageId": "u1",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_USER",
+        "parts": [
+         {
+          "text": "Build the website."
+         }
+        ]
+       },
+       {
+        "messageId": "ctx-m3",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "I am building the website now."
+         }
+        ]
+       },
+       {
+        "messageId": "u2",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_USER",
+        "parts": [
+         {
+          "text": "Add an about page too."
+         }
+        ]
+       },
+       {
+        "messageId": "ctx-m7",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "Noted: an about page too."
+         }
+        ]
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "release": "website"
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "SubscribeToTask",
+    "params": {
+     "id": "t1"
+    }
+   },
+   "expect": [
+    {
+     "jsonrpc": "2.0",
+     "id": 3,
+     "result": {
+      "task": {
+       "id": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_INPUT_REQUIRED",
+        "message": {
+         "messageId": "ctx-m7",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "Noted: an about page too."
+          }
+         ]
+        }
+       },
+       "history": [
+        {
+         "messageId": "u1",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_USER",
+         "parts": [
+          {
+           "text": "Build the website."
+          }
+         ]
+        },
+        {
+         "messageId": "ctx-m3",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "I am building the website now."
+          }
+         ]
+        },
+        {
+         "messageId": "u2",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_USER",
+         "parts": [
+          {
+           "text": "Add an about page too."
+          }
+         ]
+        },
+        {
+         "messageId": "ctx-m7",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "Noted: an about page too."
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "jsonrpc": "2.0",
+     "id": 3,
+     "result": {
+      "statusUpdate": {
+       "taskId": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_WORKING"
+       }
+      }
+     }
+    },
+    {
+     "jsonrpc": "2.0",
+     "id": 3,
+     "result": {
+      "statusUpdate": {
+       "taskId": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_WORKING",
+        "message": {
+         "messageId": "ctx-m10",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "The website is built."
+          }
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "jsonrpc": "2.0",
+     "id": 3,
+     "result": {
+      "statusUpdate": {
+       "taskId": "t1",
+       "contextId": "ctx",
+       "status": {
+        "state": "TASK_STATE_COMPLETED",
+        "message": {
+         "messageId": "ctx-m10",
+         "contextId": "ctx",
+         "taskId": "t1",
+         "role": "ROLE_AGENT",
+         "parts": [
+          {
+           "text": "The website is built."
+          }
+         ]
+        }
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "GetTask",
+    "params": {
+     "id": "t1"
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "result": {
+     "id": "t1",
+     "contextId": "ctx",
+     "status": {
+      "state": "TASK_STATE_COMPLETED",
+      "message": {
+       "messageId": "ctx-m10",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "The website is built."
+        }
+       ]
+      }
+     },
+     "history": [
+      {
+       "messageId": "u1",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_USER",
+       "parts": [
+        {
+         "text": "Build the website."
+        }
+       ]
+      },
+      {
+       "messageId": "ctx-m3",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "I am building the website now."
+        }
+       ]
+      },
+      {
+       "messageId": "u2",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_USER",
+       "parts": [
+        {
+         "text": "Add an about page too."
+        }
+       ]
+      },
+      {
+       "messageId": "ctx-m7",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "Noted: an about page too."
+        }
+       ]
+      },
+      {
+       "messageId": "ctx-m10",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_AGENT",
+       "parts": [
+        {
+         "text": "The website is built."
+        }
+       ]
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

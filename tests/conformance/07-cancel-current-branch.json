@@ -1,0 +1,229 @@
+{
+ "name": "CancelTask on a task a current branch holds: the branch merges cancelled and the conversation comes back to main",
+ "script": {
+  "main": [
+   [
+    {
+     "type": "tool_use",
+     "id": "f1",
+     "name": "fork",
+     "input": {
+      "current": {
+       "id": "site",
+       "skills": [
+        "website"
+       ],
+       "messages": [
+        "Build the website."
+       ],
+       "reason": "Build the practice's website."
+      }
+     }
+    }
+   ],
+   [
+    {
+     "type": "text",
+     "text": "Sure."
+    }
+   ]
+  ],
+  "website": [
+   [
+    {
+     "type": "text",
+     "text": "Writing the home page."
+    }
+   ]
+  ]
+ },
+ "steps": [
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "messageId": "u1",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "Build the website."
+       }
+      ]
+     },
+     "configuration": {
+      "returnImmediately": true
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+     "task": {
+      "id": "t1",
+      "contextId": "ctx",
+      "status": {
+       "state": "TASK_STATE_SUBMITTED"
+      },
+      "history": [
+       {
+        "messageId": "u1",
+        "contextId": "ctx",
+        "taskId": "t1",
+        "role": "ROLE_USER",
+        "parts": [
+         {
+          "text": "Build the website."
+         }
+        ]
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "await_call": "website"
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "CancelTask",
+    "params": {
+     "id": "t1"
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "result": {
+     "id": "t1",
+     "contextId": "ctx",
+     "status": {
+      "state": "TASK_STATE_CANCELED"
+     },
+     "history": [
+      {
+       "messageId": "u1",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_USER",
+       "parts": [
+        {
+         "text": "Build the website."
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "release": "website"
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "SendMessage",
+    "params": {
+     "message": {
+      "messageId": "u2",
+      "role": "ROLE_USER",
+      "parts": [
+       {
+        "text": "Never mind."
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": {
+     "task": {
+      "id": "t2",
+      "contextId": "ctx",
+      "status": {
+       "state": "TASK_STATE_COMPLETED",
+       "message": {
+        "messageId": "ctx-m6",
+        "contextId": "ctx",
+        "taskId": "t2",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "Sure."
+         }
+        ]
+       }
+      },
+      "history": [
+       {
+        "messageId": "u2",
+        "contextId": "ctx",
+        "taskId": "t2",
+        "role": "ROLE_USER",
+        "parts": [
+         {
+          "text": "Never mind."
+         }
+        ]
+       },
+       {
+        "messageId": "ctx-m6",
+        "contextId": "ctx",
+        "taskId": "t2",
+        "role": "ROLE_AGENT",
+        "parts": [
+         {
+          "text": "Sure."
+         }
+        ]
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "request": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "GetTask",
+    "params": {
+     "id": "t1"
+    }
+   },
+   "expect": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "result": {
+     "id": "t1",
+     "contextId": "ctx",
+     "status": {
+      "state": "TASK_STATE_CANCELED"
+     },
+     "history": [
+      {
+       "messageId": "u1",
+       "contextId": "ctx",
+       "taskId": "t1",
+       "role": "ROLE_USER",
+       "parts": [
+        {
+         "text": "Build the website."
+        }
+       ]
+      }
+     ]
+    }
+   }
+  }
+ ]
+}
