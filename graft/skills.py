@@ -14,7 +14,7 @@ from typing import Any, Sequence
 
 from .db import Skill, Store
 
-MIN_CHILDREN_TO_FORK = 2  # minimum child skills a branch must own to gain `fork` ability
+MIN_BRANCH_SKILLS_TO_FORK = 2  # minimum child skills a branch must own to gain `fork` ability
 
 
 def obj(props: dict, required: list[str]) -> dict:

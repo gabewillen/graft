@@ -1,21 +1,21 @@
-"""Live E2E experiment: Hierarchical Nested Skills (`min_children_to_fork=2` vs `1` vs `bundled` vs `flat`).
+"""Live E2E experiment: Hierarchical Nested Skills (`min_branch_skills_to_fork=2` vs `1` vs `bundled` vs `flat`).
 
 Models a realistic production skill tree on disk (loaded via `GraftConfig(skills_dir=...)`):
   - `incident-triage` (owns 12 specialized subsystem runbook child skills, ~1.5 KB each = ~18 KB total)
     - `postgres-locks`, `postgres-vacuum`, `redis-evictions`, `kafka-lag`, `k8s-oom`,
       `dns-resolution`, `tls-certs`, `cdn-cache`, `load-balancer`, `auth-tokens`,
       `storage-iops`, `rate-limiter`
-  - `status-page` (owns 1 child skill: `status-template`) — directly tests `min_children_to_fork=2` vs `1`!
+  - `status-page` (owns 1 child skill: `status-template`) — directly tests `min_branch_skills_to_fork=2` vs `1`!
   - `changelog` (leaf skill, 0 children)
 
 Runs the same 4-turn incident-response script across four modes:
-  1. `nested-min2` (default, `min_children_to_fork=2`):
+  1. `nested-min2` (default, `min_branch_skills_to_fork=2`):
      - `main` sees 3 top-level skills (+ `search`).
      - `incident-triage` (12 children >= 2) gains `fork` and forks only the 1-2 needed child skills.
      - `status-page` (1 child < 2) auto-links `status-template` directly (no extra fork hop).
-  2. `nested-min1` (`min_children_to_fork=1`):
+  2. `nested-min1` (`min_branch_skills_to_fork=1`):
      - Same tree, except `status-page` (1 child) also gains `fork` and must fork `status-template`.
-  3. `bundled` (`min_children_to_fork=None`):
+  3. `bundled` (`min_branch_skills_to_fork=None`):
      - `main` still sees 3 top-level skills, but `incident-triage` auto-links all 12 child skills (~18 KB + 13 tools).
   4. `flat` (all skills flattened to top-level on `main`):
      - Every child skill is exposed directly in `main`'s catalog.
@@ -484,7 +484,7 @@ async def run_mode(mode: str, *, provider_name: str, model: str | None, fake: bo
             config=GraftConfig(
                 persona=BASE_SYSTEM,
                 skills_dir=sdir,
-                min_children_to_fork=min_children,
+                min_branch_skills_to_fork=min_children,
                 seeder=None,
                 nonce=nonce,
                 max_steps=12,

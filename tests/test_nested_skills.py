@@ -177,11 +177,11 @@ def test_main_catalog_and_card_hide_children_and_refuse_direct_fork(tmp_path):
     assert "nested under 'ops'" in refusals[0]
 
 
-def test_min_children_to_fork_two_vs_one_child(tmp_path):
-    """With default min_children_to_fork=2:
+def test_min_branch_skills_to_fork_two_vs_one_child(tmp_path):
+    """With default min_branch_skills_to_fork=2:
     - parent with >= 2 children gains `fork` and sees its children in its child catalog
     - parent with 1 child does NOT gain `fork`; its lone child is auto-linked directly
-    With min_children_to_fork=1:
+    With min_branch_skills_to_fork=1:
     - parent with 1 child DOES gain `fork`."""
     skills = [
         Skill("multi", "Multi parent.", "Multi instr.", []),
@@ -213,22 +213,22 @@ def test_min_children_to_fork_two_vs_one_child(tmp_path):
     # Threshold = 1
     store1 = Store(str(tmp_path / "t1.db"))
     agent1 = GraftAgent(store1, FakeProvider(lambda *a: _text("ok")), tools=tools,
-                        config=GraftConfig(skills=skills, seeder=None, min_children_to_fork=1))
+                        config=GraftConfig(skills=skills, seeder=None, min_branch_skills_to_fork=1))
     linked_s1, cf_s1 = agent1._host._resolve_branch_skills(["single"], focus=True)
     assert cf_s1 is True and linked_s1 == ["single", "fork", "merge"]
 
     # Threshold = None -> never sub-fork; auto-link all descendants into parent branch
     store_none = Store(str(tmp_path / "tnone.db"))
     agent_none = GraftAgent(store_none, FakeProvider(lambda *a: _text("ok")), tools=tools,
-                            config=GraftConfig(skills=skills, seeder=None, min_children_to_fork=None))
+                            config=GraftConfig(skills=skills, seeder=None, min_branch_skills_to_fork=None))
     linked_bundled, cf_bundled = agent_none._host._resolve_branch_skills(["multi"], focus=True)
     assert cf_bundled is False and linked_bundled == ["multi", "m1", "m2", "merge"]
 
     # Invalid thresholds (< 1) are rejected
     for bad in (0, -1):
-        with pytest.raises(ValueError, match="min_children_to_fork"):
+        with pytest.raises(ValueError, match="min_branch_skills_to_fork"):
             GraftAgent(Store(str(tmp_path / f"bad_{bad}.db")), FakeProvider(lambda *a: _text("ok")),
-                       tools=tools, config=GraftConfig(skills=skills, seeder=None, min_children_to_fork=bad))
+                       tools=tools, config=GraftConfig(skills=skills, seeder=None, min_branch_skills_to_fork=bad))
 
 
 # ------------------------------------------------------------------ depth-2 current & detached

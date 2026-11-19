@@ -74,7 +74,7 @@ from .db import Graft, Store, render, validate
 from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, Cancel, CancelCall, Branch, Machines, Mode,
                       Prepared, QueuedJoin, RunOutcome, ToolCall, TransitionRefused, Unwritten, described)
 from .providers import Provider, prefix_nonce, window_tokens_for
-from .skills import (BASE_SYSTEM, BRANCH_ID_PATTERN, BUILTIN, MAX_MESSAGES, MIN_CHILDREN_TO_FORK,
+from .skills import (BASE_SYSTEM, BRANCH_ID_PATTERN, BUILTIN, MAX_MESSAGES, MIN_BRANCH_SKILLS_TO_FORK,
                      REASON_CHARS, SUB_BRANCH_INSTRUCTIONS, SUB_DETACHED_BRANCH_INSTRUCTIONS,
                      skill_instructions, skill_listing)
 from .tools import CallToolResult, Tool, ToolContext, by_name, invoke_tool
@@ -527,15 +527,15 @@ class Host:
                  call_timeout: float | None = MODEL_CALL_TIMEOUT,
                  names: Callable[[], str] | None = None,
                  before_fork: Callable[[ForkContext], Any] | None = None,
-                 min_children_to_fork: int | None = MIN_CHILDREN_TO_FORK):
+                 min_branch_skills_to_fork: int | None = MIN_BRANCH_SKILLS_TO_FORK):
         self.store = store
         # The source of the ids a fork call leaves out (seeded in tests).
         self.names = names or new_names()
         # Optional host policy hook called before a fork commits (returns None to allow, or refusal string(s)).
         self.before_fork = before_fork
-        if min_children_to_fork is not None and min_children_to_fork < 1:
-            raise ValueError(f"min_children_to_fork must be >= 1 or None, got {min_children_to_fork!r}")
-        self.min_children_to_fork = min_children_to_fork
+        if min_branch_skills_to_fork is not None and min_branch_skills_to_fork < 1:
+            raise ValueError(f"min_branch_skills_to_fork must be >= 1 or None, got {min_branch_skills_to_fork!r}")
+        self.min_branch_skills_to_fork = min_branch_skills_to_fork
         self.persona = persona  # user-provided; identical, verbatim, on every timeline
         self.provider = provider
         self.tools = by_name(list(tools))  # the host's tools, by name (graft/tools.py)
@@ -1728,10 +1728,10 @@ class Host:
     def _resolve_branch_skills(self, requested: list[str], focus: bool) -> tuple[list[str], bool]:
         """Resolve full linked skills for a new branch and whether it gains `fork`.
 
-        - If `min_children_to_fork` is None: never grant `fork`; auto-link all descendants.
-        - If held skills own >= `min_children_to_fork` child skills: link `fork` (children stay
+        - If `min_branch_skills_to_fork` is None: never grant `fork`; auto-link all descendants.
+        - If held skills own >= `min_branch_skills_to_fork` child skills: link `fork` (children stay
           in the branch's child catalog and are forked on demand).
-        - If held skills own 1 .. min_children_to_fork-1 child skills: auto-link those children
+        - If held skills own 1 .. min_branch_skills_to_fork-1 child skills: auto-link those children
           directly (avoiding a single-child fork hop) and re-check the next level.
         - Always append `merge` (current) or `detached` (background)."""
         linked = list(requested)
@@ -1742,7 +1742,7 @@ class Host:
             children = self.store.children_of(caps, exclude=seen | set(BUILTIN))
             if not children:
                 break
-            if self.min_children_to_fork is not None and len(children) >= self.min_children_to_fork:
+            if self.min_branch_skills_to_fork is not None and len(children) >= self.min_branch_skills_to_fork:
                 can_fork = True
                 break
             for c in children:
