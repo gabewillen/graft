@@ -27,7 +27,7 @@ from a2a_schema import check
 from graft import a2a
 from graft.agent import GraftAgent, GraftConfig
 from graft.db import Store
-from graft.fake import FakeWorld
+from graft.fake import FakeTools
 from graft.providers import FakeProvider
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -100,7 +100,7 @@ def _results(out):
 def test_conformance(tmp_path, path):
     fixture = json.load(open(path))
     model = Scripted(fixture["script"])
-    world = FakeWorld()
+    world = FakeTools()
     count = itertools.count(1)
     agent = GraftAgent(Store(str(tmp_path / "c.db")), FakeProvider(model), tools=world.tools(),
                        config=GraftConfig(seeder=None, context_id="ctx", ids=lambda: f"t{next(count)}"))

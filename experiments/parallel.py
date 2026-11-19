@@ -1,25 +1,25 @@
-"""Parallel grafts vs sequential clone-join on one multi-part request.
+"""Parallel grafts vs sequential branch-join on one multi-part request.
 
 The same three deliverables (a website page, a slide deck, a calendar booking) are produced in
 two ways:
 
-  sequential: the user asks for one part per message. Each part gets a focus clone that takes the
+  sequential: the user asks for one part per message. Each part gets a focus branch that takes the
               conversation; the next message is out of its scope, so it joins and the original
-              clones again (clone, join, clone, join).
-  parallel:   the user asks for all three in one message. The original makes one clone call with
+              branches again (branch, join, branch, join).
+  parallel:   the user asks for all three in one message. The original makes one branch call with
               three background entries (focus=false), keeps the conversation, and is woken when
               they have joined.
 
-Reported per arm: the checks on the simulated world, user turns, follow-ups, model calls, clones
+Reported per arm: the checks on the simulated world, user turns, follow-ups, model calls, branches
 with their join reasons, wakes, and wall-clock.
 
-A live clone may ask the user a question instead of finishing (the website skill tells it to ask
+A live branch may ask the user a question instead of finishing (the website skill tells it to ask
 for missing details). So that a question is not scored as a failure of the harness, both arms
 get the same bounded follow-up: after each scripted message, while the last reply is a question
 and the checks are not met, one fixed user reply is sent, at most MAX_FOLLOW_UPS times per arm.
 
 Offline by default: a scripted provider (graft/fake.py) plays every role, and `--latency` adds a
-fixed delay to each model call so that overlap between background clones is visible in the
+fixed delay to each model call so that overlap between background branches is visible in the
 wall-clock. That shows the mechanics only. It says nothing about how a real model routes, seeds
 or writes; use `--live` (needs an API key) for that.
 
@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from graft.db import Store, validate  # noqa: E402
 from graft.fake import bench_graft_policy, parallel_graft_policy  # noqa: E402
 from graft.agent import GraftAgent, GraftConfig, HarnessError  # noqa: E402
-from graft.fake import FakeWorld  # noqa: E402
+from graft.fake import FakeTools  # noqa: E402
 from graft.providers import FakeProvider, make_provider  # noqa: E402
 from graft.sim import ask  # noqa: E402
 
@@ -66,7 +66,7 @@ FOLLOW_UP = "No other details; use what I gave you and finish."
 MAX_FOLLOW_UPS = 3  # per arm
 
 
-def checks(world: FakeWorld) -> dict[str, bool]:
+def checks(world: FakeTools) -> dict[str, bool]:
     site = " ".join(world.site.values()).lower()
     deck = world.decks[-1] if world.decks else {}
     booked = [(b.get("date"), b.get("time")) for b in world.calendar]
@@ -88,8 +88,8 @@ def slowed(policy: Policy, latency: float) -> Policy:
     return call
 
 
-async def converse(agent: GraftAgent, script: list[str], world: FakeWorld) -> tuple[list[tuple[str, str]], int]:
-    """Send the script. After each message, let background clones join, then apply the follow-up
+async def converse(agent: GraftAgent, script: list[str], world: FakeTools) -> tuple[list[tuple[str, str]], int]:
+    """Send the script. After each message, let background branches join, then apply the follow-up
     rule: while the last reply is a question and the checks are not met, answer it with
     FOLLOW_UP, at most MAX_FOLLOW_UPS times in all. Returns (transcript, follow-ups used)."""
     transcript: list[tuple[str, str]] = []
@@ -124,7 +124,7 @@ async def run_arm(arm: str, live: bool, latency: float, trace: bool, policy: Pol
     provider = make_provider() if live else FakeProvider(slowed(policy, latency))
     path = os.path.join(tempfile.mkdtemp(prefix=f"graft-parallel-{arm}-", dir=workdir), "m.db")
     store = Store(path)
-    world = FakeWorld()
+    world = FakeTools()
     # Offline means offline: no seeder call either, even with a TypeSafe key exported.
     seeder = {} if live else {"seeder": None}
     agent = GraftAgent(store, provider, tools=world.tools(), config=GraftConfig(
@@ -138,14 +138,14 @@ async def run_arm(arm: str, live: bool, latency: float, trace: bool, policy: Pol
     # One branch holds the conversation: the store's copy of each machine's state says which.
     holders = [r[0] for r in store.con.execute("SELECT timeline_id FROM timelines WHERE status IN ('active', 'joining')")]
     assert len(holders) == 1, f"invariant violated: holding the conversation: {holders}"
-    clones = [(r["timeline_id"], r["status"], r["join_reason"]) for r in store.con.execute(
+    branches = [(r["timeline_id"], r["status"], r["join_reason"]) for r in store.con.execute(
         "SELECT timeline_id, status, join_reason FROM timelines WHERE source_id IS NOT NULL ORDER BY timeline_id")]
     modes = [json.loads(r[0]).get("focus") for r in store.con.execute(
-        "SELECT scratch FROM transactions WHERE kind='clone' AND status='committed' ORDER BY tx_id")]
+        "SELECT scratch FROM transactions WHERE kind='branch' AND status='committed' ORDER BY tx_id")]
     res = {"arm": arm, "checks": checks(world), "user_turns": len(script), "follow_ups": follow_ups,
-           "model_calls": provider.usage["calls"], "wall_s": wall, "clones": clones,
+           "model_calls": provider.usage["calls"], "wall_s": wall, "branches": branches,
            "background": modes.count(False), "focus": modes.count(True), "wakes": len(agent._host.wakes),
-           "clone_calls": provider.by_tag.get("original:clone_tx", {}).get("calls", 0),
+           "branch_calls": provider.by_tag.get("original:branch_tx", {}).get("calls", 0),
            "view_violations": validate(store.view("o"), "o", require_user_end=False),
            "replies": [t for who, t in transcript if who == "assistant"], "db": path}
     await agent.close()
@@ -165,9 +165,9 @@ def report(results: list[dict], live: bool, latency: float) -> bool:
         if r["view_violations"]:
             print(f"  FAIL original's view is invalid: {r['view_violations']}")
         print(f"  user turns {r['user_turns']}; follow-ups {r['follow_ups']} (of at most {MAX_FOLLOW_UPS}); "
-              f"clone calls {r['clone_calls']}; clones {len(r['clones'])} "
+              f"branch calls {r['branch_calls']}; branches {len(r['branches'])} "
               f"({r['focus']} focus, {r['background']} background); wakes {r['wakes']}")
-        print(f"  clones: {', '.join(f'{c} {s}/{j}' for c, s, j in r['clones'])}")
+        print(f"  branches: {', '.join(f'{c} {s}/{j}' for c, s, j in r['branches'])}")
         print(f"  model calls {r['model_calls']}; wall-clock {r['wall_s']:.2f}s")
         print(f"  db: {r['db']}")
     seq, par = results
@@ -183,7 +183,7 @@ async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--live", action="store_true", help="use a real provider (needs an API key)")
     ap.add_argument("--latency", type=float, default=0.1, help="seconds added to each scripted model call")
-    ap.add_argument("--trace", action="store_true", help="show clone/join internals")
+    ap.add_argument("--trace", action="store_true", help="show branch/join internals")
     a = ap.parse_args()
     results = [await run_arm(arm, a.live, a.latency, a.trace) for arm in ("sequential", "parallel")]
     return 0 if report(results, a.live, a.latency) else 1

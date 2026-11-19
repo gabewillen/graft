@@ -2,7 +2,7 @@
 
 Every run gets its own provider instance (so usage is per run), its own store and World, and a
 unique conversation nonce (--cache-scope run). Metrics per run: pass, scored checks, usage by
-role, effective total, $ cost (when prices are set), calls, wall-clock latency, clones or
+role, effective total, $ cost (when prices are set), calls, wall-clock latency, branches or
 delegations, output spent on context passing, compactions.
 
 Context passing: graft = output of the original's calls that emitted `fork` (the default
@@ -46,7 +46,7 @@ from graft.sim import run_script  # noqa: E402
 from graft.skills import install  # noqa: E402
 from graft.subagent import SubagentRunner  # noqa: E402
 
-ROLES = ("parent/original", "handoff/clone-tx", "subagent/clone", "summary", "compaction", "seeder")
+ROLES = ("parent/original", "handoff/branch-tx", "subagent/branch", "summary", "compaction", "seeder")
 
 
 def role_of(arm: str, tag: str) -> str:
@@ -55,12 +55,12 @@ def role_of(arm: str, tag: str) -> str:
     if arm == "graft":
         if tag == "original":
             return "parent/original"
-        if tag.endswith(":clone_tx"):
-            return "handoff/clone-tx"
-        if tag.startswith("clone:"):
-            return "subagent/clone"
+        if tag.endswith(":branch_tx"):
+            return "handoff/branch-tx"
+        if tag.startswith("branch:"):
+            return "subagent/branch"
         return tag
-    return {"parent": "parent/original", "handoff": "handoff/clone-tx", "subagent": "subagent/clone",
+    return {"parent": "parent/original", "handoff": "handoff/branch-tx", "subagent": "subagent/branch",
             "summary": "summary"}.get(tag, tag)
 
 
@@ -143,7 +143,7 @@ async def run_one(sc: Scenario, arm: str, i: int, fake: bool, compact: int | Non
                      for x in slog]
     if arm == "graft" and agent is not None:
         seeds = []
-        for (scr,) in agent.store.con.execute("SELECT scratch FROM transactions WHERE kind='clone' AND status='committed'"):
+        for (scr,) in agent.store.con.execute("SELECT scratch FROM transactions WHERE kind='branch' AND status='committed'"):
             ids = json.loads(scr).get("seed", []) if scr else []
             seeds.append((len(ids), sum(len(agent.store.turn(i)["content"]) // 4 for i in ids)))
         rec["seed_sizes"] = seeds
@@ -152,12 +152,12 @@ async def run_one(sc: Scenario, arm: str, i: int, fake: bool, compact: int | Non
             "SELECT count(*) FROM timelines WHERE source_id IS NOT NULL").fetchone()[0]
         rec["joins"] = [tuple(r) for r in agent.store.con.execute(
             "SELECT timeline_id, join_reason FROM timelines WHERE source_id IS NOT NULL ORDER BY created_at")]
-        rec["context_out"] = roles.get("handoff/clone-tx", {}).get("output", 0)
+        rec["context_out"] = roles.get("handoff/branch-tx", {}).get("output", 0)
         await agent.close()
     elif agent is not None:
         rec["handoffs"] = len(agent.delegations)
         rec["delegations"] = [(d.skill, len(d.task_prompt), d.steps) for d in agent.delegations]
-        rec["context_out"] = sum(roles.get(k, {}).get("output", 0) for k in ("handoff/clone-tx", "summary"))
+        rec["context_out"] = sum(roles.get(k, {}).get("output", 0) for k in ("handoff/branch-tx", "summary"))
     else:
         rec["handoffs"], rec["context_out"] = 0, 0
     rec["compactions"] = len(getattr(records, "compactions", []) or [])
@@ -285,9 +285,9 @@ def report(recs: list[dict], pricing: cachestats.Pricing, scenarios: list[str], 
             hit = statistics.mean(cachestats.hit_rate(r["total"]) for r in rs)
             print(f"  {sc:<16} {arm:<9} hit rate {hit:.0%}; " + "; ".join(parts))
             costs = [run_cost(pricing, r) for r in rs]
-            cc = [r.get("role_cost", {}).get("handoff/clone-tx") for r in rs]
+            cc = [r.get("role_cost", {}).get("handoff/branch-tx") for r in rs]
             if None not in costs and cc and None not in cc and sum(costs):
-                print(f"      clone-call / handoff $ share {sum(cc) / sum(costs):.1%}")
+                print(f"      branch-call / handoff $ share {sum(cc) / sum(costs):.1%}")
             sites: Counter = Counter()
             for r in rs:
                 sites.update(r.get("call_sites", {}))
@@ -302,7 +302,7 @@ def report(recs: list[dict], pricing: cachestats.Pricing, scenarios: list[str], 
                       f"{sum(1 for x in sl if x['fallback'])}; truncated rows {sum(len(x['truncated'] or []) for x in sl)}")
             ss = [x for r in rs for x in r.get("seed_sizes", [])]
             if ss:
-                print(f"      clone seeds: {statistics.mean(x[0] for x in ss):.1f} rows / {statistics.mean(x[1] for x in ss):.0f} tokens mean")
+                print(f"      branch seeds: {statistics.mean(x[0] for x in ss):.1f} rows / {statistics.mean(x[1] for x in ss):.0f} tokens mean")
 
     pairs = [(a, b) for a in ("graft", "graft_summary") for b in ("subagent", "subagent_batched")
              if a in arms and b in arms] + [("graft", b) for b in ("graft_summary",)
@@ -393,11 +393,11 @@ def main() -> int:
                          "default: the model's known window; 0 = off")
     ap.add_argument("--out", default=None, help="write per-run records as JSON")
     ap.add_argument("--seeder", choices=("model", "jev"), default=None,
-                    help="clone seed actor (sets GRAFT_SEEDER; jev needs TYPESAFE_API_KEY)")
+                    help="branch seed actor (sets GRAFT_SEEDER; jev needs TYPESAFE_API_KEY)")
     ap.add_argument("--effort", action="append", default=[], metavar="SITE=LEVEL",
-                    help="per-call-site effort, e.g. clone_call=high (sets GRAFT_EFFORT_<SITE>; see graft/callsites.py)")
+                    help="per-call-site effort, e.g. branch_call=high (sets GRAFT_EFFORT_<SITE>; see graft/callsites.py)")
     ap.add_argument("--model", action="append", default=[], metavar="SITE=MODEL",
-                    help="per-call-site model, e.g. clone_call=gpt-6-luna (sets GRAFT_MODEL_<SITE>)")
+                    help="per-call-site model, e.g. branch_call=gpt-6-luna (sets GRAFT_MODEL_<SITE>)")
     a = ap.parse_args()
     if a.seeder:
         os.environ["GRAFT_SEEDER"] = a.seeder

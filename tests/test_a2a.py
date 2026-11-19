@@ -15,7 +15,7 @@ from a2a_schema import check, problems
 from graft import a2a
 from graft.agent import GraftAgent, GraftConfig, HarnessError, fold
 from graft.db import Store
-from graft.fake import FakeWorld
+from graft.fake import FakeTools
 from graft.providers import FakeProvider
 
 GATE = 5  # seconds a scripted model call waits for its gate before the test fails
@@ -64,7 +64,7 @@ class Policy:
                 return text("Report: done.") if self.mode == "detached" else []
             if self.mode is None or REQUEST not in json.dumps(messages[-1]):
                 return text("Hello.")
-            entry = {"skills": ["website"], "messages": [REQUEST], "reason": "Build the site."}
+            entry = {"skills": ["website"], "messages": [1], "reason": "Build the site."}
             return fork(**({"current": entry} if self.mode == "current" else {"detached": [entry]}))
         self.branch_started.set()
         assert self.gate.wait(GATE)

@@ -21,7 +21,7 @@ from typing import Callable, Iterator, Protocol
 
 ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-5-5"
 # Preference order for OpenAI; the first id that the Models API lists wins.
-OPENAI_PREFERENCE = ("gpt-5.4-mini", "gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini")
+OPENAI_PREFERENCE = ("gpt-6-luna", "gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini")
 
 # Context windows (input tokens) by model id prefix, longest prefix wins. Source: the Claude
 # API model table (2026-11). Models not listed have no known window: joins are not size-checked.

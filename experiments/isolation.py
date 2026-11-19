@@ -8,7 +8,7 @@ The same slides task runs N times in each arm (default 20), with arms run concur
           newsletter, social and recipes, and did real tool work in each skill's house
           style (emoji, exclamation marks, ALL CAPS, #hashtags, slang, closing questions,
           lowercase titles). Then the slides task arrives, and it must load_skill('slides').
-  clone:  graft. The clone is seeded only with the task's user row, linked to slides+join,
+  branch:  graft. The branch is seeded only with the task's user row, linked to slides+join,
           and also has to load_skill('slides') itself.
 
   subagent: the delegation baseline. A parent with the same history (and the persona plus a
@@ -52,7 +52,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from graft import cachestats  # noqa: E402
 from graft.db import Graft, Store, render  # noqa: E402
-from graft.fake import FakeWorld  # noqa: E402
+from graft.fake import FakeTools  # noqa: E402
 from graft.harness import Host  # noqa: E402
 from graft.providers import FakeProvider, add_usage, empty_usage, make_provider, prefix_nonce  # noqa: E402
 from graft.skills import (BASE_SYSTEM, LOAD_SKILL_TOOL, install, load_skill,  # noqa: E402
@@ -126,19 +126,19 @@ def build_history(store: Store, tl: str) -> None:
 
 def build(path: str, provider):
     store = Store(path)
-    install(store, tools=FakeWorld().definitions())
+    install(store, tools=FakeTools().definitions())
     store.create_timeline(tl="o", source=None, skills=["fork"])
     build_history(store, "o")
     task_row = store.add_turn("o", "user", "text", TASK)
-    # clone arm: graft clone seeded only with the task-relevant user row
-    store.commit_clone(source="o", grafts=[Graft(child="c1", seed=[task_row], skills=["slides", "merge"], focus=True)])
+    # branch arm: graft branch seeded only with the task-relevant user row
+    store.commit_branch(source="o", grafts=[Graft(child="c1", seed=[task_row], skills=["slides", "merge"], focus=True)])
     # shared arm: one timeline with every capability skill linked and the same history
     store.create_timeline("shared", None, CAPABILITY)
     for r in store.view("o"):
         store.append("shared", r["row_id"])
-    h = Host(store, provider)  # its wording of the clone's system prompt
+    h = Host(store, provider)  # its wording of the branch's system prompt
     arms = {
-        "clone": {
+        "branch": {
             "rows": store.view("c1"), "system": h.system("c1"), "tools": store.tools_for("c1"),
             "linked": {"slides", "merge"}},
         "shared": {
@@ -154,7 +154,7 @@ def build(path: str, provider):
     return store, arms
 
 
-def subagent_run(provider, arm: dict, world: FakeWorld, nonce: str | None) -> dict:
+def subagent_run(provider, arm: dict, world: FakeTools, nonce: str | None) -> dict:
     """Parent writes the handoff (one call on the shared history), then the subagent works."""
     with provider.usage_tag("parent"):
         blocks = provider.complete(arm["system"], prefix_nonce(render(arm["rows"]), nonce), arm["tools"])
@@ -169,7 +169,7 @@ def subagent_run(provider, arm: dict, world: FakeWorld, nonce: str | None) -> di
     return {"texts": [d.summary], "loaded": d.loaded, "handoff": d.task_prompt, "summary": d.summary}
 
 
-def agent_loop(provider, instructions: dict[str, str], arm: dict, world: FakeWorld, max_steps: int = 8,
+def agent_loop(provider, instructions: dict[str, str], arm: dict, world: FakeTools, max_steps: int = 8,
                nonce: str | None = None) -> dict:
     msgs = prefix_nonce(render(arm["rows"]), nonce)
     texts, loaded = [], []
@@ -205,7 +205,7 @@ def title_case(t: str) -> bool:
     return bool(words) and all(w[0].isupper() for i, w in enumerate(words) if i == 0 or w.lower() not in small)
 
 
-def score(world: FakeWorld, run: dict) -> dict:
+def score(world: FakeTools, run: dict) -> dict:
     calls = Counter(name for name, _ in world.log)
     deck = world.decks[-1] if world.decks else {"title": "", "slides": []}
     titles = [deck.get("title", "")] + [s["title"] for s in deck["slides"]]
@@ -335,7 +335,7 @@ def main() -> int:
 
     def job(arm_name: str, i: int) -> tuple[str, int, dict]:
         usage = provider.thread_usage_reset()
-        world = FakeWorld()
+        world = FakeTools()
         nonce = uuid.uuid4().hex[:16] if a.cache_scope == "run" else None
         try:
             if arm_name == "subagent":
@@ -403,24 +403,24 @@ def main() -> int:
         print(cachestats.prefix_line(name, prefix_counts[name], cachestats.min_cacheable(provider.name)))
     print("\nsignificance (two-sided; alpha=0.05):")
     for other in [n for n in ("shared", "subagent") if n in results]:
-        c, s = results["clone"], results[other]
+        c, s = results["branch"], results[other]
         pc, ps = sum(r["correct"] for r in c), sum(r["correct"] for r in s)
         p_pass = fisher_two_sided(pc, len(c), ps, len(s))
-        print(f"  pass rate clone {pc}/{len(c)} vs {other} {ps}/{len(s)}: Fisher p={p_pass:.4f}"
+        print(f"  pass rate branch {pc}/{len(c)} vs {other} {ps}/{len(s)}: Fisher p={p_pass:.4f}"
               f" -> {'SIGNIFICANT' if p_pass < 0.05 else 'not significant'}")
         p_score = permutation_p([r["score"] for r in c], [r["score"] for r in s])
-        print(f"  mean score clone {statistics.mean(r['score'] for r in c):.3f} vs {other} "
+        print(f"  mean score branch {statistics.mean(r['score'] for r in c):.3f} vs {other} "
               f"{statistics.mean(r['score'] for r in s):.3f}: permutation p={p_score:.4f}"
               f" -> {'SIGNIFICANT' if p_score < 0.05 else 'not significant'}")
         for k in LEAKS:
             lc, ls = sum(r["leaks"][k] for r in c), sum(r["leaks"][k] for r in s)
             if lc or ls:
                 p = fisher_two_sided(lc, len(c), ls, len(s))
-                print(f"  leak {k}: clone {lc}/{len(c)} vs {other} {ls}/{len(s)}: Fisher p={p:.4f}"
+                print(f"  leak {k}: branch {lc}/{len(c)} vs {other} {ls}/{len(s)}: Fisher p={p:.4f}"
                       f" -> {'SIGNIFICANT' if p < 0.05 else 'not significant'}")
         anyc, anys = sum(any(r["leaks"].values()) for r in c), sum(any(r["leaks"].values()) for r in s)
         p_any = fisher_two_sided(anyc, len(c), anys, len(s))
-        print(f"  any leakage: clone {anyc}/{len(c)} vs {other} {anys}/{len(s)}: Fisher p={p_any:.4f}"
+        print(f"  any leakage: branch {anyc}/{len(c)} vs {other} {anys}/{len(s)}: Fisher p={p_any:.4f}"
               f" -> {'SIGNIFICANT' if p_any < 0.05 else 'not significant'}")
     print(f"db: {path}")
     return 0

@@ -1,7 +1,7 @@
 """A deterministic scripted policy for FakeProvider (offline tests and dry runs).
 
 It plays every role through the same neutral interface a real model sees, so the
-whole branch -> converse -> merge -> re-branch path (graft's clone and join) runs without an API key.
+whole branch -> converse -> merge -> re-branch path (graft's branch and join) runs without an API key.
 """
 
 from __future__ import annotations
@@ -76,19 +76,24 @@ def texts_of(messages: list[dict]) -> list[str]:
     return _user_texts(messages)
 
 
-def _quotes(messages: list[dict]) -> list[str]:
-    """The user's messages as fork pointers: exact quotes, without the conversation nonce, once each."""
-    out: list[str] = []
+_ROW_TAG = re.compile(r"^(?:\[conversation [^\]]*\]\s*)?\[#(\d+)\]\s*")
+
+
+def _row_ids(messages: list[dict]) -> list[int]:
+    """The user's messages as integer row-id pointers (from main's `[#<id>]` prefixes)."""
+    out: list[int] = []
     for t in _user_texts(messages):
-        q = re.sub(r"^\[conversation [^\]]*\]\s*", "", t).strip()
-        if q and q not in out:
-            out.append(q)
+        m = _ROW_TAG.match(t)
+        if m:
+            rid = int(m.group(1))
+            if rid not in out:
+                out.append(rid)
     return out
 
 
 def _entry(messages: list[dict], skills: list[str]) -> dict:
-    """A fork entry that points at the user's messages: the fake original seeds a branch with them."""
-    return {"skills": skills, "messages": _quotes(messages)}
+    """A fork entry that points at the user's messages by integer row id."""
+    return {"skills": skills, "messages": _row_ids(messages)}
 
 
 def _ids_from_sql(out: str) -> list[int]:
@@ -106,23 +111,17 @@ def pivot_policy(system: str, messages: list[dict], tools: list[dict]) -> list[d
         user = [re.sub(r"^\[conversation [^\]]*\]\s*", "", t) for t in texts_of(messages)]
         wants_slides = any("slide" in t.lower() for t in user)
         return _use(tool="fork", current=_entry(messages=messages, skills=["slides" if wants_slides else "website"]))
-    # a clone: load its capability skill first (progressive disclosure)
-    skill = "website" if "site_write" in names else "slides" if "slides_create" in names else None
-    loaded = any(b["type"] == "tool_use" and b["name"] == "load_skill"
-                 for m in messages if m["role"] == "assistant" for b in m["content"])
+    # a branch: its linked skills are already auto-loaded in its system prompt
     prev_tool = next((b["name"] for m in reversed(messages) if m["role"] == "assistant"
                       for b in m["content"] if b["type"] == "tool_use"), None)
     texts = _user_texts(messages)
-    fresh = last["type"] == "text" or prev_tool == "fork"  # a branch's first view ends on its fork result
-    if skill and not loaded and fresh:
-        return _use("load_skill", name=skill)
     if last["type"] == "tool_result" and prev_tool not in ("load_skill", "fork"):
         return _text("Done. Anything else?")
     msg = texts[-1] if texts else ""
     if "site_write" in names:
         # it merges with a reason (handing the request back) only for a slide request after it acted;
         # a seed that also mentions slides is another instance's part
-        acted = any(b["type"] == "tool_use" and b["name"] != "load_skill"
+        acted = any(b["type"] == "tool_use" and b["name"] not in ("load_skill", "fork")
                     for m in messages if m["role"] == "assistant" for b in m["content"])
         answered = any(m["role"] == "assistant" and any(b["type"] == "text" for b in m["content"])
                        for m in messages)
@@ -171,7 +170,7 @@ _DATE = re.compile(r"(\d{4}-\d{2}-\d{2})\D+(\d{1,2}:\d{2})")
 
 
 def _clean(t: str) -> str:
-    return re.sub(r"^\[conversation [^\]]*\]\s*", "", t)
+    return re.sub(r"^(?:\[conversation [^\]]*\]\s*)?(?:\[#\d+\]\s*)?", "", t)
 
 
 def _wants(text: str) -> list[str]:
@@ -183,7 +182,7 @@ def _summary(messages: list[dict]) -> list[dict]:
 
 
 def _act(names: set[str], messages: list[dict]) -> list[dict]:
-    """A capability holder's action on the latest user request (shared by clones and subagents)."""
+    """A capability holder's action on the latest user request (shared by branches and subagents)."""
     texts = [_clean(t) for t in _user_texts(messages)]
     joined = " ".join(texts)
     out: list[dict] = []
@@ -202,10 +201,10 @@ def _holder_policy(names: set[str], messages: list[dict]) -> list[dict]:
     used = [b for m in messages if m["role"] == "assistant" for b in m["content"] if b["type"] == "tool_use"]
     caps = [s for s, prefix in (("slides", "slides_"), ("calendar", "calendar_"), ("website", "site_"))
             if any(n.startswith(prefix) for n in names)]
-    if not any(u["name"] == "load_skill" for u in used) and caps:
+    if "load_skill" in names and not any(u["name"] == "load_skill" for u in used) and caps:
         return _use("load_skill", name=caps[0])
     if last["type"] == "tool_result":
-        if used and used[-1]["name"] == "load_skill":
+        if used and used[-1]["name"] in ("load_skill", "fork"):
             return _act(names, messages)
         errs = [b for b in messages[-1]["content"] if b["type"] == "tool_result" and b.get("is_error")]
         return _text("Sorry, I could not complete that: " + str(errs[0]["content"])[:120]) if errs \
@@ -262,7 +261,7 @@ def bench_graft_policy(system: str, messages: list[dict], tools: list[dict]) -> 
 
 
 def parallel_graft_policy(system: str, messages: list[dict], tools: list[dict]) -> list[dict]:
-    """Like bench_graft_policy, but a request that names several skills becomes one clone call
+    """Like bench_graft_policy, but a request that names several skills becomes one branch call
     with one background entry per skill; the original keeps the conversation and reports when
     the harness wakes it (experiments/parallel.py)."""
     names = {t["name"] for t in tools}
@@ -342,7 +341,7 @@ async def _finish(awaitable):
 
 
 @dataclass
-class FakeWorld:
+class FakeTools:
     """The simulated world behind the simulated skills' tools (a fake website, slide decks, a
     calendar): `tools()` is the list of Tools a test, the simulator or an experiment gives graft.
     Each tool's function calls `execute(name, args)`, which returns (content, is_error) or an

@@ -1,4 +1,4 @@
-"""Skill catalog: three built-ins (fork, merge, detached: graft's clone skill, and the join skills of
+"""Skill catalog: three built-ins (fork, merge, detached: graft's branch skill, and the join skills of
 a focus graft and a background graft, as the model is told them) and simulated capability skills.
 
 A capability skill names its tools; the tools themselves are the host's (graft/tools.py), and the
@@ -52,14 +52,14 @@ CANCEL_TOOL = {
 # What a branch id looks like: chosen by the model, or drawn by the harness (6 hex characters).
 BRANCH_ID_PATTERN = "^[a-z0-9][a-z0-9-]{0,31}$"
 
-# One entry of the fork call: the skills the branch holds, the messages it starts from (pointers:
-# short exact quotes or row ids), optionally main's own words for it, and optionally its id.
-MESSAGES = {"type": "array", "maxItems": MAX_MESSAGES, "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
-            "description": "The messages of this conversation the branch starts from: each a short exact "
-                           "quote of one message (or its row id). It may be empty if you give a reason."}
+# One entry of the fork call: the skills the branch holds, the messages it starts from (integer
+# row ids), optionally main's own words for it, and optionally its id.
+MESSAGES = {"type": "array", "maxItems": MAX_MESSAGES, "items": {"type": "integer"},
+            "description": "The integer row ids (the [#id] numbers shown on messages) of the messages "
+                           "this branch starts from. It may be empty if you give a reason."}
 REASON = {"type": "string", "maxLength": REASON_CHARS, "description": "Your own words for this branch: the part it does, and anything "
                                            "it needs to know that the messages do not say."}
-CLONE_ENTRY = obj({"id": {"type": "string", "pattern": BRANCH_ID_PATTERN}, "skills": STRS,
+BRANCH_ENTRY = obj({"id": {"type": "string", "pattern": BRANCH_ID_PATTERN}, "skills": STRS,
                    "messages": MESSAGES, "reason": REASON}, ["skills", "messages"])
 
 BASE_SYSTEM = (
@@ -68,8 +68,8 @@ BASE_SYSTEM = (
     "assistant and you narrow your tools for each task."
 )
 
-# The `fork` skill: graft's clone skill, as the original is told it.
-CLONE_INSTRUCTIONS = """\
+# The `fork` skill: graft's branch skill, as the original is told it.
+BRANCH_INSTRUCTIONS = """\
 You are on main, and you stay on main. You talk with the user, route each request, and work on it
 by forking yourself: each branch you fork is you, carrying on with one part of the request and
 holding only the skills that part needs. Every other capability (see the skill catalog below) is
@@ -89,9 +89,9 @@ stays on main.
 FORK. `fork(current={...}, detached=[{...}, ...])` starts every branch it names at once. Give
 `current`, `detached`, or both. Each branch is `{id?, skills, messages, reason?}`:
 - `skills`: catalog skill names the branch holds (never `fork`, `merge` or `detached`).
-- `messages`: the messages of this conversation the branch starts from, each a short exact quote
-  of one message (or its row id). The branch sees only these, then this fork call. You choose
-  what each branch sees, as a git branch is cut from the commits you pick: point it at what its
+- `messages`: the integer row ids (the `[#id]` prefix shown on each message) of the messages this
+  branch starts from. The branch sees only those messages, then this fork call. You choose what
+  each branch sees, as a git branch is cut from the commits you pick: point it at the row ids its
   part needs. It may be empty when `reason` says everything.
 - `reason`: your own words for that branch: which part of the request is its own, and anything it
   needs that the messages do not say. The branch reads it in this fork call. Give every branch a
@@ -177,42 +177,25 @@ branch's.
 
 CATALOG: list[Skill] = [
     Skill(name="fork",
-          description="Built-in. You stay on main. When a user request needs any catalog skill, call "
-          "fork(current={...}, detached=[...]) right away, with no text, instead of doing or planning "
-          "the work here. Each is a new branch of yourself holding only the skills its part needs, "
-          "starting from the messages you point it at and the reason you write for it: the current one "
-          "talks with the user for one turn; detached ones work out of sight. Every branch merges back "
-          "when its turn ends. stop(ids=[ids]) stops detached branches that are still running. Load this "
-          "skill for main, current and detached branches, messages and reasons, stopping, and merging.",
-          instructions=CLONE_INSTRUCTIONS, tools=[
-        LOAD_SKILL_TOOL,
+          description="Built-in. You stay on main. Fork current and detached branches to do catalog-skill work.",
+          instructions=BRANCH_INSTRUCTIONS, tools=[
         {"name": "fork", "description": "Fork yourself in one call; you stay on main. `current`: a new "
                                           "branch that talks with the user for one turn; `detached`: new "
                                           "branches that work out of sight; give either or both. Each "
                                           "branch names the skills it holds, the messages it starts from, "
                                           "your reason (its part, in your words) and, optionally, its id.",
-         "inputSchema": obj(props={"current": CLONE_ENTRY,
-                                    "detached": {"type": "array", "items": CLONE_ENTRY}}, required=[])},
+         "inputSchema": obj(props={"current": BRANCH_ENTRY,
+                                    "detached": {"type": "array", "items": BRANCH_ENTRY}}, required=[])},
         CANCEL_TOOL,
     ]),
     Skill(name="merge",
-          description="Built-in. You are on a branch of yourself for one turn, talking with the user. "
-          "Do the part the reason you wrote for this branch gives it (without one: the part your "
-          "skills cover) and say nothing about the rest; you are doing it on other branches or on "
-          "main. End your turn with a reply to the user (what you did, or your question): the end "
-          "of your turn merges this branch back into main. Load this skill for details.",
+          description="Built-in. You are on a current branch talking with the user for one turn.",
           instructions=JOIN_INSTRUCTIONS, tools=[
-        LOAD_SKILL_TOOL,
         JOIN_TOOL,
     ]),
     Skill(name="detached",
-          description="Built-in. You are on a detached branch of yourself: you cannot reach the user, so "
-          "never ask questions. Do the part the reason you wrote for this branch gives it (without "
-          "one: the part your skills cover) and say nothing about the rest. Write your result as a "
-          "final reply; the end of your turn merges this branch back into main. Load this skill for "
-          "details.",
+          description="Built-in. You are on a detached branch working out of sight.",
           instructions=BACKGROUND_INSTRUCTIONS, tools=[
-        LOAD_SKILL_TOOL,
         JOIN_TOOL,
     ]),
     Skill("website", "Build and edit a small website (pages with text content).",
@@ -259,6 +242,16 @@ def skill_listing(store: Store, names: list[str], heading: str) -> str:
     rows = [store.con.execute("SELECT name, description FROM skills WHERE name=?", (n,)).fetchone()
             for n in names]
     return heading + "\n" + "\n".join(f"- {r[0]}: {r[1]}" for r in rows if r)
+
+
+def skill_instructions(store: Store, names: list[str]) -> str:
+    """Full instructions for every skill linked to a timeline (loaded automatically on fork)."""
+    blocks = []
+    for n in names:
+        row = store.con.execute("SELECT name, instructions FROM skills WHERE name=?", (n,)).fetchone()
+        if row:
+            blocks.append(f"## {row[0]}\n{row[1]}")
+    return "\n\n".join(blocks)
 
 
 def install(store: Store, tools: dict[str, dict] | None = None, skills: list[Skill] | None = None) -> None:

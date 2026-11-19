@@ -18,7 +18,7 @@ summaries, compaction or nested delegation), so no verdict is drawn from it.
 Graft checks:
   1. every website branch merged at the end of its turn, and the pivot reached the original
   2. the original's (default) joins committed and it holds the facts
-  3. the slides clone's seed points at the user's own audience and tone rows
+  3. the slides branch's seed points at the user's own audience and tone rows
      (same row_ids -> verbatim, no paraphrase)
   4. the deck uses those facts
 
@@ -47,7 +47,7 @@ from graft import cachestats  # noqa: E402
 from graft.db import Store  # noqa: E402
 from graft.fake import pivot_policy, subagent_policy  # noqa: E402
 from graft.agent import GraftAgent, GraftConfig  # noqa: E402
-from graft.fake import FakeWorld  # noqa: E402
+from graft.fake import FakeTools  # noqa: E402
 from graft.harness import Host  # noqa: E402
 from graft.providers import FakeProvider, add_usage, empty_usage, make_provider  # noqa: E402
 from graft.sim import run_script  # noqa: E402
@@ -69,7 +69,7 @@ SCRIPT = ["Hi! I need a website for my business.", FACT_AUDIENCE, FACT_TONE, FAC
           nudge, nudge]
 
 
-def clones_with(store: Store, skill: str) -> list[str]:
+def branches_with(store: Store, skill: str) -> list[str]:
     return [r[0] for r in store.con.execute(
         "SELECT ts.timeline_id FROM timeline_skills ts JOIN skills s USING(skill_id) "
         "JOIN timelines t USING(timeline_id) WHERE s.name=? AND t.source_id IS NOT NULL "
@@ -96,18 +96,18 @@ def graft_checks(store, world, provider=None, verbose: bool = True) -> bool:
         print(f"info: provider={provider.name}:{provider.model} usage={getattr(provider, 'usage', {})}")
     ok = all(c[1] for c in checks)
     print(f"OVERALL (graft): {'PASS' if ok else 'FAIL'}")
-    clones = [r for r in s.con.execute(
+    branches = [r for r in s.con.execute(
         "SELECT timeline_id, join_reason, join_trigger FROM timelines WHERE source_id IS NOT NULL "
         "ORDER BY created_at")]
-    print(f"info: clones={len(clones)} joins={[(c['timeline_id'], c['join_reason'], c['join_trigger']) for c in clones]}")
+    print(f"info: branches={len(branches)} joins={[(c['timeline_id'], c['join_reason'], c['join_trigger']) for c in branches]}")
     return ok
 
 
 def pivot_structural_checks(store, world) -> list[tuple[str, bool, str]]:
     s = store
     checks: list[tuple[str, bool, str]] = []
-    web = clones_with(s, "website")
-    slides = clones_with(s, "slides")
+    web = branches_with(s, "website")
+    slides = branches_with(s, "slides")
     aud, tone, svc = user_row(s, FACT_AUDIENCE), user_row(s, FACT_TONE), user_row(s, FACT_SERVICES)
     piv = user_row(s, PIVOT)
     # every user message reaches the original: a current branch holds the conversation for one turn
@@ -124,12 +124,12 @@ def pivot_structural_checks(store, world) -> list[tuple[str, bool, str]]:
                    bool(txs and all(t and t["status"] == "committed" for t in txs) and aud in held and tone in held),
                    f"join txs={[dict(t) if t else None for t in txs]}; fact rows in original's context: {remembered}"))
     sl = slides[0] if slides else None
-    # the seed: pointers the clone did not produce itself
+    # the seed: pointers the branch did not produce itself
     seed = [r["row_id"] for r in s.view(sl) if r["owner_timeline"] != sl] if sl else []
     owners = {r: s.turn(r)["owner_timeline"] for r in (aud, tone, svc) if r}
     checks.append(("slides seed holds audience+tone rows verbatim (same row_ids)",
                    bool(sl and aud in seed and tone in seed),
-                   f"slides clone={sl} seed={seed} audience_row={aud} tone_row={tone} "
+                   f"slides branch={sl} seed={seed} audience_row={aud} tone_row={tone} "
                    f"services_row={svc} (in seed: {svc in seed}) owners={owners}"))
     paraphrase = [r for r in seed if s.turn(r)["role"] == "assistant" and s.turn(r)["kind"] == "text"
                   and s.turn(r)["owner_timeline"] == s.root()]
@@ -183,22 +183,22 @@ def fact_table(handoff: str, deck: str) -> list[str]:
 
 
 # ------------------------------------------------------------------ cache tables
-# Common role names across arms: parent/original, handoff/clone-tx, subagent/clone, summary/join-tx.
-ROLE_ORDER = ("parent/original", "handoff/clone-tx", "subagent/clone", "summary/join-tx")
+# Common role names across arms: parent/original, handoff/branch-tx, subagent/branch, summary/join-tx.
+ROLE_ORDER = ("parent/original", "handoff/branch-tx", "subagent/branch", "summary/join-tx")
 
 
 def graft_role(tag: str) -> str:
     if tag == "original":
         return "parent/original"
-    if tag.endswith(":clone_tx"):
-        return "handoff/clone-tx"
-    if tag.startswith("clone:"):
-        return "subagent/clone"
+    if tag.endswith(":branch_tx"):
+        return "handoff/branch-tx"
+    if tag.startswith("branch:"):
+        return "subagent/branch"
     return tag
 
 
 def subagent_role(tag: str) -> str:
-    return {"parent": "parent/original", "handoff": "handoff/clone-tx", "subagent": "subagent/clone",
+    return {"parent": "parent/original", "handoff": "handoff/branch-tx", "subagent": "subagent/branch",
             "summary": "summary/join-tx"}.get(tag, tag)
 
 
@@ -252,7 +252,7 @@ def first_call_line(label: str, call: dict | None) -> str:
 async def run_graft(provider, nonce: str | None, quiet: bool, db_path: str | None) -> dict:
     path = db_path or os.path.join(tempfile.mkdtemp(prefix="graft-pivot-"), "pivot.db")
     store = Store(path)
-    world = FakeWorld()
+    world = FakeTools()
     agent = GraftAgent(store, provider, tools=world.tools(), config=GraftConfig(
         trace=None if quiet else (lambda m: print("  · " + m)), nonce=nonce))
     h = agent._host  # its wording of each timeline's system prompt, for the cache report
@@ -260,22 +260,22 @@ async def run_graft(provider, nonce: str | None, quiet: bool, db_path: str | Non
     await agent.start()
     await run_script(agent, SCRIPT, world=world)
     ok = graft_checks(store, world, provider)
-    slides = clones_with(store, "slides")
+    slides = branches_with(store, "slides")
     sl = slides[0] if slides else None
     seed_rows = [r for r in store.view(sl) if r["owner_timeline"] != sl] if sl else []
     seed_text = "\n".join(r["content"] for r in seed_rows if r["kind"] == "text")
-    print("\nslides clone seed (pointers to existing rows; no text generated for the handoff):")
+    print("\nslides branch seed (pointers to existing rows; no text generated for the handoff):")
     for r in seed_rows:
         print(f"  row {r['row_id']} owner={r['owner_timeline']} {r['role']} {r['kind']}: {r['content'][:200]}")
-    print("fact preservation (DIAGNOSTIC only, no verdict; handoff = first slides clone's seed):")
+    print("fact preservation (DIAGNOSTIC only, no verdict; handoff = first slides branch's seed):")
     print("\n".join(fact_table(seed_text, world.deck_text())))
     roles = cache_table("graft", provider, graft_role,
-                        [(f"  {t}", u) for t, u in sorted(provider.by_tag.items()) if t.startswith("clone:")])
-    print("first call of each clone (does a fresh clone get any cache hit?):")
+                        [(f"  {t}", u) for t, u in sorted(provider.by_tag.items()) if t.startswith("branch:")])
+    print("first call of each branch (does a fresh branch get any cache hit?):")
     root = store.root()
     for tl in [r[0] for r in store.con.execute(
             "SELECT timeline_id FROM timelines WHERE source_id IS NOT NULL ORDER BY created_at")]:
-        print(first_call_line(tl, next((c for c in provider.call_log if c["tag"] == f"clone:{tl}"), None)))
+        print(first_call_line(tl, next((c for c in provider.call_log if c["tag"] == f"branch:{tl}"), None)))
         print("    static prefix vs original: " + shared_prefix(
             provider, h.system(root), store.tools_for(root), h.system(tl), store.tools_for(tl)))
     print(f"db: {path}")
@@ -287,7 +287,7 @@ async def run_graft(provider, nonce: str | None, quiet: bool, db_path: str | Non
 
 async def run_subagent(provider, nonce: str | None, quiet: bool) -> dict:
     store = Store(":memory:")
-    world = FakeWorld()
+    world = FakeTools()
     install(store, tools=world.definitions())
     r = SubagentRunner(store, provider, tools=world.tools(), nonce=nonce,
                        trace=None if quiet else (lambda m: print("  · " + m)))
@@ -328,12 +328,12 @@ def comparison(res: dict, provider) -> None:
     print("  " + pricing.assumptions())
     if "graft" in res:
         m = res["graft"]["roles"]
-        tx = m.get("handoff/clone-tx", {}).get("output", 0)
-        print(f"  graft: output tokens in calls that emitted one-shot clone(seed) "
+        tx = m.get("handoff/branch-tx", {}).get("output", 0)
+        print(f"  graft: output tokens in calls that emitted one-shot branch(seed) "
               f"(the default join makes no call; incl. reasoning) = {tx}")
     if "subagent" in res:
         sa = res["subagent"]["roles"]
-        ho, sm = (sa.get(k, {}).get("output", 0) for k in ("handoff/clone-tx", "summary/join-tx"))
+        ho, sm = (sa.get(k, {}).get("output", 0) for k in ("handoff/branch-tx", "summary/join-tx"))
         print(f"  subagent: output tokens in calls that wrote handoff prompts {ho} + summaries {sm} = {ho + sm} "
               f"(incl. reasoning)")
     for arm, r in res.items():
@@ -343,7 +343,7 @@ def comparison(res: dict, provider) -> None:
               f"{pricing.effective_input(r['roles']['TOTAL']):.0f}, effective total "
               f"{pricing.effective_total(r['roles']['TOTAL']):.0f}")
     store = Store(":memory:")
-    world = FakeWorld()
+    world = FakeTools()
     install(store, tools=world.definitions())
     store.create_timeline(tl="o", source=None, skills=["fork"])
     h, sub = Host(store, provider, tools=world.tools()), SubagentRunner(store, provider, tools=world.tools())

@@ -7,7 +7,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from graft import seeder as sd
-from _util import clone_in_turn, conversation, chat_of, install_fake
+from _util import branch_in_turn, conversation, chat_of, install_fake
 from graft.db import Store
 from graft.harness import Host
 from graft.providers import FakeProvider
@@ -66,7 +66,7 @@ def test_jev_selects_by_threshold_with_trigger_and_audit(tmp_path, monkeypatch):
         await chat_of(h).start()
         r = rows(store)
         # the decisions client picks the seed; the entry names only its skills
-        children, text = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
+        children, text = await branch_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
             "current": {"skills": ["slides"]}}})
         assert children == ["c1"], text
         seed = [x["row_id"] for x in store.view("c1")]
@@ -76,7 +76,7 @@ def test_jev_selects_by_threshold_with_trigger_and_audit(tmp_path, monkeypatch):
         assert f"row_{r['note']}" not in questions and len(questions) == 6
         q = questions[f"row_{r['u2']}"].instructions
         assert q["before"]["row_id"] == r["a1"] and q["after"]["row_id"] == r["a2"]  # neighbour rows
-        tx = store.con.execute("SELECT scratch FROM transactions WHERE kind='clone' AND status='committed'").fetchone()
+        tx = store.con.execute("SELECT scratch FROM transactions WHERE kind='branch' AND status='committed'").fetchone()
         audit = json.loads(tx[0])["seeder"]
         assert audit["threshold"] == 0.4 and audit["selected"] == seed and audit["fallback"] is None
         assert audit["scores"][str(r["u2"])] == 0.9 and audit["model"] == "jev-1.13.0" and audit["input_tokens"] == 600
@@ -98,7 +98,7 @@ def test_leading_assistant_row_gets_nearest_earlier_user_row(tmp_path, monkeypat
     async def go():
         await chat_of(h).start()
         r = rows(store)
-        (child,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
+        (child,), _ = await branch_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
             "current": {"skills": ["slides"]}}})
         assert [x["row_id"] for x in store.view(child)] == [r["u2"], r["a2"], r["trig"]]
         assert h.seeder_log[0]["added_lead_user_row"] == r["u2"]
@@ -115,7 +115,7 @@ def test_seeder_failure_falls_back_to_the_entrys_messages_and_is_recorded(tmp_pa
     async def go():
         await chat_of(h).start()
         r = rows(store)
-        (child,), text = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
+        (child,), text = await branch_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
             "current": {"skills": ["slides"]}}})
         audit = h.seeder_log[0]
         assert "TimeoutError" in audit["error"] and audit["fallback"] == "messages"

@@ -6,7 +6,7 @@ from types import SimpleNamespace as NS
 from graft import cachestats
 from _util import chat_of, conversation, install_fake
 from graft.db import Store
-from graft.fake import FakeWorld, pivot_policy
+from graft.fake import FakeTools, pivot_policy
 from graft.harness import Host
 from graft.providers import (AnthropicProvider, FakeProvider, OpenAIProvider, _accepts, prefix_nonce,
                                prompt_cache_key)
@@ -115,7 +115,7 @@ def test_harness_applies_nonce_and_tags_roles(tmp_path):
     assert fp.calls and all(c["messages"][0]["content"][0]["text"].startswith("[conversation run123]")
                             for c in fp.calls)
     assert not store.con.execute("SELECT 1 FROM turns WHERE content LIKE '%run123%'").fetchone()
-    assert {"original:clone_tx", "clone:c1", "clone:c2"} <= set(fp.by_tag)
+    assert {"original:branch_tx", "branch:c1", "branch:c2"} <= set(fp.by_tag)
     assert not any("join" in t for t in fp.by_tag)  # the default join makes no model call
     assert sum(u["calls"] for u in fp.by_tag.values()) == len(fp.calls)
 
@@ -128,7 +128,7 @@ def test_effective_input_cost_and_hit_rate():
     priced = cachestats.Pricing(price_in=2.0, price_out=10.0, price_cached=0.2)
     assert abs(priced.cost(u) - (1000 * 2 + 4000 * 0.2 + 200 * 2.5 + 100 * 10) / 1e6) < 1e-12
     assert abs(cachestats.hit_rate(u) - 4000 / 5200) < 1e-12
-    lines = cachestats.table([("clone", u)], priced, per=2)
+    lines = cachestats.table([("branch", u)], priced, per=2)
     assert len(lines) == 3 and "$" in lines[1]
 
 
@@ -147,7 +147,7 @@ def test_subagent_baseline_isolates_subagent_and_tags_roles():
     store = Store(":memory:")
     install_fake(store)
     fp = FakeProvider(subagent_policy)
-    world = FakeWorld()
+    world = FakeTools()
     r = SubagentRunner(store, fp, tools=world.tools(), nonce="n1")
 
     async def go():

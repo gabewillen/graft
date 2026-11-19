@@ -30,11 +30,11 @@ import pytest
 
 from graft.db import Store
 from graft.harness import (CANCELLED_BY_THE_TOOL, CANCELLED_WHILE_RUNNING, FAILED_AFTER_INVOKED,
-                           NOT_RUN_BESIDE_CLONE, NOT_RUN_INTERRUPTED, NOT_RUN_JOINING, WITHDRAWN_SEED,
+                           NOT_RUN_BESIDE_BRANCH, NOT_RUN_INTERRUPTED, NOT_RUN_JOINING, WITHDRAWN_SEED,
                            Host)
 from graft.providers import FakeProvider
 from graft import seeder as seeder_mod
-from graft.skills import BACKGROUND_INSTRUCTIONS, BUILTIN, CATALOG, CLONE_INSTRUCTIONS, JOIN_INSTRUCTIONS, \
+from graft.skills import BACKGROUND_INSTRUCTIONS, BUILTIN, CATALOG, BRANCH_INSTRUCTIONS, JOIN_INSTRUCTIONS, \
     install
 
 # Stems, so every inflection is caught (clone, clones, cloned, cloning; join, joins, joined, ...).
@@ -126,10 +126,10 @@ def check(found: list[tuple[str, str]]):
 # ------------------------------------------------------------------ the text itself
 def test_the_built_in_skills_and_tools_say_branch_and_merge():
     names = {s.name for s in CATALOG}
-    assert {"fork", "merge", "detached"} <= names and not {"clone", "join"} & names
+    assert {"fork", "merge", "detached"} <= names and not {"branch", "join"} & names
     assert set(BUILTIN) == {"fork", "merge", "detached"}
     tools = {t["name"] for s in CATALOG for t in s.tools if isinstance(t, dict)}
-    assert {"fork", "merge", "stop", "load_skill"} <= tools and not {"clone", "join"} & tools
+    assert {"fork", "merge", "stop"} <= tools and not {"branch", "join", "load_skill"} & tools
     branch_tool = next(t for s in CATALOG for t in s.tools if isinstance(t, dict) and t["name"] == "fork")
     assert set(branch_tool["inputSchema"]["properties"]) == {"current", "detached"}
     merge_tool = next(t for s in CATALOG for t in s.tools if isinstance(t, dict) and t["name"] == "merge")
@@ -139,7 +139,7 @@ def test_the_built_in_skills_and_tools_say_branch_and_merge():
     assert set(branch_tool["inputSchema"]["properties"]["current"]["properties"]) == {"id", "skills", "messages", "reason"}
     # the first-person framing: a branch is you, and what you did there is your memory
     focus, background, original = (" ".join(t.split()) for t in (JOIN_INSTRUCTIONS, BACKGROUND_INSTRUCTIONS,
-                                                                   CLONE_INSTRUCTIONS))
+                                                                   BRANCH_INSTRUCTIONS))
     assert "on a branch of yourself" in focus and "on a detached branch of yourself" in background
     assert "yours on other branches or on main" in focus and "yours on other branches or on main" in background
     assert "the reason you wrote for this branch" in focus and "the reason you wrote for this branch" in background
@@ -160,7 +160,7 @@ def test_no_built_in_skill_text_or_tool_uses_a_banned_word():
 
 
 def test_the_harness_constant_results_and_the_seeder_question_use_no_banned_word():
-    check([("const", str(x)) for x in (NOT_RUN_BESIDE_CLONE, NOT_RUN_INTERRUPTED, NOT_RUN_JOINING,
+    check([("const", str(x)) for x in (NOT_RUN_BESIDE_BRANCH, NOT_RUN_INTERRUPTED, NOT_RUN_JOINING,
                                        CANCELLED_WHILE_RUNNING, CANCELLED_BY_THE_TOOL, FAILED_AFTER_INVOKED,
                                        WITHDRAWN_SEED)]
           + [("seeder", seeder_mod.NOUL_TRUE), ("seeder", seeder_mod.NOUL_FALSE),
@@ -197,14 +197,14 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
         names = {t["name"] for t in tools}
         last = last_block(messages)
         if "fork" in names:
-            if last["type"] == "text" and not woke(last) and last["text"] == REQUEST:
+            if last["type"] == "text" and not woke(last) and last["text"].endswith(REQUEST):
                 return [use(tool="fork", use_id="b1", **branched(
                             entry(skills=["merge"], focus=False), entry(skills=["fork"], focus=False),
                             entry(skills=["website"], focus=False, purpose="p"), entry(skills=["slides"], focus=False, id="Bad Id"))),
                         use(tool="load_skill", use_id="l1", name="website")]
             if ran(last) and "b1" == last["tool_use_id"]:
                 return [use(tool="fork", use_id="b2", **branched(entry(skills=["website"], focus=False), entry(skills=["slides"], focus=False)))]
-            if last["type"] == "text" and not woke(last) and last["text"] == "Stop the slides.":
+            if last["type"] == "text" and not woke(last) and last["text"].endswith("Stop the slides."):
                 return [use(tool="stop", use_id="x1", ids=["c2", "c9", "o", 5])]
             if ran(last) and last["tool_use_id"] == "x1":
                 website_gate.set()
@@ -257,11 +257,11 @@ def test_focus_merges_hand_back_and_failure_say_branch_and_merge(tmp_path):
         last = last_block(messages)
         user = last["type"] == "text" and not woke(last)
         if "fork" in names:
-            if user and last["text"] == "Build me a website.":
+            if user and last["text"].endswith("Build me a website."):
                 return [use(tool="fork", use_id="f1", **branched(entry(skills=["website"], focus=True)))]
-            if user and last["text"] == "Book a room.":
+            if user and last["text"].endswith("Book a room."):
                 return [use(tool="fork", use_id="f2", **branched(entry(skills=["calendar"], focus=True)))]
-            if user and last["text"] == "Make slides.":
+            if user and last["text"].endswith("Make slides."):
                 return [use(tool="fork", use_id="f3", **branched(entry(skills=["slides"], focus=True)))]
             return [] if woke(last) else text("Okay.")
         if "site_write" in names:
@@ -291,14 +291,14 @@ def test_focus_merges_hand_back_and_failure_say_branch_and_merge(tmp_path):
 
 def test_a_merge_too_large_for_the_context_says_branch(tmp_path):
     """The size backstop's merge result, which says a result did not fit."""
-    from _util import clone_in_turn
+    from _util import branch_in_turn
     store, h, rec = make(tmp_path=tmp_path, policy=lambda **_: text(t="Reporting."), name="e", window_tokens=120)
 
     async def go():
         await chat_of(h).start()
         store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
         store.add_turn(tl="o", role="assistant", kind="text", content="Started.")
-        (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork",
+        (c1,), _ = await branch_in_turn(h=h, use={"id": "t", "name": "fork",
                                                  "input": branched(entry(skills=["website"], focus=False))})
         store.add_turn(tl=c1, role="assistant", kind="text", content="Site built. " + "x" * 4000)
         await h.do_join(child=c1, reason="done")
@@ -353,7 +353,7 @@ def test_a_merge_whose_view_would_be_invalid_says_branch(tmp_path, monkeypatch):
     """The record a merge falls back to when its view would be invalid (it cannot happen for
     well-formed rows, so validation is forced to fail for that one check)."""
     import graft.harness as harness_mod
-    from _util import clone_in_turn
+    from _util import branch_in_turn
     real = harness_mod.validate
     forced = []
 
@@ -370,7 +370,7 @@ def test_a_merge_whose_view_would_be_invalid_says_branch(tmp_path, monkeypatch):
         await chat_of(h).start()
         store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
         store.add_turn(tl="o", role="assistant", kind="text", content="Started.")
-        (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork",
+        (c1,), _ = await branch_in_turn(h=h, use={"id": "t", "name": "fork",
                                                  "input": branched(entry(skills=["website"], focus=False))})
         store.add_turn(tl=c1, role="assistant", kind="text", content="Site built.")
         monkeypatch.setattr(harness_mod, "validate", failing)
@@ -394,27 +394,27 @@ from graft import compaction as compaction_mod, db as db_mod, harness as harness
 # fails the check (it must be listed again), so a new place that words a note or a refusal is
 # added here, not missed.
 PRODUCERS = {
-    harness_mod: ["merge_result", "SKIPPED_NOTE", "MERGED", "check_skill_link", "clone_entries", "_strings", "_messages", "cancel_ids",
+    harness_mod: ["merge_result", "SKIPPED_NOTE", "MERGED", "check_skill_link", "branch_entries", "_strings", "_messages", "cancel_ids",
                   "fork_result", "Host.resolve_messages", "Host.message_index", "ENTRY_SHAPE",
-                  "Host.cancel_text", "Host.system", "Host.load", "Host._names", "Host._running_note",
+                  "Host.cancel_text", "Host.system", "Host._names", "Host._running_note",
                   "Host.merge_call", "Host.fit_join", "Host.default_join",
-                  "Host.task_of", "Host._stop_call", "_entry", "NOT_A_DRAWN_ID", "NO_FREE_ID", "Host.prepare_clone", "Host.refuse_clone",
-                  "Host._prepare_clone", "Host._loop", "Host._missing_results",
-                  "NOT_RUN_INTERRUPTED", "NOT_RUN_JOINING", "NOT_RUN_BESIDE_CLONE", "CANCELLED_WHILE_RUNNING",
+                  "Host.task_of", "Host._stop_call", "_entry", "NOT_A_DRAWN_ID", "NO_FREE_ID", "Host.prepare_branch", "Host.refuse_branch",
+                  "Host._prepare_branch", "Host._loop", "Host._missing_results",
+                  "NOT_RUN_INTERRUPTED", "NOT_RUN_JOINING", "NOT_RUN_BESIDE_BRANCH", "CANCELLED_WHILE_RUNNING",
                   "CANCELLED_BY_THE_TOOL", "FAILED_AFTER_INVOKED", "WITHDRAWN_SEED"],
-    machine_mod: ["clone_refusal", "decline_why", "clone_why", "cancel_refusal", "_cancel_rows", "refuse_clone_call",
-                  "refuse_cancel_call", "clone_refusal_not_written", "decline", "decline_failed_step",
-                  "preparation_crashed", "drop_clone", "answer_pending", "_cut_outcome", "ToolCall"],
+    machine_mod: ["branch_refusal", "decline_why", "branch_why", "cancel_refusal", "_cancel_rows", "refuse_branch_call",
+                  "refuse_cancel_call", "branch_refusal_not_written", "decline",
+                  "preparation_crashed", "drop_branch", "answer_pending", "ToolCall"],
     db_mod: ["WITHDRAWN_NOTE"],
     compaction_mod: ["COMPACT_TOOL", "EXTRACT_INSTRUCTION", "WITHDRAWN_INDEX", "index_text", "extract_request",
                      "SUMMARY_HEADER", "COMPACT_INSTRUCTION", "summary_turn"],
     seeder_mod: ["NOUL_TRUE", "NOUL_FALSE", "reduced_state", "reduced_question", "jev_request"],
-    skills_mod: ["LOAD_SKILL_TOOL", "JOIN_TOOL", "CANCEL_TOOL", "MESSAGES", "REASON", "CLONE_INSTRUCTIONS", "JOIN_INSTRUCTIONS",
-                 "BACKGROUND_INSTRUCTIONS", "load_skill", "skill_listing"],
+    skills_mod: ["LOAD_SKILL_TOOL", "JOIN_TOOL", "CANCEL_TOOL", "MESSAGES", "REASON", "BRANCH_INSTRUCTIONS", "JOIN_INSTRUCTIONS",
+                 "BACKGROUND_INSTRUCTIONS", "load_skill", "skill_listing", "skill_instructions"],
 }
 # graft's own identifiers (store and transaction kinds, a graft's kind, its reason, the keys of the
 # harness's logs) and its audit records: compared and stored, never shown to a model.
-INTERNAL = {"clone", "join", "joined", "background", "focus", "cancelled", "out_of_scope", "FOCUS ", ":clone_tx", "DEFAULT JOIN ", "CLONE ",
+INTERNAL = {"branch", "join", "joined", "background", "focus", "cancelled", "out_of_scope", "FOCUS ", ":branch_tx", "DEFAULT JOIN ", "BRANCH ",
             "BACKGROUND", "FOCUS"}
 # Calls whose text is never shown to a model: the host's trace and the lines the user's callbacks get.
 NOT_MODEL_FACING = {"trace", "_report", "_report_failure", "emit", "DecisionFault", "Aborted", "RuntimeError",
@@ -497,7 +497,7 @@ def test_every_model_facing_producer_uses_no_banned_word(module, name):
 def test_the_merge_result_of_a_branch_that_wrote_nothing_and_plural_stops_say_branch(tmp_path):
     """A branch that brings back no rows the conversation lacks, a stop of two branches, and every
     merge result wording (each reason, focus or not, each size tier)."""
-    from _util import clone_in_turn
+    from _util import branch_in_turn
     from graft.harness import merge_result
     store, h, rec = make(tmp_path=tmp_path, policy=lambda **_: text(t="Reporting."), name="h")
 
@@ -505,7 +505,7 @@ def test_the_merge_result_of_a_branch_that_wrote_nothing_and_plural_stops_say_br
         await chat_of(h).start()
         store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
         store.add_turn(tl="o", role="assistant", kind="text", content="Started.")
-        (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork",
+        (c1,), _ = await branch_in_turn(h=h, use={"id": "t", "name": "fork",
                                                  "input": branched(entry(skills=["website"], focus=False))})
         await h.do_join(child=c1, reason="done")  # it wrote nothing
         await h.drain_and_wake("o")

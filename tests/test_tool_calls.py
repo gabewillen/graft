@@ -10,9 +10,9 @@ import pytest
 
 from _util import ran, started, woke, conversation, chat_of, install_fake
 from graft.agent import HarnessError
-from graft.fake import FakeWorld
+from graft.fake import FakeTools
 
-from test_parallel import (REQUEST, WAIT_TIMEOUT, clone_entry, clone_use, is_wake, make, text, tool_results,
+from test_parallel import (REQUEST, WAIT_TIMEOUT, branch_entry, branch_use, is_wake, make, text, tool_results,
                            violations)
 
 STOP = "stop the website"
@@ -23,8 +23,8 @@ def use(id, name, **args):
     return {"type": "tool_use", "id": id, "name": name, "input": args}
 
 
-class Meeting(FakeWorld):
-    """site_write (clone A) waits until slides_create (clone B) has run; each call is logged as it
+class Meeting(FakeTools):
+    """site_write (branch A) waits until slides_create (branch B) has run; each call is logged as it
     starts and ends, on the loop. `a_started` is a threading.Event: B's model call waits on it, so
     A's tool is already waiting when B's runs."""
 
@@ -50,23 +50,23 @@ class Meeting(FakeWorld):
 
 
 def background_original(entries):
-    """An original that clones `entries` in the background, says "Started." after the clone
+    """An original that branches `entries` in the background, says "Started." after the branch
     result, reports on a merge result, and cancels c1 when the user says STOP."""
     def respond(last, messages):
         if ran(last):
             return text("Stopped." if last["tool_use_id"].startswith("x") else "Started.")
         if is_wake(last):
             return text("Report.")
-        if last["text"] == STOP:
+        if last["text"].endswith(STOP):
             return [use(f"x{len(messages)}", "stop", ids=["c1"])]
-        return [clone_use(*entries, id=f"c{len(messages)}") | {"type": "tool_use"}]
+        return [branch_use(*entries, id=f"c{len(messages)}") | {"type": "tool_use"}]
     return respond
 
 
-def test_a_tool_that_awaits_another_clones_tool_lets_both_run_and_finish(tmp_path):
+def test_a_tool_that_awaits_another_branches_tool_lets_both_run_and_finish(tmp_path):
     world = Meeting()
-    original = background_original([clone_entry(skills=["website"], focus=False),
-                                    clone_entry(skills=["slides"], focus=False)])
+    original = background_original([branch_entry(skills=["website"], focus=False),
+                                    branch_entry(skills=["slides"], focus=False)])
 
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
@@ -97,7 +97,7 @@ def test_a_tool_that_awaits_another_clones_tool_lets_both_run_and_finish(tmp_pat
     assert h.tools_run("c1") == ["site_write"] and h.tools_run("c2") == ["slides_create"]
 
 
-class Hanging(FakeWorld):
+class Hanging(FakeTools):
     """site_write waits for ever; it records that it started and that it was cancelled."""
 
     def __init__(self):
@@ -132,7 +132,7 @@ def graft_writes(original):
 
 def test_a_background_graft_cancelled_while_its_tool_awaits_records_the_call_as_run(tmp_path):
     world = Hanging()
-    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    policy = graft_writes(background_original([branch_entry(skills=["website"], focus=False)]))
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
 
     async def go():
@@ -158,7 +158,7 @@ def test_a_focus_graft_whose_request_is_withdrawn_while_its_tool_awaits_records_
     def original(last, messages):
         if ran(last):
             return text("Started.")
-        return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
+        return [branch_use(branch_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
     store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=world)
 
@@ -182,7 +182,7 @@ def test_a_focus_graft_whose_request_is_withdrawn_while_its_tool_awaits_records_
     assert violations(store=store, tl="c1") == []
 
 
-class Slow(FakeWorld):
+class Slow(FakeTools):
     """Two awaited tools: the first takes longer. Each logs its start and end."""
 
     def __init__(self):
@@ -198,7 +198,7 @@ class Slow(FakeWorld):
 
 def test_a_turns_awaited_tool_calls_run_one_at_a_time_and_are_stored_in_call_order(tmp_path):
     world = Slow()
-    original = background_original([clone_entry(skills=["website"], focus=False)])
+    original = background_original([branch_entry(skills=["website"], focus=False)])
 
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
@@ -227,7 +227,7 @@ def test_a_turns_awaited_tool_calls_run_one_at_a_time_and_are_stored_in_call_ord
 
 def test_close_while_a_background_graft_s_tool_awaits_returns_and_records_the_call_as_run(tmp_path):
     world = Hanging()
-    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    policy = graft_writes(background_original([branch_entry(skills=["website"], focus=False)]))
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
 
     async def go():
@@ -246,11 +246,11 @@ def test_close_while_a_background_graft_s_tool_awaits_returns_and_records_the_ca
 def test_a_synchronous_tool_that_raises_ends_as_run_with_an_error(tmp_path):
     """A tool that was invoked has run, whatever it then raised: its call gets a result marked
     run, with an error naming what was raised, and the run goes on (the model sees it)."""
-    class Raising(FakeWorld):
+    class Raising(FakeTools):
         def execute(self, name, args):
             raise RuntimeError("backend down")
 
-    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    policy = graft_writes(background_original([branch_entry(skills=["website"], focus=False)]))
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=Raising())
 
     async def go():
@@ -287,7 +287,7 @@ async def settled(h):
 
 
 def test_a_background_graft_whose_close_out_cannot_be_written_carries_it_with_its_join(tmp_path):
-    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    policy = graft_writes(background_original([branch_entry(skills=["website"], focus=False)]))
     store, h, _ = make(tmp_path=tmp_path, policy=policy)
     fail_once(h=h, name="store_result")  # its row cannot be written: the run ends, the real result kept
     fired = fail_once(h=h, name="close_tool_uses")
@@ -308,7 +308,7 @@ def test_a_background_graft_whose_close_out_cannot_be_written_carries_it_with_it
 
 def test_a_cancelled_graft_whose_close_out_cannot_be_written_still_names_the_running_tool(tmp_path):
     world = Hanging()
-    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    policy = graft_writes(background_original([branch_entry(skills=["website"], focus=False)]))
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
 
     async def go():
@@ -333,7 +333,7 @@ def test_a_failed_focus_graft_whose_close_out_cannot_be_written_carries_it_with_
     def original(last, messages):
         if ran(last) or is_wake(last) or woke(last):
             return text("Back.")
-        return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
+        return [branch_use(branch_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
     store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original))
     fail_once(h=h, name="store_result")  # its row cannot be written: the run ends, the real result kept
@@ -368,7 +368,7 @@ def test_a_withdrawal_stops_a_background_graft_whose_tool_awaits_at_once(tmp_pat
             return text("Started.")
         if is_wake(last):
             return text("Report.")
-        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
+        return [branch_use(branch_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
     store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=world)
 
@@ -396,17 +396,19 @@ def test_a_withdrawal_stops_a_background_graft_whose_tool_awaits_at_once(tmp_pat
 def test_a_withdrawal_after_the_answer_stops_a_background_graft_whose_tool_awaits_at_once(tmp_path, monkeypatch):
     """The user's call is cancelled in the tick it is answered (its call not yet done): the cancel
     wins, and the background graft made for it stops at once."""
-    import graft.machine as machine
+    import hsm
     world = Hanging()
     late: dict = {}
-    real_rest = machine.come_to_rest
+    real_dispatch = hsm.Dispatch
 
-    def come_to_rest(ctx, inst, event):
-        real_rest(ctx=ctx, inst=inst, event=event)
-        task = late.pop("task", None)
-        if task is not None and inst.timeline_id == "o":
-            task.cancel()
-    monkeypatch.setattr(machine, "come_to_rest", come_to_rest)
+    def on_dispatch(ctx, target, event):
+        res = real_dispatch(ctx, target, event)
+        if event.name == "rested" and getattr(event.data, "tl", None) == "o":
+            task = late.pop("task", None)
+            if task is not None:
+                task.cancel()
+        return res
+    monkeypatch.setattr(hsm, "Dispatch", on_dispatch)
 
     def original(last, messages):
         if ran(last):
@@ -414,7 +416,7 @@ def test_a_withdrawal_after_the_answer_stops_a_background_graft_whose_tool_await
             return text("Started.")
         if is_wake(last):
             return text("Report.")
-        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
+        return [branch_use(branch_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
     store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=world)
 
@@ -444,7 +446,7 @@ def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_r
     def original(last, messages):
         if ran(last) or woke(last):
             return text("Back.")
-        return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
+        return [branch_use(branch_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
     store, h, said = make(tmp_path=tmp_path, policy=graft_writes(original))
     real, call, raised = h.store_result, {}, []
@@ -486,7 +488,7 @@ def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_r
 CANCELLED_BY_THE_TOOL = "interrupted by the tool: it may have acted"
 
 
-class SelfCancel(FakeWorld):
+class SelfCancel(FakeTools):
     """site_write awaits a future the host cancels itself (its own deadline): CancelledError reaches
     the activity while its state is still active."""
 
@@ -499,7 +501,7 @@ class SelfCancel(FakeWorld):
 
 
 def test_a_tool_that_is_cancelled_by_its_host_ends_as_run_with_an_error_and_its_run_goes_on(tmp_path):
-    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    policy = graft_writes(background_original([branch_entry(skills=["website"], focus=False)]))
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=SelfCancel())
 
     async def go():
@@ -519,20 +521,20 @@ def test_a_focus_graft_whose_tool_is_cancelled_by_its_host_goes_on(tmp_path):
     def original(last, messages):
         if ran(last) or woke(last):
             return text("Back.")
-        return [clone_use(clone_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
+        return [branch_use(branch_entry(skills=["website"], focus=True), id=f"c{len(messages)}") | {"type": "tool_use"}]
 
     store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=SelfCancel())
 
     async def go():
         await chat_of(h).start()
-        assert await asyncio.wait_for(chat_of(h).say(REQUEST), WAIT_TIMEOUT) == ["done", "Back."]  # main runs once after the merge
+        assert await asyncio.wait_for(chat_of(h).say(REQUEST), WAIT_TIMEOUT) == ["done"]  # focus replied, nothing else running: no wake
         await h.close()
 
     asyncio.run(go())
     assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_BY_THE_TOOL, True)]
 
 
-class SharedWork(FakeWorld):
+class SharedWork(FakeTools):
     """slides_create (c1) starts a task and awaits it; site_write (c2) awaits the same task. When c1
     is cancelled its await is cancelled, and so is the shared task c2 awaits: c2's state is not left."""
 
@@ -555,8 +557,8 @@ class SharedWork(FakeWorld):
 
 def test_a_graft_whose_tool_awaits_work_a_cancelled_sibling_shared_goes_on(tmp_path):
     world = SharedWork()
-    original = background_original([clone_entry(skills=["slides"], focus=False),
-                                    clone_entry(skills=["website"], focus=False)])
+    original = background_original([branch_entry(skills=["slides"], focus=False),
+                                    branch_entry(skills=["website"], focus=False)])
 
     def policy(system, messages, tools):
         names = {t["name"] for t in tools}
@@ -588,7 +590,7 @@ def test_a_graft_whose_tool_awaits_work_a_cancelled_sibling_shared_goes_on(tmp_p
 
 # ------------------------------------------------------------------ a tool that was invoked is never closed as not run
 def one_background(world, **kw):
-    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    policy = graft_writes(background_original([branch_entry(skills=["website"], focus=False)]))
     return make(tmp_path=kw.pop("tmp_path"), policy=policy, world=world, **kw)
 
 
@@ -605,7 +607,7 @@ def run_one(h):
     asyncio.run(go())
 
 
-class ActsThenRaises(FakeWorld):
+class ActsThenRaises(FakeTools):
     """site_write acts, then its own deadline raises."""
 
     def __init__(self):
@@ -630,7 +632,7 @@ def test_a_tool_that_raises_after_it_was_invoked_ends_as_run_with_an_error(tmp_p
     assert store.timeline("c1")["join_reason"] == "done"  # its run went on
 
 
-class BadShape(FakeWorld):
+class BadShape(FakeTools):
     def __init__(self, value):
         super().__init__()
         self.value = value
@@ -655,7 +657,7 @@ def test_a_trace_callback_that_raises_leaves_the_tool_s_result_alone(tmp_path):
         if "] tool site_write" in line:
             raise RuntimeError("trace sink down")
 
-    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path, trace=trace)
+    store, h, _ = one_background(FakeTools(), tmp_path=tmp_path, trace=trace)
     run_one(h)
     assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]
     assert h.tools_run("c1") == ["site_write"]
@@ -663,7 +665,7 @@ def test_a_trace_callback_that_raises_leaves_the_tool_s_result_alone(tmp_path):
 
 def test_a_graft_whose_join_is_abandoned_still_writes_the_close_out_it_carried(tmp_path):
     from graft.machine import MAX_JOIN_ATTEMPTS
-    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    policy = graft_writes(background_original([branch_entry(skills=["website"], focus=False)]))
     store, h, _ = make(tmp_path=tmp_path, policy=policy)
     fail_once(h=h, name="store_result")
     fail_once(h=h, name="close_tool_uses")
@@ -694,7 +696,7 @@ def test_a_graft_whose_join_is_abandoned_still_writes_the_close_out_it_carried(t
 
 def test_a_join_retried_after_its_write_failed_writes_the_carried_close_out_once(tmp_path):
     world = Hanging()
-    policy = graft_writes(background_original([clone_entry(skills=["website"], focus=False)]))
+    policy = graft_writes(background_original([branch_entry(skills=["website"], focus=False)]))
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
     real, fired = store.commit_join, []
 
@@ -725,7 +727,7 @@ def test_a_join_retried_after_its_write_failed_writes_the_carried_close_out_once
     assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
 
 
-class SeveralWaiting(FakeWorld):
+class SeveralWaiting(FakeTools):
     """Every capability tool waits for ever; each records that it started and that it was cancelled."""
 
     def __init__(self):
@@ -757,7 +759,7 @@ def test_a_withdrawal_stops_several_background_grafts_whose_tools_await(tmp_path
                 return text("Started.")
             if is_wake(last):
                 return text("Report.")
-            return [clone_use(*[clone_entry(skills=[k], focus=False) for k in tools], id="k1") | {"type": "tool_use"}]
+            return [branch_use(*[branch_entry(skills=[k], focus=False) for k in tools], id="k1") | {"type": "tool_use"}]
         skill = "website" if "site_write" in names else "slides" if "slides_create" in names else "calendar"
         return [tools[skill]]
 
@@ -811,7 +813,7 @@ def drive_one(h, store):
 
 
 def test_a_harness_tool_call_that_fails_after_the_tool_ran_keeps_the_call_as_run(tmp_path):
-    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeTools(), tmp_path=tmp_path)
     real = h.call_tool
 
     async def broken(**kw):
@@ -829,7 +831,7 @@ class BadStr(Exception):
         raise RuntimeError("no str")
 
 
-class ActsThenBadStr(FakeWorld):
+class ActsThenBadStr(FakeTools):
     async def execute(self, name, args):
         if name == "site_write":
             raise BadStr()
@@ -848,7 +850,7 @@ class Abort(BaseException):
     pass
 
 
-class ActsThenAborts(FakeWorld):
+class ActsThenAborts(FakeTools):
     async def execute(self, name, args):
         if name == "site_write":
             raise Abort("host abort")
@@ -864,7 +866,7 @@ def test_a_tool_that_raises_a_base_exception_ends_as_run_with_an_error(tmp_path)
 def test_a_run_whose_model_call_raises_a_base_exception_fails_and_does_not_wedge(tmp_path):
     def policy(system, messages, tools):
         if "fork" in {t["name"] for t in tools}:
-            return background_original([clone_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
+            return background_original([branch_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
                                                                                          messages)
         raise Abort("provider abort")
 
@@ -874,7 +876,7 @@ def test_a_run_whose_model_call_raises_a_base_exception_fails_and_does_not_wedge
     assert store.timeline("c1")["join_reason"] == "failed"
 
 
-class CancelsOwnTask(FakeWorld):
+class CancelsOwnTask(FakeTools):
     """The host cancels the task its tool runs in (its own deadline), while the graft still runs."""
 
     async def execute(self, name, args):
@@ -893,63 +895,9 @@ def test_a_tool_whose_own_task_the_host_cancels_ends_as_run_with_an_error(tmp_pa
 
 
 
-def test_a_withdrawal_stops_every_waiting_graft_even_when_one_stop_fails_once(tmp_path, monkeypatch):
-    """The stops are the original's own steps (it ticks through them where it stands): one that
-    fails is made again, and no graft's answer is needed for the next stop."""
-    import graft.machine as machine
-    real, fired = machine.stop_one, []
-
-    def stop_once_failing(ctx, inst, event):
-        if not fired:
-            fired.append(inst.timeline_id)
-            raise RuntimeError("INJECTED stop_one")
-        return real(ctx=ctx, inst=inst, event=event)
-    monkeypatch.setattr(machine, "stop_one", stop_once_failing)
-    world, gate = SeveralWaiting(), threading.Event()
-    tools = {"website": use("w1", "site_write", page="i", content="x"),
-             "slides": use("s1", "slides_create", title="D"),
-             "calendar": use("k1", "calendar_book", what="x", date="2026-12-05", time="10:00")}
-
-    def policy(system, messages, tool_list):
-        names = {t["name"] for t in tool_list}
-        last = messages[-1]["content"][-1]
-        if "fork" in names:
-            if ran(last):
-                assert gate.wait(WAIT_TIMEOUT)
-                return text("Started.")
-            if is_wake(last):
-                return text("Report.")
-            return [clone_use(*[clone_entry(skills=[k], focus=False) for k in tools], id="k1") | {"type": "tool_use"}]
-        skill = "website" if "site_write" in names else "slides" if "slides_create" in names else "calendar"
-        return [tools[skill]]
-
-    store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
-
-    async def go():
-        await chat_of(h).start()
-        call = asyncio.create_task(chat_of(h).say(REQUEST))
-        for name in ("site_write", "slides_create", "calendar_book"):
-            while name not in world.started:
-                await asyncio.sleep(0.01)
-        call.cancel()
-        gate.set()
-        try:
-            await call
-        except asyncio.CancelledError:
-            pass
-        for c in ("c1", "c2", "c3"):
-            await asyncio.wait_for(h.join_queued(c), WAIT_TIMEOUT)
-        try:
-            await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
-        except RuntimeError:
-            pass  # the injected failure, told once
-        await h.close()
-
-    asyncio.run(go())
-    assert fired == ["o"] and world.cancelled == {"site_write", "slides_create", "calendar_book"}
 
 
-class ActsThenGenExit(FakeWorld):
+class ActsThenGenExit(FakeTools):
     async def execute(self, name, args):
         if name == "site_write":
             raise GeneratorExit()
@@ -964,7 +912,7 @@ def test_a_tool_that_raises_generator_exit_ends_as_run_with_an_error(tmp_path):
     assert tool_results(store=store, tl="c1") == [("site_write", "raised GeneratorExit; it may have acted", True)]
 
 
-class ActsThenStop(FakeWorld):
+class ActsThenStop(FakeTools):
     async def execute(self, name, args):
         if name == "site_write":
             raise StopAsyncIteration()
@@ -986,7 +934,7 @@ class Hostile(str):
         raise RuntimeError("hostile len")
 
 
-class ReturnsHostile(FakeWorld):
+class ReturnsHostile(FakeTools):
     async def execute(self, name, args):
         if name == "site_write":
             return Hostile("ok"), False
@@ -1001,7 +949,7 @@ def test_a_tool_that_returns_a_hostile_str_subclass_is_stored_as_plain_text(tmp_
 
 # ------------------------------------------------------------------ no activity ends without an outcome
 def test_a_row_write_that_raises_a_base_exception_still_ends_the_call(tmp_path):
-    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeTools(), tmp_path=tmp_path)
     real = h.store_result
 
     def broken(**kw):
@@ -1015,7 +963,7 @@ def test_a_row_write_that_raises_a_base_exception_still_ends_the_call(tmp_path):
 
 
 def test_a_join_record_write_that_raises_a_base_exception_still_queues_the_join(tmp_path):
-    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeTools(), tmp_path=tmp_path)
     real = h.record_join
 
     def broken(**kw):
@@ -1028,74 +976,10 @@ def test_a_join_record_write_that_raises_a_base_exception_still_queues_the_join(
 
 
 # ------------------------------------------------------------------ a stop that always fails is given up
-def withdraw_three(tmp_path, monkeypatch, failing):
-    """Three background grafts whose tools wait; the call that made them is withdrawn. `stop_one`
-    raises every time for the grafts in `failing`. Returns (calls to stop_one, the world, store, h)."""
-    import graft.machine as machine
-    real, calls = machine.stop_one, []
-
-    def stop(ctx, inst, event):
-        child = inst.stop_try[1] if inst.stop_try and inst.stop_try[0] is event else machine._stop_target(inst)
-        calls.append(child)
-        if child in failing or failing == "all":
-            raise RuntimeError(f"INJECTED stop_one {child}")
-        return real(ctx=ctx, inst=inst, event=event)
-    monkeypatch.setattr(machine, "stop_one", stop)
-    world, gate = SeveralWaiting(), threading.Event()
-    tools = {"website": use("w1", "site_write", page="i", content="x"),
-             "slides": use("s1", "slides_create", title="D"),
-             "calendar": use("k1", "calendar_book", what="x", date="2026-12-05", time="10:00")}
-
-    def policy(system, messages, tool_list):
-        names = {t["name"] for t in tool_list}
-        last = messages[-1]["content"][-1]
-        if "fork" in names:
-            if ran(last):
-                assert gate.wait(WAIT_TIMEOUT)
-                return text("Started.")
-            if is_wake(last):
-                return text("Report.")
-            return [clone_use(*[clone_entry(skills=[k], focus=False) for k in tools], id="k1") | {"type": "tool_use"}]
-        skill = "website" if "site_write" in names else "slides" if "slides_create" in names else "calendar"
-        return [tools[skill]]
-
-    store, h, said = make(tmp_path=tmp_path, policy=policy, world=world)
-    out = {}
-
-    async def go():
-        await chat_of(h).start()
-        call = asyncio.create_task(chat_of(h).say(REQUEST))
-        for name in ("site_write", "slides_create", "calendar_book"):
-            while name not in world.started:
-                await asyncio.sleep(0.01)
-        call.cancel()
-        gate.set()
-        try:
-            await call
-        except asyncio.CancelledError:
-            pass
-        await asyncio.sleep(0.5)
-        out["calls"] = len(calls)
-        await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
-
-    asyncio.run(go())
-    return out, calls, world, said
 
 
-def test_a_stop_that_always_fails_is_given_up_after_a_bounded_number_of_attempts(tmp_path, monkeypatch):
-    from graft.machine import MAX_STOP_ATTEMPTS
-    out, calls, world, said = withdraw_three(tmp_path=tmp_path, monkeypatch=monkeypatch, failing="all")
-    assert out["calls"] <= 3 * MAX_STOP_ATTEMPTS  # bounded: never a spin
-    assert any("could not be stopped" in line for line in said)  # each give-up is told
 
 
-def test_a_graft_whose_stop_always_fails_does_not_keep_the_others_from_stopping(tmp_path, monkeypatch):
-    from graft.machine import MAX_STOP_ATTEMPTS
-    out, calls, world, _ = withdraw_three(tmp_path=tmp_path, monkeypatch=monkeypatch, failing={"c1"})
-    # every counted try is made, on its graft: c1's three, then c2's and c3's, never None
-    assert calls[:MAX_STOP_ATTEMPTS] == ["c1"] * MAX_STOP_ATTEMPTS and calls.count("c1") == MAX_STOP_ATTEMPTS
-    assert None not in calls
-    assert {"slides_create", "calendar_book"} <= world.cancelled  # c2 and c3 were stopped at the withdrawal
 
 
 class Abort2(BaseException):
@@ -1110,7 +994,7 @@ class BadMessage(BaseException):
 
 
 def test_an_io_write_failure_whose_message_raises_still_has_an_outcome(tmp_path):
-    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeTools(), tmp_path=tmp_path)
     real = h.record_join
 
     def broken(**kw):
@@ -1123,7 +1007,7 @@ def test_an_io_write_failure_whose_message_raises_still_has_an_outcome(tmp_path)
 
 
 def test_a_row_write_failure_whose_message_raises_still_has_an_outcome(tmp_path):
-    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeTools(), tmp_path=tmp_path)
     real = h.store_result
 
     def broken(**kw):
@@ -1148,7 +1032,7 @@ def test_a_refusal_row_whose_write_error_has_a_bad_message_still_ends_the_run(tm
         last = messages[-1]["content"][-1]
         if ran(last) or woke(last):
             return text("Refused.")
-        return [clone_use(clone_entry(skills=["fork"], focus=True),
+        return [branch_use(branch_entry(skills=["fork"], focus=True),
                           id="k1") | {"type": "tool_use"}]  # a branch cannot hold fork: refused in its preparation
 
     store, h, _ = make(tmp_path=tmp_path, policy=policy)
@@ -1176,37 +1060,6 @@ def test_a_refusal_row_whose_write_error_has_a_bad_message_still_ends_the_run(tm
     assert out["said"] != "TIMEOUT" and out["closed"] is True
 
 
-def test_an_effect_that_raises_a_base_exception_is_a_fault_the_machine_recovers_from(tmp_path, monkeypatch):
-    import graft.machine as machine
-    real, fired = machine.take_message, []
-
-    def raising(ctx, inst, event):
-        if not fired:
-            fired.append(1)
-            raise Abort("an effect's abort")
-        return real(ctx=ctx, inst=inst, event=event)
-    monkeypatch.setattr(machine, "take_message", raising)
-    store, h, _ = make(tmp_path=tmp_path, policy=lambda *a: text("ok"))
-    out = {}
-
-    async def go():
-        await chat_of(h).start()
-        try:
-            out["first"] = await asyncio.wait_for(chat_of(h).say("hello"), WAIT_TIMEOUT)
-        except asyncio.TimeoutError:
-            out["first"] = "TIMEOUT"
-        except BaseException as error:  # noqa: BLE001 - the failed step's caller gets its error
-            out["first"] = type(error).__name__
-        out["second"] = await asyncio.wait_for(chat_of(h).say("again"), WAIT_TIMEOUT)
-        try:
-            await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
-        except BaseException:  # noqa: BLE001 - told once
-            pass
-        await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
-        out["closed"] = True
-
-    asyncio.run(go())
-    assert fired and out["first"] != "TIMEOUT" and out["second"] == ["ok"] and out["closed"] is True
 
 
 class BadStop(StopIteration):
@@ -1219,7 +1072,7 @@ def test_a_model_call_raising_a_stop_iteration_with_a_bad_message_fails_its_run_
     (call_timeout=None) nothing waits for ever."""
     def policy(system, messages, tools):
         if "fork" in {t["name"] for t in tools}:
-            return background_original([clone_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
+            return background_original([branch_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
                                                                                          messages)
         raise BadStop()
 
@@ -1229,7 +1082,7 @@ def test_a_model_call_raising_a_stop_iteration_with_a_bad_message_fails_its_run_
     assert store.timeline("c1")["join_reason"] == "failed"
 
 
-def test_a_seeder_that_raises_a_base_exception_refuses_the_clone_call_and_leaves_no_audit_open(tmp_path):
+def test_a_seeder_that_raises_a_base_exception_refuses_the_branch_call_and_leaves_no_audit_open(tmp_path):
     from graft.db import Store
     from graft.providers import FakeProvider
     from graft.harness import Host
@@ -1244,7 +1097,7 @@ def test_a_seeder_that_raises_a_base_exception_refuses_the_clone_call_and_leaves
         last = messages[-1]["content"][-1]
         if ran(last):
             return text("Could not start it.")
-        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
+        return [branch_use(branch_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
     store = Store(str(tmp_path / "p.db"))
     install_fake(store)
@@ -1269,7 +1122,7 @@ def test_a_seeder_that_raises_a_base_exception_refuses_the_clone_call_and_leaves
 def test_a_background_model_call_that_raises_cancelled_error_fails_its_run(tmp_path):
     def policy(system, messages, tools):
         if "fork" in {t["name"] for t in tools}:
-            return background_original([clone_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
+            return background_original([branch_entry(skills=["website"], focus=False)])(messages[-1]["content"][-1],
                                                                                          messages)
         raise asyncio.CancelledError()  # a provider SDK's own cancellation surfacing
 
@@ -1309,7 +1162,7 @@ def test_an_original_model_call_that_raises_cancelled_error_fails_its_run(tmp_pa
 
 
 def test_a_host_write_that_raises_cancelled_error_is_its_state_s_failure(tmp_path):
-    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeTools(), tmp_path=tmp_path)
     real = h.record_join
 
     def broken(**kw):
@@ -1321,12 +1174,12 @@ def test_a_host_write_that_raises_cancelled_error_is_its_state_s_failure(tmp_pat
     assert out["joined"] is True and out["closed"] is True
 
 
-def test_a_clone_preparation_that_raises_cancelled_error_is_refused(tmp_path):
-    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
+def test_a_branch_preparation_that_raises_cancelled_error_is_refused(tmp_path):
+    store, h, _ = one_background(FakeTools(), tmp_path=tmp_path)
 
     async def broken(**kw):
         raise asyncio.CancelledError()
-    h.prepare_clone = broken
+    h.prepare_branch = broken
     out = say_and_close(h)
     assert out["said"] != "TIMEOUT" and out["closed"] is True
 
@@ -1345,7 +1198,7 @@ def test_a_seeder_that_raises_cancelled_error_leaves_no_audit_open(tmp_path):
     def policy(system, messages, tools):
         if ran(messages[-1]["content"][-1]):
             return text("Could not start it.")
-        return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
+        return [branch_use(branch_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
     store = Store(str(tmp_path / "p.db"))
     install_fake(store)
@@ -1369,118 +1222,16 @@ def test_an_error_whose_type_name_cannot_be_had_is_described_as_an_error():
     assert described(Odd("its message")) == "error: its message"
 
 
-def test_a_stop_whose_counting_always_fails_is_still_bounded_and_stops_every_graft(tmp_path, monkeypatch):
-    """The bound holds even when the behavior that counts a try fails: the stop counts it itself."""
-    import graft.machine as machine
-    counted = []
-
-    def always(ctx, inst, event):
-        counted.append(1)
-        raise RuntimeError("INJECTED count_stop")
-    monkeypatch.setattr(machine, "count_stop", always)
-    out, calls, world, said = withdraw_three(tmp_path=tmp_path, monkeypatch=monkeypatch, failing=set())
-    assert len(counted) == 3  # one try per graft, each stopped by it
-    assert {"site_write", "slides_create", "calendar_book"} <= world.cancelled
 
 
-def test_several_kept_errors_that_are_not_exceptions_are_raised_together(tmp_path, monkeypatch):
-    """Errors kept for settle that are not Exceptions are raised in one group, never a TypeError."""
-    import graft.machine as machine
-
-    def always(ctx, inst, event):
-        raise Abort("INJECTED abort")
-    monkeypatch.setattr(machine, "tell_given_up", always)  # runs at every rest gate: kept again and again
-    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
-    out = {}
-
-    async def go():
-        await chat_of(h).start()
-        for key, coro in (("said", lambda: chat_of(h).say(REQUEST)), ("joined", lambda: h.join_queued("c1")),
-                          ("settled", chat_of(h).quiet), ("settled2", chat_of(h).quiet), ("closed", h.close)):
-            try:
-                await asyncio.wait_for(coro(), WAIT_TIMEOUT)
-                out[key] = "ok"
-            except asyncio.TimeoutError:
-                out[key] = "TIMEOUT"
-            except BaseException as error:  # noqa: BLE001 - what each call raised
-                out[key] = type(error).__name__
-    asyncio.run(go())
-    assert "TypeError" not in out.values() and "TIMEOUT" not in out.values() and out["closed"] == "ok"
 
 
-def test_an_effect_that_raises_stop_iteration_fails_its_callers_with_an_error_they_can_carry(tmp_path, monkeypatch):
-    import graft.machine as machine
-
-    def bad(ctx, inst, event):
-        raise StopIteration("a bug")
-    monkeypatch.setattr(machine, "take_message", bad)
-    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
-    out = {}
-
-    async def go():
-        await chat_of(h).start()
-        for key, coro in (("said", lambda: chat_of(h).send(REQUEST)), ("settled", chat_of(h).quiet), ("closed", h.close)):
-            try:
-                await asyncio.wait_for(coro(), WAIT_TIMEOUT)
-                out[key] = "ok"
-            except asyncio.TimeoutError:
-                out[key] = "TIMEOUT"
-            except BaseException as error:  # noqa: BLE001 - what each call raised
-                out[key] = type(error).__name__
-    asyncio.run(go())
-    assert out["said"] not in ("TIMEOUT", "ok") and "TIMEOUT" not in out.values() and out["closed"] == "ok"
 
 
-def test_failing_every_caller_with_an_error_a_future_cannot_carry_gives_each_one_it_can():
-    from graft.machine import _fail_all
-
-    async def go():
-        loop = asyncio.get_running_loop()
-        replies = [loop.create_future(), loop.create_future()]
-        assert _fail_all(replies=replies, error=StopIteration("a bug")) is True
-        return [type(r.exception()).__name__ for r in replies]
-    assert asyncio.run(go()) == ["RuntimeError", "RuntimeError"]
 
 
-def test_a_rest_step_that_always_fails_still_answers_the_waiting_call(tmp_path, monkeypatch):
-    """A fault on the way to rest that comes back every time: the user's call gets the error (it
-    fails closed), and settle and close return."""
-    import graft.machine as machine
-
-    def always(ctx, inst, event):
-        raise RuntimeError("INJECTED come_to_rest")
-    monkeypatch.setattr(machine, "come_to_rest", always)
-    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
-    out = {}
-
-    async def go():
-        await chat_of(h).start()
-        for key, coro in (("said", lambda: chat_of(h).send(REQUEST)), ("settled", chat_of(h).quiet), ("closed", h.close)):
-            try:
-                await asyncio.wait_for(coro(), WAIT_TIMEOUT)
-                out[key] = "ok"
-            except asyncio.TimeoutError:
-                out[key] = "TIMEOUT"
-            except BaseException as error:  # noqa: BLE001 - what each call raised
-                out[key] = type(error).__name__
-    asyncio.run(go())
-    assert out["said"] == "HarnessError" and out["settled"] != "TIMEOUT" and out["closed"] == "ok"
 
 
-def test_a_stop_whose_counting_and_stopping_both_always_fail_is_still_given_up(tmp_path, monkeypatch):
-    """A double fault: the try is counted on the fault path, so the bound holds and each stop is
-    given up after MAX_STOP_ATTEMPTS."""
-    import graft.machine as machine
-    from graft.machine import MAX_STOP_ATTEMPTS
-    counted = []
-
-    def count_always(ctx, inst, event):
-        counted.append(1)
-        raise RuntimeError("INJECTED count_stop")
-    monkeypatch.setattr(machine, "count_stop", count_always)
-    out, calls, world, said = withdraw_three(tmp_path=tmp_path, monkeypatch=monkeypatch, failing="all")
-    assert len(calls) == 3 * MAX_STOP_ATTEMPTS and len(counted) == 3 * MAX_STOP_ATTEMPTS
-    assert any("could not be stopped" in line for line in said)
 
 
 def test_a_provider_cancel_reaches_the_caller_as_a_runtime_error_and_withdraws_nothing(tmp_path):

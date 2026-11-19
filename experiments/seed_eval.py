@@ -1,8 +1,8 @@
-"""Offline replay of the original's seed selection (the "cloner actor") over stored
+"""Offline replay of the original's seed selection (the "branchr actor") over stored
 long_compaction runs. Evaluation only: harness behaviour is unchanged.
 
-Event: in each stored run, the slides clone that built the deck (seeded by the original after
-the website clone joined). Candidates = text rows in the original's working view before that clone
+Event: in each stored run, the slides branch that built the deck (seeded by the original after
+the website branch joined). Candidates = text rows in the original's working view before that branch
 was created. Ground truth: for each scored fact (diagnose_long.SCORED), the candidate rows that carry
 it. A fact is covered when at least one of its carrier rows is seeded.
 
@@ -73,10 +73,10 @@ class Event:
 # ------------------------------------------------------------------ events
 def load_event(path: str) -> Event | None:
     s = Store(path)
-    clones = [r[0] for r in s.con.execute("SELECT timeline_id FROM timelines WHERE source_id IS NOT NULL "
+    branches = [r[0] for r in s.con.execute("SELECT timeline_id FROM timelines WHERE source_id IS NOT NULL "
                                           "ORDER BY created_at")]
-    slides = [c for c in clones if "slides" in {k["name"] for k in s.skills_for(c)}]
-    web = [c for c in clones if "website" in {k["name"] for k in s.skills_for(c)}]
+    slides = [c for c in branches if "slides" in {k["name"] for k in s.skills_for(c)}]
+    web = [c for c in branches if "website" in {k["name"] for k in s.skills_for(c)}]
     if not slides or not web:
         return None
     sl = slides[-1]
@@ -89,7 +89,7 @@ def load_event(path: str) -> Event | None:
     if not cands:
         return None
     seed = {r["row_id"] for r in s.view(sl) if r["owner_timeline"] != sl}
-    tx = s.con.execute("SELECT scratch FROM transactions WHERE kind='clone' AND target=? AND status='committed'",
+    tx = s.con.execute("SELECT scratch FROM transactions WHERE kind='branch' AND target=? AND status='committed'",
                        (sl,)).fetchone()
     purpose = ""
     if tx and tx[0]:
@@ -205,8 +205,8 @@ LUNA_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["ro
 # The alternative selectors below (luna, needle, ...) are eval-only and keep the prompts the committed
 # results in experiments/results/ were made with; NOUL_TRUE, NOUL_FALSE and the question above match
 # graft/seeder.py, which the harness uses, and say "fork" as the model is told it.
-LUNA_SYSTEM = ("You choose which messages of a conversation a focused clone needs for its new task. The "
-               "clone sees only the messages you choose. It needs every message that carries facts, names, "
+LUNA_SYSTEM = ("You choose which messages of a conversation a focused branch needs for its new task. The "
+               "branch sees only the messages you choose. It needs every message that carries facts, names, "
                "numbers, requirements or preferences the task should use, and the request for the task. "
                "Return one entry per row_id with needed and your confidence (0 to 1) in that judgment.")
 
@@ -244,9 +244,9 @@ class JevSeederScorer:
                           "model": d.model, "requests": d.requests, "truncated": d.truncated}
 
 
-NEEDLE_TOOL = {"name": "mark_message", "description": "Record whether the clone needs the CURRENT message.",
+NEEDLE_TOOL = {"name": "mark_message", "description": "Record whether the branch needs the CURRENT message.",
                "parameters": {"type": "object", "properties": {"needed": {
-                   "type": "boolean", "description": "true if the clone needs the CURRENT message"}},
+                   "type": "boolean", "description": "true if the branch needs the CURRENT message"}},
                    "required": ["needed"]}}
 NEEDLE_WINDOW_CHARS = 3200  # ~800 tokens of text + system, under Needle 3's ~1024-token window
 
@@ -282,7 +282,7 @@ class NeedleScorer:
     def _score_sync(self, e: Event) -> tuple[dict[int, float], dict]:
         import needle
 
-        system = (f"A clone will do this new task: {e.purpose[:300]}. It sees only the messages you mark needed. A "
+        system = (f"A branch will do this new task: {e.purpose[:300]}. It sees only the messages you mark needed. A "
                   "message is needed if it carries facts, names, numbers, requirements or preferences the task "
                   "should use, or it is the request for the task. Call mark_message once for the CURRENT message.")
         t0 = time.perf_counter()
@@ -310,7 +310,7 @@ class NeedleScorer:
 
 
 NEEDLE_KEEP_TOOL = {"name": "keep_message",
-                    "description": "Keep this message for the clone: it carries facts, names, numbers, requirements "
+                    "description": "Keep this message for the branch: it carries facts, names, numbers, requirements "
                                    "or preferences the task should use.",
                     "parameters": {"type": "object", "properties": {}, "required": []}}
 
@@ -327,7 +327,7 @@ class NeedleKeepScorer(NeedleScorer):
         import needle
 
         trig = next(x["text"] for x in e.candidates if x["row_id"] == e.trigger)
-        system = (f"A clone will do this new task: {e.purpose[:300]}. The user's latest request: {trig[:300]}. It sees "
+        system = (f"A branch will do this new task: {e.purpose[:300]}. The user's latest request: {trig[:300]}. It sees "
                   "only the messages you keep. Messages with facts, names, numbers, requirements or preferences for "
                   "the task are needed; chit-chat and tool noise are not.")
         t0 = time.perf_counter()
@@ -412,7 +412,7 @@ class NeedleRetestScorer:
         import needle
 
         purpose, trig = needle_context(e)
-        system = f"New task for a clone: {purpose}. The user's latest request: {trig}."
+        system = f"New task for a branch: {purpose}. The user's latest request: {trig}."
         if self.variant == "pair":
             tools, ctx_in_text = NEEDLE_PAIR, False
         else:

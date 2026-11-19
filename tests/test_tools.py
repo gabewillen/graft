@@ -14,7 +14,7 @@ def noop(args):
     return "ok"
 
 
-@pytest.mark.parametrize("name", ["", "has space", "x" * 129, "load_skill", "fork", "merge", "stop", 7])
+@pytest.mark.parametrize("name", ["", "has space", "x" * 129, "fork", "merge", "stop", 7])
 def test_a_tool_name_that_is_not_mcp_or_is_grafts_own_is_refused(name):
     with pytest.raises(ValueError):
         Tool(name=name, input_schema=SCHEMA, fn=noop)

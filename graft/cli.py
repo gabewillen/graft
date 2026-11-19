@@ -11,7 +11,7 @@ import tempfile
 from . import a2a
 from .agent import GraftAgent, GraftConfig, HarnessError
 from .db import Store
-from .fake import FakeWorld
+from .fake import FakeTools
 from .harness import in_daemon_thread
 from .providers import make_provider
 from .sim import user_message
@@ -54,7 +54,7 @@ async def _follow(agent: GraftAgent, stream, seen: set[str]) -> None:
 
 async def chat(db_path: str, trace: bool) -> None:
     store = Store(db_path)
-    world = FakeWorld()  # the simulated skills' tools
+    world = FakeTools()  # the simulated skills' tools
     provider = make_provider()
     agent = GraftAgent(store, provider, tools=world.tools(), config=GraftConfig(trace=print if trace else None))
     await agent.start()
@@ -113,7 +113,7 @@ def main() -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("chat")
     c.add_argument("--db", default=None)
-    c.add_argument("--trace", action="store_true", help="show clone/join internals")
+    c.add_argument("--trace", action="store_true", help="show branch/join internals")
     d = sub.add_parser("dump")
     d.add_argument("db")
     a = p.parse_args()

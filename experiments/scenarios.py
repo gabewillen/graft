@@ -1,9 +1,9 @@
 """Benchmark scenarios as data: scripted user turns + a deterministic scorer.
 
-Each scorer looks only at the final FakeWorld state and the transcript (arm-agnostic), returns
+Each scorer looks only at the final FakeTools state and the transcript (arm-agnostic), returns
 (ok, checks, diag). `ok` is the pass criterion; `checks` are the scored items; `diag` holds
 diagnostic-only fields (fact preservation, structure). Scripts are lists of user messages or
-callables `step(world) -> str | None` (None skips), where `world` is the run's FakeWorld.
+callables `step(world) -> str | None` (None skips), where `world` is the run's FakeTools.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import pivot as pivot_mod
-from graft.fake import FakeWorld
+from graft.fake import FakeTools
 
 
 @dataclass
@@ -22,7 +22,7 @@ class Scenario:
     name: str
     script: list
     score: Callable[["RunContext"], tuple[bool, dict, dict]]
-    world: Callable[[], FakeWorld] = FakeWorld
+    world: Callable[[], FakeTools] = FakeTools
     compact_tokens: int | None = None  # default compaction threshold for this scenario
     survival_facts: dict | None = None  # fact -> regex, classified through compaction
     about: str = ""
@@ -31,7 +31,7 @@ class Scenario:
 @dataclass
 class RunContext:
     arm: str
-    world: FakeWorld
+    world: FakeTools
     transcript: list[tuple[str, str]]
     agent: object
     extra: dict = field(default_factory=dict)
@@ -41,11 +41,11 @@ def assistant_texts(ctx: RunContext) -> list[str]:
     return [t for r, t in ctx.transcript if r == "assistant"]
 
 
-def last_deck(world: FakeWorld) -> dict:
+def last_deck(world: FakeTools) -> dict:
     return world.decks[-1] if world.decks else {"title": "", "audience": "", "tone": "", "slides": []}
 
 
-def deck_blob(world: FakeWorld) -> str:
+def deck_blob(world: FakeTools) -> str:
     return json.dumps(last_deck(world)).lower()
 
 
@@ -130,8 +130,8 @@ def score_failure(ctx: RunContext) -> tuple[bool, dict, dict]:
     return all(checks.values()), checks, diag
 
 
-def failing_calendar() -> FakeWorld:
-    return FakeWorld(failures={"calendar_book": CAL_ERROR})
+def failing_calendar() -> FakeTools:
+    return FakeTools(failures={"calendar_book": CAL_ERROR})
 
 
 # ------------------------------------------------------------------ long_compaction

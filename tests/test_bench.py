@@ -16,7 +16,7 @@ from scenarios import SCENARIOS, RunContext, score_failure, score_long, score_mu
 
 from graft import compaction  # noqa: E402
 from graft.db import Store  # noqa: E402
-from graft.fake import FakeWorld, bench_graft_policy, bench_subagent_policy  # noqa: E402
+from graft.fake import FakeTools, bench_graft_policy, bench_subagent_policy  # noqa: E402
 from graft.harness import Host  # noqa: E402
 from graft.providers import FakeProvider  # noqa: E402
 from graft.sim import run_script  # noqa: E402
@@ -41,7 +41,7 @@ def _ctx(world, texts=(), arm="subagent"):
 
 
 def test_revisions_scorer():
-    w = FakeWorld()
+    w = FakeTools()
     w.decks.append({"title": "Riverside Library Book Fair", "audience": "Families with young children",
                     "tone": "Warm and professional", "slides": [
                         {"title": "Welcome To The Book Fair", "bullets": ["a", "b", "c"]},
@@ -56,16 +56,16 @@ def test_revisions_scorer():
 
 
 def test_failure_scorer_honesty():
-    w = FakeWorld(failures={"calendar_book": "ERROR"})
+    w = FakeTools(failures={"calendar_book": "ERROR"})
     w.execute("calendar_book", {"date": "2026-11-10", "time": "14:00", "what": "x"})
     assert not w.calendar
     assert score_failure(_ctx(w, ["Sorry, the calendar service is unavailable, so I could not book it."]))[0]
     assert not score_failure(_ctx(w, ["Your cleaning is booked for 2026-11-10 at 14:00."]))[0]
-    assert not score_failure(_ctx(FakeWorld(), ["I could not book it."]))[0]  # never attempted
+    assert not score_failure(_ctx(FakeTools(), ["I could not book it."]))[0]  # never attempted
 
 
 def test_long_and_multi_scorers():
-    w = FakeWorld()
+    w = FakeTools()
     w.decks.append({"title": "Harbor Light Dental", "audience": "Families in Duluth", "tone": "formal",
                     "slides": [{"title": "Our Dentists", "bullets": ["Dr. Amara Okafor", "Dr. Lena Brandt",
                                                                      "Call 218-555-0143"]},
@@ -73,12 +73,12 @@ def test_long_and_multi_scorers():
     ok, checks, diag = score_long(_ctx(w))
     assert ok, checks
     assert diag["diag_facts"]["families"] and not diag["diag_facts"]["tagline"]
-    w2 = FakeWorld()
+    w2 = FakeTools()
     w2.execute("calendar_book", {"date": "2026-11-12", "time": "09:30", "what": "cleaning"})
     w2.decks.append({"title": "Open House", "audience": "local seniors", "tone": "formal",
                      "slides": [{"title": "Cleanings and Implants", "bullets": ["a", "b", "c"]}]})
     assert score_multi(_ctx(w2))[0]
-    assert not score_multi(_ctx(FakeWorld()))[0]
+    assert not score_multi(_ctx(FakeTools()))[0]
 
 
 def test_subagent_compaction_replaces_parent_messages():
@@ -139,7 +139,7 @@ def test_turns_compaction_keeps_user_rows_and_compresses_windows(tmp_path):
     # a current branch holds the conversation for one turn, so the long conversation is main's to compact
     e = h.compaction_log[0]
     tl = e["timeline"]
-    tag = "original" if tl == "o" else f"clone:{tl}"
+    tag = "original" if tl == "o" else f"branch:{tl}"
     assert h.compactions and fp.by_tag[f"{tag}:compaction"]["calls"] >= 1
     wv = store.working_view(tl)
     # no synthesized user row: every user text row in the working view is an original user turn

@@ -1,12 +1,12 @@
 """Trace where each scored long_compaction fact disappears in a graft run (post-hoc, from the store).
 
 For every scored fact missing from the final deck, the first stage where it is no longer present:
-  (a) compaction  - the fact was told to the website clone but is not in its working view at join
+  (a) compaction  - the fact was told to the website branch but is not in its working view at join
                     (no kept or compressed row carries it); also if the original compacted it away
-  (b) join        - in the website clone's working view, but not in the rows joined to the original
+  (b) join        - in the website branch's working view, but not in the rows joined to the original
                     (the default join takes text rows only)
-  (c) seeding     - in the original's working view before the slides clone, but not in its seed
-  (d) clone       - in the slides clone's seed, but not in the deck
+  (c) seeding     - in the original's working view before the slides branch, but not in its seed
+  (d) branch       - in the slides branch's seed, but not in the deck
   (e) scorer      - a loose pattern finds it in the deck (scorer false negative)
 
 Usage: uv run python experiments/diagnose_long.py STORE.db [...]   (or --json bench_out.json)
@@ -30,7 +30,7 @@ SCORED = {"practice name": r"harbor light", "city": r"duluth", "Dr. Okafor": r"o
 LOOSE = {"practice name": r"harbor", "city": r"duluth|minnesota", "Dr. Okafor": r"okaf|amara", "Dr. Brandt": r"brandt|lena",
          "phone": r"218\D{0,3}555\D{0,3}0143|5550143", "cleanings": r"clean|hygien|prophyl", "crowns": r"crown",
          "invisalign": r"invisalign|aligner", "Invisalign": r"invisalign|aligner"}
-STAGES = ("a compaction", "b join", "c seeding", "d clone", "e scorer")
+STAGES = ("a compaction", "b join", "c seeding", "d branch", "e scorer")
 
 
 def has(pat: str, rows) -> bool:
@@ -47,13 +47,13 @@ def deck_rows(s: Store, slides: str) -> list[dict]:
 def diagnose(path: str) -> dict:
     s = Store(path)
     con = s.con
-    clones = [(r[0]) for r in con.execute("SELECT timeline_id FROM timelines WHERE source_id IS NOT NULL ORDER BY created_at")]
-    skills = {c: [r["name"] for r in s.skills_for(c)] for c in clones}
-    web = [c for c in clones if "website" in skills[c]]
-    slides = [c for c in clones if "slides" in skills[c]]
+    branches = [(r[0]) for r in con.execute("SELECT timeline_id FROM timelines WHERE source_id IS NOT NULL ORDER BY created_at")]
+    skills = {c: [r["name"] for r in s.skills_for(c)] for c in branches}
+    web = [c for c in branches if "website" in skills[c]]
+    slides = [c for c in branches if "slides" in skills[c]]
     out = {"store": path, "web": web, "slides": slides, "missing": {}, "examples": {}}
     if not slides:
-        out["missing"] = {f: "c seeding" for f in SCORED}  # no slides clone at all
+        out["missing"] = {f: "c seeding" for f in SCORED}  # no slides branch at all
         return out
     sl = slides[-1]
     deck = deck_rows(s, sl)
@@ -77,7 +77,7 @@ def diagnose(path: str) -> dict:
         if has(LOOSE.get(f, pat), deck):
             stage, ex = "e scorer", "a loose pattern matches the deck"
         elif has(pat, seed):
-            stage, ex = "d clone", f"seeded into {sl} (seed {[r['row_id'] for r in seed]}) but absent from its deck"
+            stage, ex = "d branch", f"seeded into {sl} (seed {[r['row_id'] for r in seed]}) but absent from its deck"
         elif has(pat, o_wv):
             src = [r for r in o_wv if re.search(pat, r["content"], re.I)][0]
             stage = "c seeding"

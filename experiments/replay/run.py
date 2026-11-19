@@ -7,7 +7,7 @@ For each recorded Claude Code delegation event (read-only subagents):
   G  graft: the parent prefix becomes the original's timeline; the recorded handoff is appended as
      the subtask row (a replay adaptation: no live user asked for this subtask, so the recorded
      handoff stands in as the trigger, owned by the original); the Jev seeder picks the seed; the
-     clone works autonomously with the same tools, then joins(done) and the default join applies.
+     branch works autonomously with the same tools, then joins(done) and the default join applies.
   R  recorded: the real subagent's final report (reference only).
 Evaluation: 8-12 probes generated from the real subagent transcript (facts it found), answered by
 the continued parent (no tools) after each arm's delegation; graded by a model judge plus exact
@@ -188,9 +188,9 @@ async def arm_g(e, sb: sandbox.Sandbox, max_steps: int, workdir: str) -> dict:
     rows = [store.add_turn(tl="o", role=t.role, kind="text", content=t.text) for t in e.parent_prefix]
     rows.append(store.add_turn(tl="o", role="user", kind="text", content=subtask_text(e)))
     t0 = time.perf_counter()
-    # one focus graft: the replay hands the recorded subtask to a single clone and joins it back
-    await h.begin_turn("o")  # a clone call belongs to a turn of the source
-    _, child, text = await h.clone_call(src="o", use={"id": "replay", "name": "fork", "input": {
+    # one focus graft: the replay hands the recorded subtask to a single branch and joins it back
+    await h.begin_turn("o")  # a branch call belongs to a turn of the source
+    _, child, text = await h.branch_call(src="o", use={"id": "replay", "name": "fork", "input": {
         "current": {"skills": [skill.name], "messages": rows}}})  # the seeder picks; these are its fallback
     forced = False
     if child:
@@ -208,7 +208,7 @@ async def arm_g(e, sb: sandbox.Sandbox, max_steps: int, workdir: str) -> dict:
         su.update(calls=slog.get("requests") or 1, uncached=slog["input_tokens"], input=slog["input_tokens"])
         by_model[slog.get("model") or "jev-1.13.0"] = su
     await h.close()
-    return {"returned": "\n\n".join(r["content"] for r in joined), "latency": lat, "clone": child, "clone_text": text,
+    return {"returned": "\n\n".join(r["content"] for r in joined), "latency": lat, "branch": child, "branch_text": text,
             "forced_join": forced, "seed_rows": len(seed), "seed_tokens": sum(len(r["content"]) // 4 for r in seed),
             "candidates": len(slog.get("candidates") or []), "seeder": {k: slog.get(k) for k in
                                                                         ("latency", "input_tokens", "fallback", "error")},

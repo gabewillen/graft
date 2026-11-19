@@ -1,15 +1,15 @@
-"""A focus clone's host tool that awaits what three background clones file.
+"""A focus branch's host tool that awaits what three background branches file.
 
-The host's shape: one request gets one focus clone (the website, which talks to the user) and
-three background clones (a slide deck, a calendar booking, a newsletter). Publishing the home
+The host's shape: one request gets one focus branch (the website, which talks to the user) and
+three background branches (a slide deck, a calendar booking, a newsletter). Publishing the home
 page needs all three, since the page links to them. In this scenario the website's `site_write`
 is an async host tool: it awaits, with asyncio (no polling tool, no time limit of graft's), until
-the three background clones have filed their results (`slides_add_slide`, `calendar_book`,
-`newsletter_draft`), and then writes the page. While it waits, the background clones run.
+the three background branches have filed their results (`slides_add_slide`, `calendar_book`,
+`newsletter_draft`), and then writes the page. While it waits, the background branches run.
 
 Recorded: model calls, input tokens (uncached + cached + cache writes), wall time, whether the
-focus clone finished (replied while holding the conversation, or joined done) or failed, how long
-its tool waited, and each background clone's join reason.
+focus branch finished (replied while holding the conversation, or joined done) or failed, how long
+its tool waited, and each background branch's join reason.
 
     uv run python experiments/await_results.py --live          # needs OPENAI_API_KEY (and a model)
     uv run python experiments/await_results.py                 # offline: the scripted fake (mechanics only)
@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from graft.db import Store, validate  # noqa: E402
 from graft.agent import GraftAgent, GraftConfig  # noqa: E402
-from graft.fake import FakeWorld  # noqa: E402
+from graft.fake import FakeTools  # noqa: E402
 from graft.providers import FakeProvider, make_provider  # noqa: E402
 from graft.sim import follow, say as send  # noqa: E402
 
@@ -48,11 +48,11 @@ WAIT_LIMIT = 900.0  # seconds the whole conversation may take before the run is 
 FILING = {"slides_add_slide": "slides", "calendar_book": "calendar", "newsletter_draft": "newsletter"}
 
 
-class Awaiting(FakeWorld):
+class Awaiting(FakeTools):
     """site_write awaits until the slides, the booking and the newsletter are filed, then writes.
     Each filing sets its event when its tool runs; the wait is an asyncio wait, not a poll.
     `gate`: each filing tool first awaits `focus_waiting`, which site_write sets when it starts
-    waiting, so the focus clone's tool is always reached before anything is filed and the wait
+    waiting, so the focus branch's tool is always reached before anything is filed and the wait
     is exercised. `events`: (seconds since the run began, what happened), for the timeline."""
 
     def __init__(self, gate: bool = False):
@@ -98,7 +98,7 @@ class Awaiting(FakeWorld):
         if name in FILING and self.gate and not self.focus_waiting.is_set():
             self.note(f"{name} waits until site_write is waiting")
             await self.focus_waiting.wait()
-        result = FakeWorld.execute(self, name, args)
+        result = FakeTools.execute(self, name, args)
         self.note(f"{name} ran" + (" (error)" if result[1] else ""))
         if not result[1] and name in FILING:
             self._file(FILING[name])
@@ -106,7 +106,7 @@ class Awaiting(FakeWorld):
 
 
 def scripted(system, messages, tools):
-    """Offline stand-in: the original clones website (focus) and three background parts."""
+    """Offline stand-in: the original branches website (focus) and three background parts."""
     names = {t["name"] for t in tools}
     last = messages[-1]["content"][-1]
     use = lambda prefix, tool, **a: {"type": "tool_use", "id": f"{prefix}{len(messages)}", "name": tool,  # noqa: E731
@@ -161,11 +161,11 @@ async def run(live: bool, trace: bool, gate: bool = False) -> dict:
         return heard(texts)
 
     async def converse():
-        # settle only at the end: with the gate, a background clone waits for the focus clone's
-        # tool, so settling before the focus clone has reached it would wait for ever
+        # settle only at the end: with the gate, a background branch waits for the focus branch's
+        # tool, so settling before the focus branch has reached it would wait for ever
         nonlocal follow_ups
         replies = await say(REQUEST)
-        # the focus clone holds the conversation until it writes the page: while it has not (it asked
+        # the focus branch holds the conversation until it writes the page: while it has not (it asked
         # something, however it put it), it gets the one fixed follow-up, at most MAX_FOLLOW_UPS times
         while follow_ups < MAX_FOLLOW_UPS and not world.site:
             follow_ups += 1
@@ -180,25 +180,25 @@ async def run(live: bool, trace: bool, gate: bool = False) -> dict:
     rows = store.con.execute("SELECT timeline_id, status, join_reason FROM timelines "
                              "WHERE source_id IS NOT NULL ORDER BY rowid").fetchall()
     kinds = {}
-    for r in store.con.execute("SELECT scratch FROM transactions WHERE kind='clone' AND status='committed'"):
+    for r in store.con.execute("SELECT scratch FROM transactions WHERE kind='branch' AND status='committed'"):
         scratch = json.loads(r[0])
         for g in scratch.get("grafts", []) if isinstance(scratch, dict) else []:
             kinds[g.get("child")] = g.get("focus")
-    clones = []
+    branches = []
     for tl, status, reason in rows:
         skills = [k["name"] for k in store.skills_for(tl) if k["name"] not in ("merge", "detached")]
         replied = any(r["role"] == "assistant" and r["kind"] == "text" for r in store.view(tl)
                       if r["owner_timeline"] == tl)
-        clones.append({"clone": tl, "skills": skills, "status": status, "join_reason": reason,
+        branches.append({"branch": tl, "skills": skills, "status": status, "join_reason": reason,
                        "replied": replied, "tools_run": agent._host.tools_run(tl)})
-    focus = [c for c in clones if "website" in c["skills"]]
+    focus = [c for c in branches if "website" in c["skills"]]
     usage = provider.usage
     res = {
         "live": live, "model": getattr(provider, "model", "fake"), "stuck": stuck,
         "model_calls": usage["calls"], "input_tokens": usage["input"], "uncached_input": usage["uncached"],
         "cached_input": usage["cached"], "output_tokens": usage["output"], "wall_s": round(wall, 1),
         "calls_by_tag": {k: v["calls"] for k, v in provider.by_tag.items()},
-        "follow_ups": follow_ups, "clones": clones,
+        "follow_ups": follow_ups, "branches": branches,
         "focus_outcome": (None if not focus else
                           "failed" if focus[0]["join_reason"] == "failed" else
                           "joined " + focus[0]["join_reason"] if focus[0]["join_reason"] else
@@ -218,10 +218,10 @@ def summary(r: dict) -> str:
              f"(uncached {r['uncached_input']}, cached {r['cached_input']}); output tokens {r['output_tokens']}; "
              f"wall {r['wall_s']}s; follow-ups {r['follow_ups']}",
              f"calls by tag: {r['calls_by_tag']}",
-             f"focus clone: {r['focus_outcome']}; site written {r['site_written']}; "
+             f"focus branch: {r['focus_outcome']}; site written {r['site_written']}; "
              f"site_write waits {r['site_write_waits']}; filed {r['filed']}"]
-    for c in r["clones"]:
-        lines.append(f"  {c['clone']} {c['skills']} status={c['status']} join_reason={c['join_reason']} "
+    for c in r["branches"]:
+        lines.append(f"  {c['branch']} {c['skills']} status={c['status']} join_reason={c['join_reason']} "
                      f"replied={c['replied']} tools_run={c['tools_run']}")
     lines.append("timeline (s since the run began):")
     lines += [f"  {t:8.3f}  {what}" for t, what in r["timeline"]]

@@ -1,4 +1,4 @@
-"""Seed actor for the one-shot clone (GRAFT_SEEDER=model|jev).
+"""Seed actor for the one-shot branch (GRAFT_SEEDER=model|jev).
 
 Jev request design (reduced + chunked; documented limits: 64k tokens per request, 32k for the
 state plus the longest question): the state is only the new task (the part of the latest request
@@ -12,7 +12,7 @@ truncated deterministically (recorded in the decision).
 With `model` (the default when TYPESAFE_API_KEY is unset) there is no decisions client: a graft
 starts from the messages its fork entry points at (`Harness.resolve_messages`). With `jev`, a
 TypeSafe Jev decision model
-picks the seed: one `system_one` request per clone with one Noul ("does a branch doing the new
+picks the seed: one `system_one` request per branch with one Noul ("does a branch doing the new
 task need this message?") per candidate row. Candidates are the
 text rows of the source's working view, excluding harness notes. Rows scoring at or above
 GRAFT_SEED_THRESHOLD (default 0.4) are seeded in view order, and the user's latest message (the

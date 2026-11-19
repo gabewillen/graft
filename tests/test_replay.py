@@ -302,8 +302,8 @@ def test_worktree_diff_includes_submodule_changes(tmp_path):
         w.remove()
 
 
-def test_arm_g_clones_runs_and_joins_offline(tmp_path, monkeypatch):
-    """The graft arm of the replay, with a scripted provider and a fake seeder: one focus clone
+def test_arm_g_branches_runs_and_joins_offline(tmp_path, monkeypatch):
+    """The graft arm of the replay, with a scripted provider and a fake seeder: one focus branch
     for the recorded subtask, run to the end of its turn, which merges it (`done`)."""
     import asyncio
 
@@ -320,7 +320,7 @@ def test_arm_g_clones_runs_and_joins_offline(tmp_path, monkeypatch):
                                    input_tokens=50)
 
     def policy(system, messages, tools):
-        assert "fork" not in {t["name"] for t in tools}  # only the clone is ever called
+        assert "fork" not in {t["name"] for t in tools}  # only the branch is ever called
         return [{"type": "text", "text": "Report: parse_token lacks bounds checks."}]
 
     monkeypatch.setattr(replay_run, "OpenAIProvider", lambda model: FakeProvider(policy))
@@ -329,11 +329,11 @@ def test_arm_g_clones_runs_and_joins_offline(tmp_path, monkeypatch):
     (tmp_path / "repo").mkdir()
     sb = sandbox.Sandbox(str(tmp_path / "repo"))
     res = asyncio.run(replay_run.arm_g(e, sb, max_steps=4, workdir=str(tmp_path)))
-    assert res["clone"] == "c1" and res["clone_text"].startswith("forked -> c1 (current")
+    assert res["branch"] == "c1" and res["branch_text"].startswith("forked -> c1 (current")
     assert res["forced_join"] is False  # its turn ended on its answer, and that merged it
     assert res["returned"] == "Report: parse_token lacks bounds checks." and res["joined_rows"] == 1
     assert res["seed_rows"] == 3 and res["candidates"] == 3 and res["seeder"]["fallback"] is None
     assert res["usage"]["calls"] == 1 and res["by_model"]["fake-1"]["input"] == 50
-    last = res["parent_messages"][-1]  # the parent's view ends on its result of the clone's merge call
+    last = res["parent_messages"][-1]  # the parent's view ends on its result of the branch's merge call
     assert last["role"] == "user" and last["content"][-1]["type"] == "tool_result"
     assert last["content"][-1]["content"].startswith("c1 merged.")

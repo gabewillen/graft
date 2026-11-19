@@ -1,4 +1,4 @@
-"""What a branch starts with (spec: Clone, The seed and the graft's view; What the model is told,
+"""What a branch starts with (spec: Branch, The seed and the graft's view; What the model is told,
 Fork and merge are messages): the messages main points at (row ids or exact quotes, in stored
 order), then main's own fork turn (its reason included), then that turn's results as the branch
 sees them: its own fork result, and main's results of the other calls. Nothing is injected with
@@ -10,7 +10,7 @@ import threading
 
 from _util import chat_of, conversation, install_fake
 from graft.db import Store
-from graft.harness import NOT_RUN_BESIDE_CLONE, Host, clone_entries, fork_result
+from graft.harness import NOT_RUN_BESIDE_BRANCH, Host, branch_entries, fork_result
 from graft.providers import FakeProvider
 
 ASK = "I run a dental practice in Austin."
@@ -65,32 +65,34 @@ def run(*, h, says):
 
 
 def test_entry_shape_messages_and_reason():
-    _, v = clone_entries({"current": {"skills": ["website"]}})
+    _, v = branch_entries({"current": {"skills": ["website"]}})
     assert any("messages must be a list" in x for x in v), v
-    _, v = clone_entries({"current": {"skills": ["website"], "messages": []}})
+    _, v = branch_entries({"current": {"skills": ["website"], "messages": []}})
     assert v == ["current: give it messages, a reason, or both: with neither it would start from nothing"]
-    es, v = clone_entries({"current": {"skills": ["website"], "messages": [], "reason": "Build it."}})
+    es, v = branch_entries({"current": {"skills": ["website"], "messages": [], "reason": "Build it."}})
     assert v == [] and es[0].reason == "Build it." and es[0].messages == []
-    _, v = clone_entries({"current": {"skills": ["website"], "messages": [], "reason": "  "}})
+    _, v = branch_entries({"current": {"skills": ["website"], "messages": [], "reason": "  "}})
     assert v and "neither" in v[0]  # a blank reason is no reason
-    _, v = clone_entries({"current": {"skills": ["website"], "messages": [1.5, True, "q"]}})
-    assert v == ["current: each item of messages is a short exact quote (a string) or a row id (an integer)"]
-    _, v = clone_entries({"current": {"skills": ["website"], "messages": ["q"], "reason": 3}})
+    _, v = branch_entries({"current": {"skills": ["website"], "messages": [1.5, True, "q"]}})
+    assert v == ["current: each item of messages must be a row id (an integer)"]
+    _, v = branch_entries({"current": {"skills": ["website"], "messages": [1], "reason": 3}})
     assert v == ["current: reason must be a string (your own words for what this branch is for)"]
-    _, v = clone_entries({"current": {"skills": ["website"], "messages": ["q"], "purpose": "x"}})
+    _, v = branch_entries({"current": {"skills": ["website"], "messages": [1], "purpose": "x"}})
     assert v == ["current: unknown field 'purpose' (a branch is {id?, skills, messages, reason?})"]
 
 
 def test_a_branch_sees_only_the_messages_main_points_at_then_main_fork_turn_and_its_own_result(tmp_path):
+    # row 1 = ASK, row 2 = SECRET, row 3 = REQUEST (main answered ASK and SECRET with [])
     main = Main([{"type": "text", "text": "On it."},
-                 fork_use(current={"id": "site", "skills": ["website"], "messages": [REQUEST, "dental practice"],
+                 fork_use(current={"id": "site", "skills": ["website"], "messages": [3, 1],
                                    "reason": "Build the site; ask what pages they want."})])
     store, h = make(tmp_path=tmp_path, policy=main)
     run(h=h, says=[ASK, SECRET, REQUEST])
     sent = main.branch_sent
     flat = json.dumps(sent)
     assert "hunter2" not in flat  # main did not point at it: the branch never sees it
-    # stored order: the quoted messages, then main's fork turn (text + call), then its own result
+    assert "[#" not in flat  # branches never see main's [#id] tags
+    # stored order: the pointed messages, then main's fork turn (text + call), then its own result
     assert [m["role"] for m in sent] == ["user", "assistant", "user"]
     assert [b.get("text", "").split("\n")[-1] for b in sent[0]["content"]] == [ASK, REQUEST]
     assert [b["type"] for b in sent[1]["content"]] == ["text", "tool_use"]
@@ -132,15 +134,12 @@ def test_a_pointer_that_names_no_message_refuses_the_call_and_lists_the_messages
             return text("Sorry.")
         if not last["text"].endswith(REQUEST):
             return text("Noted.")
-        return [fork_use(current={"skills": ["website"], "messages": [
-            "nothing like this", "dental", 999, 1, "Build"]})]
+        return [fork_use(current={"skills": ["website"], "messages": [999, 1]})]
 
     store, h = make(tmp_path=tmp_path, policy=policy)
     run(h=h, says=[ASK, "I run a dental clinic too.", REQUEST])
     refusal = calls[0]
     assert refusal.startswith("fork refused; no branch was started:")
-    assert "current: quote 'nothing like this' matches no message" in refusal
-    assert "current: quote 'dental' matches 2 messages" in refusal
     assert "current: row 999 is not in your conversation" in refusal
     assert "Your messages (row id, role: start of the text):" in refusal
     assert f"  1 user: {ASK}" in refusal
@@ -158,13 +157,12 @@ def test_pointers_to_tool_rows_harness_rows_and_withdrawn_messages_are_refused(t
         note = store.add_turn("o", "user", "text", "(a note)", harness=True)
         gone = store.add_turn("o", "user", "text", "Forget it.")
         store.mark_withdrawn(timelines=["o"], rows=[gone])
-        rows, problems = h.resolve_messages("o", [u, tu, tr, note, gone, "Forget it.", u], exclude=set())
+        rows, problems = h.resolve_messages("o", [u, tu, tr, note, gone, u], exclude=set())
         assert rows == [u]
         assert problems == [f"row {tu} is a tool call or tool result, not a message",
                             f"row {tr} is a tool call or tool result, not a message",
                             f"row {note} is a harness note, not a message",
-                            f"row {gone} is a message the user withdrew; it is not a request and cannot be seeded",
-                            "quote 'Forget it.' matches only a message the user withdrew; it cannot be seeded"]
+                            f"row {gone} is a message the user withdrew; it is not a request and cannot be seeded"]
         await h.close()
 
     asyncio.run(go())
@@ -172,20 +170,20 @@ def test_pointers_to_tool_rows_harness_rows_and_withdrawn_messages_are_refused(t
 
 def test_other_calls_of_the_fork_turn_carry_main_results_in_the_branch_and_thinking_stays_out(tmp_path):
     main = Main([{"type": "thinking", "thinking": "hmm", "signature": "s"},
-                 fork_use(current={"skills": ["website"], "messages": [REQUEST]}),
+                 fork_use(current={"skills": ["website"], "messages": [1]}),
                  {"type": "tool_use", "id": "l1", "name": "load_skill", "input": {"name": "fork"}}])
     store, h = make(tmp_path=tmp_path, policy=main)
     run(h=h, says=[REQUEST])
     sent = main.branch_sent
     assert [b["type"] for b in sent[1]["content"]] == ["tool_use", "tool_use"]
     results = {b["tool_use_id"]: b["content"] for b in sent[2]["content"]}
-    assert results["l1"] == NOT_RUN_BESIDE_CLONE
+    assert results["l1"] == NOT_RUN_BESIDE_BRANCH
     assert results["f1"].endswith("Your part: what the messages above ask for that your skills cover.")
 
 
 def test_messages_and_refusals_are_bounded():
     from graft.harness import MAX_MESSAGES
-    _, v = clone_entries({"current": {"skills": ["website"], "messages": ["q"] * (MAX_MESSAGES + 1)}})
+    _, v = branch_entries({"current": {"skills": ["website"], "messages": list(range(MAX_MESSAGES + 1))}})
     assert v == [f"current: messages names {MAX_MESSAGES + 1} items; give at most {MAX_MESSAGES}"]
 
 

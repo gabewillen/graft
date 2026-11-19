@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable
 # MCP tool names: 1-128 characters of letters, digits, _ - . (the model APIs refuse anything else).
 TOOL_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 # graft's own tools: a host tool may not take one of these names.
-RESERVED = frozenset({"load_skill", "fork", "merge", "stop"})
+RESERVED = frozenset({"fork", "merge", "stop"})
 
 
 @dataclass

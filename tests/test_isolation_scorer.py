@@ -5,11 +5,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from isolation import fisher_two_sided, score  # noqa: E402
 
-from graft.fake import FakeWorld  # noqa: E402
+from graft.fake import FakeTools  # noqa: E402
 
 
 def deck_world(title, slides, tone="professional, warm"):
-    w = FakeWorld()
+    w = FakeTools()
     w.execute("slides_create", {"title": title, "audience": "Retirees in Columbus, Ohio", "tone": tone})
     for t, b in slides:
         w.execute("slides_add_slide", {"title": t, "bullets": b})
@@ -45,5 +45,5 @@ def test_fisher():
 
 def test_world_tool_with_missing_args_is_an_error_not_a_crash():
     
-    content, err = FakeWorld().execute("site_write", {"page": "home"})
+    content, err = FakeTools().execute("site_write", {"page": "home"})
     assert err and "invalid arguments" in content

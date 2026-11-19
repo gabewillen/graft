@@ -15,7 +15,7 @@
          "website"
         ],
         "messages": [
-         "Build the website, then a slide deck."
+         1
         ],
         "reason": "Build the website."
        }
@@ -42,7 +42,7 @@
          "slides"
         ],
         "messages": [
-         "Build the website, then a slide deck."
+         1
         ],
         "reason": "Make a slide deck."
        }

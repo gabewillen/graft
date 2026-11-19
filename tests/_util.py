@@ -30,15 +30,15 @@ def pointing(store, use, src="o"):
     return dict(use, input=out)
 
 
-async def clone_in_turn(h, use, src="o"):
-    """Make a clone call the way the harness loop does, inside a turn of `src` (a turn its caller
+async def branch_in_turn(h, use, src="o"):
+    """Make a branch call the way the harness loop does, inside a turn of `src` (a turn its caller
     drives, so the call is not a row of src's view: an entry that names no messages is pointed at
     the conversation, `pointing`). A turn that still holds the conversation afterwards (background
     grafts only, or a refused call) is ended, so `src` is left at rest. Returns (new timeline ids or
     None, result text)."""
     use = pointing(store=h.store, use=use, src=src)
     await h.begin_turn(src)
-    children, focus, text = await h.clone_call(src=src, use=use)
+    children, focus, text = await h.branch_call(src=src, use=use)
     if focus is None:
         await h.end_turn(src)
     return children, text
@@ -55,8 +55,8 @@ def holders(store):
         "SELECT timeline_id FROM timelines WHERE status IN ('active', 'joining') ORDER BY timeline_id")]
 
 
-def clones(store):
-    """The grafts made, in order (a clone call undone because its machines could not start is
+def branches(store):
+    """The grafts made, in order (a branch call undone because its machines could not start is
     left out: its grafts are `abandoned` without ever running)."""
     return [r[0] for r in store.con.execute(
         "SELECT t.timeline_id FROM timelines t WHERE t.source_id IS NOT NULL AND NOT (t.status = 'abandoned' "
@@ -85,19 +85,24 @@ def branch_input(*entries):
     return out
 
 
+_ROW_TAG = re.compile(r"^(?:\[conversation [^\]]*\]\s*)?\[#(\d+)\]\s*")
+
+
 def _quotes(messages):
-    """The user's own messages in a rendered view, as quotes (no harness rows, no nonce). A text
-    sent more than once is left out: a quote of it would match more than one message."""
-    texts = []
+    """The user's own messages in a rendered view, as integer row-id pointers (from main's
+    `[#<id>]` prefixes, no harness rows)."""
+    ids = []
     for m in messages:
         if m["role"] != "user":
             continue
         for b in m["content"]:
             if b["type"] == "text" and not b.get("harness"):
-                q = re.sub(r"^\[conversation [^\]]*\]\s*", "", b["text"]).strip()
-                if q:
-                    texts.append(q)
-    return [q for q in dict.fromkeys(texts) if texts.count(q) == 1]
+                hit = _ROW_TAG.match(b["text"])
+                if hit:
+                    rid = int(hit.group(1))
+                    if rid not in ids:
+                        ids.append(rid)
+    return ids
 
 
 def quoting(policy):
@@ -126,7 +131,7 @@ def quoting(policy):
 
 
 def started(block):
-    """Is this block a branch's own fork result, the last row of its first view (spec: Clone)?"""
+    """Is this block a branch's own fork result, the last row of its first view (spec: Branch)?"""
     return (block.get("type") == "tool_result" and isinstance(block.get("content"), str)
             and block["content"].startswith("You are now on branch "))
 
@@ -162,7 +167,7 @@ import weakref
 
 from graft import a2a
 from graft.agent import GraftAgent, GraftConfig, HarnessError, fold
-from graft.fake import FakeWorld
+from graft.fake import FakeTools
 from graft.providers import FakeProvider
 from graft.skills import install
 from a2a_schema import check
@@ -172,7 +177,7 @@ _CHATS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 def install_fake(store, *, world=None):
     """The skill catalog, with the simulated tools' definitions (graft/fake.py)."""
-    install(store, tools=(world or FakeWorld()).definitions())
+    install(store, tools=(world or FakeTools()).definitions())
 
 
 class Chat:
@@ -364,7 +369,7 @@ def conversation(store, policy=None, *, provider=None, world=None, tools=None, q
     `provider`, and the simulated tools of `world`; returns its Chat."""
     if provider is None:
         provider = FakeProvider(quoting(policy) if quote else policy)
-    world = world if world is not None else FakeWorld()
+    world = world if world is not None else FakeTools()
     count = itertools.count(1)
     config.setdefault("ids", lambda: f"t{next(count)}")
     config.setdefault("context_id", "ctx")

@@ -1,4 +1,4 @@
-"""A branch's id (spec: Clone, Ids): given by the model or drawn by the harness, unique in the
+"""A branch's id (spec: Branch, Ids): given by the model or drawn by the harness, unique in the
 conversation and never reused; every note, result and refusal names a graft by it, the branch is
 told it, and `stop` resolves ids only through it, never a timeline id."""
 
@@ -8,7 +8,7 @@ import re
 
 import pytest
 
-from _util import clone_in_turn, ran, started, woke, conversation, chat_of, install_fake
+from _util import branch_in_turn, ran, started, woke, conversation, chat_of, install_fake
 from graft.db import Store
 from graft.harness import GRAFT_ID, MAX_NAME_DRAWS, Host, new_names
 from graft.providers import FakeProvider
@@ -30,10 +30,10 @@ def fork(*, current=None, detached=(), id="t"):
 
 
 def test_main_is_the_line_the_original_holds_and_never_a_branch_id():
-    from graft.harness import clone_entries
-    _, v = clone_entries({"current": {"id": "main", "skills": ["website"], "messages": ["q"]}})
+    from graft.harness import branch_entries
+    _, v = branch_entries({"current": {"id": "main", "skills": ["website"], "messages": [1]}})
     assert v == ["current: id 'main' is the line you hold, not a branch; give the branch another id"]
-    assert clone_entries({"current": {"id": "main-site", "skills": ["website"], "messages": ["q"]}})[1] == []
+    assert branch_entries({"current": {"id": "main-site", "skills": ["website"], "messages": [1]}})[1] == []
 
 
 def test_the_default_source_draws_six_lowercase_hex_characters():
@@ -52,7 +52,7 @@ def test_ids_given_and_drawn_name_the_branch_everywhere_and_never_its_timeline_i
     async def go():
         await chat_of(h).start()
         store.add_turn("o", "user", "text", REQUEST)
-        (c1, c2), msg = await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]},
+        (c1, c2), msg = await branch_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]},
                                                                    {"skills": ["slides"]}]))
         assert (c1, c2) == ("c1", "c2")  # timeline ids stay graft's own
         assert msg == ("forked -> site (detached, running; skills ['website', 'detached']), "
@@ -79,14 +79,14 @@ def test_an_id_is_never_reused_and_a_colliding_draw_is_drawn_again(tmp_path):
     async def go():
         await chat_of(h).start()
         store.add_turn("o", "user", "text", REQUEST)
-        (c1,), _ = await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]}]))
-        children, msg = await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["slides"]}]))
+        (c1,), _ = await branch_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]}]))
+        children, msg = await branch_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["slides"]}]))
         assert children is None and "detached[0]: id 'site' is already used in this conversation" in msg
-        (c2,), msg = await clone_in_turn(h=h, use=fork(detached=[{"skills": ["slides"]}]))
+        (c2,), msg = await branch_in_turn(h=h, use=fork(detached=[{"skills": ["slides"]}]))
         assert store.name_of(c2) == "deck" and msg.startswith("forked -> deck")
         await h.do_join(child=c1, reason="done")
         await h.drain_and_wake("o")
-        children, msg = await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["calendar"]}]))
+        children, msg = await branch_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["calendar"]}]))
         assert children is None and "already used" in msg  # merged: still never reused
         await h.machines.stop()
 
@@ -103,12 +103,12 @@ def test_an_id_source_that_cannot_give_an_id_refuses_the_call(tmp_path, source):
         await chat_of(h).start()
         store.add_turn("o", "user", "text", REQUEST)
         if source == "collides":
-            await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]}]))
-        children, msg = await clone_in_turn(h=h, use=fork(detached=[{"skills": ["slides"]}]))
+            await branch_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]}]))
+        children, msg = await branch_in_turn(h=h, use=fork(detached=[{"skills": ["slides"]}]))
         assert children is None and msg.startswith("fork refused; no branch was started: internal error")
         assert (f"no free branch id after {MAX_NAME_DRAWS} draws" if source == "collides"
                 else "which is not a branch id") in msg
-        assert store.con.execute("SELECT count(*) FROM transactions WHERE kind='clone' AND status='open'"
+        assert store.con.execute("SELECT count(*) FROM transactions WHERE kind='branch' AND status='open'"
                                  ).fetchone()[0] == 0
         await h.machines.stop()
 
@@ -126,10 +126,10 @@ def test_stop_takes_branch_ids_and_a_timeline_id_names_nothing(tmp_path):
         if "fork" not in names:
             gate.wait(10)
             return text("Built.")
-        if last["type"] == "text" and not woke(last) and last["text"] == REQUEST:
+        if last["type"] == "text" and not woke(last) and last["text"].endswith(REQUEST):
             return [{"type": "tool_use", "id": "f1", "name": "fork",
                      "input": {"detached": [{"id": "site", "skills": ["website"]}]}}]
-        if last["type"] == "text" and not woke(last) and last["text"] == "Stop it.":
+        if last["type"] == "text" and not woke(last) and last["text"].endswith("Stop it."):
             return [{"type": "tool_use", "id": "s1", "name": "stop", "input": {"ids": ["c1", "site"]}}]
         return text("Okay.")
 
@@ -164,8 +164,8 @@ def test_error_lines_name_a_branch_by_its_id_even_when_another_branchs_timeline_
     async def go():
         await chat_of(h).start()
         store.add_turn("o", "user", "text", REQUEST)
-        (site,), _ = await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]}]))
-        (named_c1,), _ = await clone_in_turn(h=h, use=fork(detached=[{"id": "c1", "skills": ["slides"]}]))
+        (site,), _ = await branch_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]}]))
+        (named_c1,), _ = await branch_in_turn(h=h, use=fork(detached=[{"id": "c1", "skills": ["slides"]}]))
         assert (site, named_c1) == ("c1", "c2") and store.name_of("c2") == "c1"
         real, failed = store.commit_join, []
 
@@ -227,5 +227,5 @@ def test_an_error_line_is_still_told_when_the_store_cannot_name_the_branch(tmp_p
     def broken(tl):
         raise OSError("store gone")
     store.name_of = broken
-    line, _ = h.report(kind="commit", src="o", clones=["c1"], error=OSError("disk full"), quiet=False, background=True)
+    line, _ = h.report(kind="commit", src="o", branches=["c1"], error=OSError("disk full"), quiet=False, background=True)
     assert line.startswith("(harness error: committing the merge of a branch failed") and "c1" not in line

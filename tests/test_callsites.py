@@ -31,11 +31,11 @@ def user(text):
 
 def test_site_mapping():
     tr = [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]}]
-    assert callsites.site_for("original", user("hi")) == "clone_call"
+    assert callsites.site_for("original", user("hi")) == "branch_call"
     assert callsites.site_for("original", tr) == "original"
-    assert callsites.site_for("original:clone_tx") == "original"
-    assert callsites.site_for("clone:c3") == "clone"
-    assert callsites.site_for("clone:c3:compaction") == "compaction"
+    assert callsites.site_for("original:branch_tx") == "original"
+    assert callsites.site_for("branch:c3") == "branch"
+    assert callsites.site_for("branch:c3:compaction") == "compaction"
     assert callsites.site_for("parent") == "subagent_parent"
     assert callsites.site_for("subagent") == "subagent"
     assert callsites.site_for("parent:compaction") == "compaction"
@@ -43,24 +43,24 @@ def test_site_mapping():
 
 def test_resolution_order(clean_env):
     m = clean_env
-    assert callsites.effort_for("clone_call") == "low"  # built-in default
+    assert callsites.effort_for("branch_call") == "low"  # built-in default
     m.setenv("GRAFT_REASONING_EFFORT", "medium")
-    assert callsites.effort_for("clone") == "medium" and callsites.effort_for("clone_call") == "medium"
+    assert callsites.effort_for("branch") == "medium" and callsites.effort_for("branch_call") == "medium"
     m.setenv("GRAFT_EFFORT_ORIGINAL", "minimal")
-    assert callsites.effort_for("clone_call") == "minimal"  # clone_call falls back to original
-    m.setenv("GRAFT_EFFORT_CLONE_CALL", "high")
-    assert callsites.effort_for("clone_call") == "high" and callsites.effort_for("original") == "minimal"
-    assert callsites.effort_for("clone") == "medium"
-    assert callsites.model_for("clone_call") is None
+    assert callsites.effort_for("branch_call") == "minimal"  # branch_call falls back to original
+    m.setenv("GRAFT_EFFORT_BRANCH_CALL", "high")
+    assert callsites.effort_for("branch_call") == "high" and callsites.effort_for("original") == "minimal"
+    assert callsites.effort_for("branch") == "medium"
+    assert callsites.model_for("branch_call") is None
     m.setenv("GRAFT_MODEL_ORIGINAL", "gpt-x")
-    assert callsites.model_for("clone_call") == "gpt-x" and callsites.model_for("clone") is None
-    m.setenv("GRAFT_MODEL_CLONE_CALL", "gpt-y")
-    assert callsites.model_for("clone_call") == "gpt-y"
+    assert callsites.model_for("branch_call") == "gpt-x" and callsites.model_for("branch") is None
+    m.setenv("GRAFT_MODEL_BRANCH_CALL", "gpt-y")
+    assert callsites.model_for("branch_call") == "gpt-y"
 
 
 def test_harness_tags_each_call_with_site_effort_and_model(tmp_path, clean_env):
-    clean_env.setenv("GRAFT_EFFORT_CLONE_CALL", "high")
-    clean_env.setenv("GRAFT_MODEL_CLONE", "model-b")
+    clean_env.setenv("GRAFT_EFFORT_BRANCH_CALL", "high")
+    clean_env.setenv("GRAFT_MODEL_BRANCH", "model-b")
     store = Store(str(tmp_path / "s.db"))
     install_fake(store)
     fp = FakeProvider(pivot_policy)
@@ -72,11 +72,11 @@ def test_harness_tags_each_call_with_site_effort_and_model(tmp_path, clean_env):
         await h.machines.stop()
 
     asyncio.run(go())
-    route = [c for c in fp.call_log if c["tag"] == "original:clone_tx"]
-    assert route and all(c["site"] == "clone_call" and c["effort"] == "high" and c["model"] == "fake"
+    route = [c for c in fp.call_log if c["tag"] == "original:branch_tx"]
+    assert route and all(c["site"] == "branch_call" and c["effort"] == "high" and c["model"] == "fake"
                          for c in route)
-    work = [c for c in fp.call_log if c["tag"].startswith("clone:")]
-    assert work and all(c["site"] == "clone" and c["effort"] == "low" and c["model"] == "model-b" for c in work)
+    work = [c for c in fp.call_log if c["tag"].startswith("branch:")]
+    assert work and all(c["site"] == "branch" and c["effort"] == "low" and c["model"] == "model-b" for c in work)
     assert set(fp.by_model) == {"fake", "model-b"}
 
 
@@ -89,11 +89,11 @@ def test_openai_provider_sends_per_call_model_and_effort():
     p.model, p.api, p.effort, p.use_cache_key = "gpt-6-luna", "responses", "low", False
     p._init_usage()
     p.client = NS(responses=NS(create=lambda **kw: calls.append(kw) or resp))
-    p.complete("S", user("hi"), [], model="gpt-6-other", effort="high", site="clone_call")
+    p.complete("S", user("hi"), [], model="gpt-6-other", effort="high", site="branch_call")
     p.complete("S", user("hi"), [])
     assert calls[0]["model"] == "gpt-6-other" and calls[0]["reasoning"] == {"effort": "high"}
     assert calls[1]["model"] == "gpt-6-luna" and calls[1]["reasoning"] == {"effort": "low"}
-    assert p.call_log[0]["model"] == "gpt-6-other" and p.call_log[0]["site"] == "clone_call"
+    assert p.call_log[0]["model"] == "gpt-6-other" and p.call_log[0]["site"] == "branch_call"
     assert set(p.by_model) == {"gpt-6-other", "gpt-6-luna"}
 
 

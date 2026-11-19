@@ -76,15 +76,15 @@ def run(*, h, says):
     return out
 
 
-SITE = {"id": "site", "skills": ["website"], "messages": [REQUEST], "reason": "Build the website."}
+SITE = {"id": "site", "skills": ["website"], "messages": [1], "reason": "Build the website."}
 
 
-def test_a_current_branch_that_replies_merges_at_the_end_of_its_turn_and_main_runs_once(tmp_path):
+def test_a_current_branch_that_replies_merges_quietly_when_nothing_else_runs(tmp_path):
     script = Script(entry=SITE, branch=lambda m: text("What pages should the site have?"))
     store, h, said = make(tmp_path=tmp_path, policy=script)
     out = run(h=h, says=[REQUEST])
-    assert out == [["What pages should the site have?"]]  # main's run after the merge said nothing
-    assert len(script.main_after_merge) == 1  # main always runs once after a merge
+    assert out == [["What pages should the site have?"]]
+    assert len(script.main_after_merge) == 0  # current branch replied with nothing else running: no wasted wake
     # the branch's timeline ends on the harness's argument-less merge call and its result
     tail = [(r["role"], r["kind"], r["tool_name"], r["harness"]) for r in store.view("c1")][-3:]
     assert tail == [("assistant", "text", None, 0), ("assistant", "tool_use", "merge", 1),
@@ -103,9 +103,6 @@ def test_a_current_branch_that_replies_merges_at_the_end_of_its_turn_and_main_ru
     assert not [r for r in store.view("o") if r["harness"] and r["kind"] == "text"]
     assert store.timeline("c1")["join_reason"] == "done" and holder(store) == "o"
     assert validate(store.view("o"), "o") == []
-    # main's run after the merge sees the merge call as an assistant message
-    last_two = script.main_after_merge[0][-2:]
-    assert last_two[0]["role"] == "assistant" and last_two[0]["content"][-1]["name"] == "merge"
 
 
 def test_the_next_message_goes_to_main_never_to_the_merged_branch(tmp_path):
@@ -119,9 +116,11 @@ def test_the_next_message_goes_to_main_never_to_the_merged_branch(tmp_path):
     store, h, said = make(tmp_path=tmp_path, policy=script)
     run(h=h, says=[REQUEST, "Home and contact."])
     assert len(seen) == 1  # the branch ran one turn
-    # main ran after the merge, then on the next message, which is its own row
-    assert len(script.main_after_merge) == 2
-    assert script.main_after_merge[1][-1]["content"][-1]["text"].endswith("Home and contact.")
+    # main skipped the silent wake, then ran on the next message (seeing the merge call + new user message)
+    assert len(script.main_after_merge) == 1
+    assert script.main_after_merge[0][-2]["role"] == "assistant"
+    assert script.main_after_merge[0][-2]["content"][-1]["name"] == "merge"
+    assert script.main_after_merge[0][-1]["content"][-1]["text"].endswith("Home and contact.")
     owners = [r["owner_timeline"] for r in store.view("o") if r["content"] == "Home and contact."]
     assert owners == ["o"] and store.timeline("c1")["status"] == "joined"
 
@@ -207,8 +206,8 @@ def test_a_malformed_or_oversized_merge_call_still_ends_the_turn_but_main_reads_
 
 
 def test_a_fork_entry_reason_over_the_bound_refuses_the_call():
-    from graft.harness import REASON_CHARS, clone_entries
-    _, v = clone_entries({"current": {"skills": ["website"], "messages": [], "reason": "x" * (REASON_CHARS + 1)}})
+    from graft.harness import REASON_CHARS, branch_entries
+    _, v = branch_entries({"current": {"skills": ["website"], "messages": [], "reason": "x" * (REASON_CHARS + 1)}})
     assert v[0] == f"current: reason is {REASON_CHARS + 1} characters long; give at most {REASON_CHARS}"
 
 

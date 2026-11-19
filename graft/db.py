@@ -1,7 +1,7 @@
 """SQLite store for Agent Grafts (spec: "Everything is SQLite").
 
 Tables follow the spec, with two additions to `transactions` (`target`, `scratch`): it is
-the audit record of clone and default-join commits (the call's arguments and the resolved
+the audit record of branch and default-join commits (the call's arguments and the resolved
 pointers), and a `compactions` table recording each extractive compaction's pointer selection.
 
 Row content encoding (provider-neutral):
@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS context(
 
 CREATE TABLE IF NOT EXISTS transactions(
   tx_id INTEGER PRIMARY KEY AUTOINCREMENT, timeline_id TEXT NOT NULL REFERENCES timelines,
-  kind TEXT NOT NULL CHECK(kind IN ('clone','join')),
+  kind TEXT NOT NULL CHECK(kind IN ('branch','join')),
   status TEXT NOT NULL, committed_sql TEXT,
   target TEXT, scratch TEXT);
 
@@ -123,15 +123,15 @@ class Skill:
 
 @dataclass
 class Graft:
-    """One entry of a committed clone call: the new timeline, its seed pointers and skills.
+    """One entry of a committed branch call: the new timeline, its seed pointers and skills.
     A focus graft takes the conversation; the others run in the background."""
     child: str
     seed: list[int]
     skills: list[str]
     focus: bool = True
     name: str | None = None  # the id the model knows it by
-    # The source's clone turn as the graft sees it: pointers to the assistant rows that hold the
-    # clone call and to the source's results of that turn's other calls, then the graft's own
+    # The source's branch turn as the graft sees it: pointers to the assistant rows that hold the
+    # branch call and to the source's results of that turn's other calls, then the graft's own
     # fork result (a tool_result block, written as a row the graft owns). Empty and None for a call
     # that is not a row in the source's view (a turn its caller drives).
     turn: list[int] = field(default_factory=list)
@@ -230,8 +230,8 @@ class Store:
             "UPDATE timelines SET join_reason=?, join_trigger=? WHERE timeline_id=?",
             (reason, trigger, tl))
 
-    def next_clone_ids(self, n: int) -> list[str]:
-        """Distinct ids for the n grafts of one clone call (none is committed yet)."""
+    def next_branch_ids(self, n: int) -> list[str]:
+        """Distinct ids for the n grafts of one branch call (none is committed yet)."""
         first = self.con.execute("SELECT count(*) FROM timelines").fetchone()[0]
         return [f"c{first + i}" for i in range(n)]
 
@@ -424,10 +424,10 @@ class Store:
             "UPDATE transactions SET status=?, committed_sql=?, scratch=? WHERE tx_id=?",
             (status, committed_sql, json.dumps(scratch, default=str), tx_id))
 
-    def commit_clone(self, source: str, grafts: Sequence[Graft],
+    def commit_branch(self, source: str, grafts: Sequence[Graft],
                      audits: Sequence[tuple[int, str, Any]] = ()) -> None:
-        """One SQL transaction for the whole clone call: every graft's timelines row, seed and
-        clone-turn pointers, fork result row and timeline_skills links, and the `committed` outcome of its audit records
+        """One SQL transaction for the whole branch call: every graft's timelines row, seed and
+        branch-turn pointers, fork result row and timeline_skills links, and the `committed` outcome of its audit records
         (`audits`: (tx_id, committed_sql, scratch)), or none of it."""
         self.con.execute("BEGIN")
         try:
@@ -450,11 +450,11 @@ class Store:
                     implicit: dict | None, result: dict | None, note: str | None, trigger: int | None,
                     tx: int, status: str, committed_sql: str | None, scratch: Any,
                     closing: Sequence[tuple[str, str, Any]] = ()) -> int | None:
-        """One join, one SQL transaction: the clone's close-out it could not write as it froze
+        """One join, one SQL transaction: the branch's close-out it could not write as it froze
         (`closing`: (timeline, tool name, tool_result block) rows, written first, into its own
-        timeline), the harness's merge call and its result at the end of the clone's timeline
+        timeline), the harness's merge call and its result at the end of the branch's timeline
         (`implicit`: {"use", "result"}, for a turn that ended without one), the remembered
-        pointers, a pointer to the merge call (`merge`, the clone's own, or the one just written),
+        pointers, a pointer to the merge call (`merge`, the branch's own, or the one just written),
         the source's merge result row (`result`, a tool_result block), or, for a join whose rows
         were skipped, a note instead of both (`note`), the trigger pointer, and the outcome of the
         join's audit record `tx`. All of it or none of it, so a join that failed halfway leaves
@@ -505,15 +505,17 @@ class Store:
 
 
 # ---------------------------------------------------------------- rendering
-def row_block(r: dict) -> dict:
+def row_block(r: dict, tag_ids: bool = False) -> dict:
     kind = r["kind"]
     if kind == "text":
         # The mark travels with the block so a caller can tell a harness note from a user message
         # without reading its text. Provider adapters build their wire blocks from type and text.
         if r.get("withdrawn"):  # never a live request: shown as withdrawn, marked like a note
             return {"type": "text", "text": WITHDRAWN_NOTE + r["content"], "harness": True}
-        return {"type": "text", "text": r["content"], "harness": True} if r.get("harness") \
-            else {"type": "text", "text": r["content"]}
+        if r.get("harness"):
+            return {"type": "text", "text": r["content"], "harness": True}
+        text = f"[#{r['row_id']}] {r['content']}" if tag_ids and r.get("row_id") is not None else r["content"]
+        return {"type": "text", "text": text}
     data = json.loads(r["content"])
     if kind == "tool_use":
         return {"type": "tool_use", "id": data["id"], "name": r["tool_name"], "input": data["input"]}
@@ -523,14 +525,17 @@ def row_block(r: dict) -> dict:
     return {"type": "thinking", **data}
 
 
-def render(rows: list[dict]) -> list[dict]:
-    """Neutral messages [{role, content:[blocks]}]: consecutive same-role rows merge."""
+def render(rows: list[dict], tag_ids: bool = False) -> list[dict]:
+    """Neutral messages [{role, content:[blocks]}]: consecutive same-role rows merge.
+    `tag_ids=True` prefixes each non-harness text row with its immutable `[#<row_id>]` pointer
+    (used on main so `fork` can pass integer row ids on the first try without breaking prefix cache)."""
     msgs: list[dict] = []
     for r in rows:
+        block = row_block(r, tag_ids=tag_ids)
         if msgs and msgs[-1]["role"] == r["role"]:
-            msgs[-1]["content"].append(row_block(r))
+            msgs[-1]["content"].append(block)
         else:
-            msgs.append({"role": r["role"], "content": [row_block(r)]})
+            msgs.append({"role": r["role"], "content": [block]})
     return msgs
 
 
@@ -555,7 +560,7 @@ def validate(rows: list[dict], viewer: str, trigger: int | None = None,
             v.append(f"row {rid}: thinking block owned by {r['owner_timeline']} is bound to its "
                      f"own conversation; exclude it from {viewer}'s view")
     # A view may start with either role: a graft pointed at no messages starts on its source's
-    # clone turn (spec: Validated views).
+    # branch turn (spec: Validated views).
     # group into messages (consecutive same role)
     groups: list[list[dict]] = []
     for r in rows:

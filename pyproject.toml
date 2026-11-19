@@ -1,7 +1,7 @@
 [project]
 name = "graft"
 version = "0.1.0"
-description = "Experimental alternative to subagents for LLM agent delegation: clones seeded from the parent's own context, joined back by pointer"
+description = "Experimental alternative to subagents for LLM agent delegation: branches seeded from the parent's own context, joined back by pointer"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -49,8 +49,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-markers = ["sweep: the internal-faults sweep (slow: run it with -m sweep)"]
-addopts = "-m 'not sweep'"
+addopts = "-q"
 
 [project.scripts]
 graft = "graft.cli:main"
