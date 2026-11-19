@@ -15,7 +15,7 @@ Runs the same 4-turn incident-response script across four modes:
      - `status-page` (1 child < 2) auto-links `status-template` directly (no extra fork hop).
   2. `nested-min1` (`min_children_to_fork=1`):
      - Same tree, except `status-page` (1 child) also gains `fork` and must fork `status-template`.
-  3. `bundled` (`min_children_to_fork=999`):
+  3. `bundled` (`min_children_to_fork=None`):
      - `main` still sees 3 top-level skills, but `incident-triage` auto-links all 12 child skills (~18 KB + 13 tools).
   4. `flat` (all skills flattened to top-level on `main`):
      - Every child skill is exposed directly in `main`'s catalog.
@@ -470,7 +470,7 @@ async def run_mode(mode: str, *, provider_name: str, model: str | None, fake: bo
         tmp = Path(td)
         flat = mode == "flat"
         sdir = write_skills_dir(tmp / "skills", flat=flat)
-        min_children = {"nested-min2": 2, "nested-min1": 1, "bundled": 999, "flat": 2}[mode]
+        min_children = {"nested-min2": 2, "nested-min1": 1, "bundled": None, "flat": 2}[mode]
         store = Store(str(tmp / f"{mode}.db"))
         tools, state = make_tools()
         if model and not fake:

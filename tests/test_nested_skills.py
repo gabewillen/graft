@@ -217,6 +217,19 @@ def test_min_children_to_fork_two_vs_one_child(tmp_path):
     linked_s1, cf_s1 = agent1._host._resolve_branch_skills(["single"], focus=True)
     assert cf_s1 is True and linked_s1 == ["single", "fork", "merge"]
 
+    # Threshold = None -> never sub-fork; auto-link all descendants into parent branch
+    store_none = Store(str(tmp_path / "tnone.db"))
+    agent_none = GraftAgent(store_none, FakeProvider(lambda *a: _text("ok")), tools=tools,
+                            config=GraftConfig(skills=skills, seeder=None, min_children_to_fork=None))
+    linked_bundled, cf_bundled = agent_none._host._resolve_branch_skills(["multi"], focus=True)
+    assert cf_bundled is False and linked_bundled == ["multi", "m1", "m2", "merge"]
+
+    # Invalid thresholds (< 1) are rejected
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="min_children_to_fork"):
+            GraftAgent(Store(str(tmp_path / f"bad_{bad}.db")), FakeProvider(lambda *a: _text("ok")),
+                       tools=tools, config=GraftConfig(skills=skills, seeder=None, min_children_to_fork=bad))
+
 
 # ------------------------------------------------------------------ depth-2 current & detached
 def test_depth_2_current_parent_forks_current_child_wake_and_quiet(tmp_path):

@@ -66,7 +66,7 @@ class GraftConfig:
     before_fork: Callable[[ForkContext], Any] | None = None  # host policy hook to allow or refuse a fork
     skills: Sequence | None = None  # the skill catalog (default: graft.skills.CATALOG)
     skills_dir: str | Path | None = None  # explicit directory of SKILL.md files (loaded via load_skills)
-    min_children_to_fork: int = MIN_CHILDREN_TO_FORK  # minimum child skills for a branch to gain `fork`
+    min_children_to_fork: int | None = MIN_CHILDREN_TO_FORK  # min children to gain `fork` (None: auto-link all)
     ids: Callable[[], str] | None = None  # the source of context and task ids (default: uuid4)
     context_id: str | None = None
     name: str = "graft"

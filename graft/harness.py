@@ -527,14 +527,14 @@ class Host:
                  call_timeout: float | None = MODEL_CALL_TIMEOUT,
                  names: Callable[[], str] | None = None,
                  before_fork: Callable[[ForkContext], Any] | None = None,
-                 min_children_to_fork: int = MIN_CHILDREN_TO_FORK):
+                 min_children_to_fork: int | None = MIN_CHILDREN_TO_FORK):
         self.store = store
         # The source of the ids a fork call leaves out (seeded in tests).
         self.names = names or new_names()
         # Optional host policy hook called before a fork commits (returns None to allow, or refusal string(s)).
         self.before_fork = before_fork
-        if min_children_to_fork < 1:
-            raise ValueError(f"min_children_to_fork must be >= 1, got {min_children_to_fork!r}")
+        if min_children_to_fork is not None and min_children_to_fork < 1:
+            raise ValueError(f"min_children_to_fork must be >= 1 or None, got {min_children_to_fork!r}")
         self.min_children_to_fork = min_children_to_fork
         self.persona = persona  # user-provided; identical, verbatim, on every timeline
         self.provider = provider
@@ -1728,6 +1728,7 @@ class Host:
     def _resolve_branch_skills(self, requested: list[str], focus: bool) -> tuple[list[str], bool]:
         """Resolve full linked skills for a new branch and whether it gains `fork`.
 
+        - If `min_children_to_fork` is None: never grant `fork`; auto-link all descendants.
         - If held skills own >= `min_children_to_fork` child skills: link `fork` (children stay
           in the branch's child catalog and are forked on demand).
         - If held skills own 1 .. min_children_to_fork-1 child skills: auto-link those children
@@ -1741,7 +1742,7 @@ class Host:
             children = self.store.children_of(caps, exclude=seen | set(BUILTIN))
             if not children:
                 break
-            if len(children) >= self.min_children_to_fork:
+            if self.min_children_to_fork is not None and len(children) >= self.min_children_to_fork:
                 can_fork = True
                 break
             for c in children:
