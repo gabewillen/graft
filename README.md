@@ -1,10 +1,10 @@
 # graft
 
-graft is an experimental alternative to subagents for delegating work inside an LLM agent. Instead of starting a fresh subagent from a handoff prompt the parent writes, the agent **branches** itself: the branch starts from the messages of the parent's real conversation the parent points at (by pointer, like a git branch; or the rows a decisions client picks) and the parent's own branch call, with its words for the branch, the branch does its part for one turn, and when that turn ends the conversation it had is **joined** back into the parent's memory by pointer. No model call is needed for the join. All state lives in SQLite as append-only turns plus per-agent pointer lists.
+graft is an alternative to subagents for delegating work inside an LLM agent. Instead of starting a fresh subagent from a handoff prompt the parent writes, the agent **branches** itself: the branch starts from the messages of the parent's real conversation the parent points at (by pointer, like a git branch; or the rows a decisions client picks) and the parent's own branch call, with its words for the branch, the branch does its part for one turn, and when that turn ends the conversation it had is **joined** back into the parent's memory by pointer. No model call is needed for the join. All state lives in SQLite as append-only turns plus per-agent pointer lists.
 
 The design is written up in [spec.md](spec.md) ("Agent Grafts"). This repository is the smallest working version of it (v1, depth 1), plus the experiments used to compare it against a subagent baseline.
 
-**Status:** experimental, pre-1.0. The APIs, schema and CLI may change. See [Results so far](#results-so-far) for where graft wins (long-horizon heavy-tool sessions, tight context budgets, and vs. subagents) and where a plain shared context is still simpler and faster.
+**Status:** v0.1.0 (pre-1.0). The APIs, schema and CLI may still change before 1.0. See [Results so far](#results-so-far) for where graft wins (long-horizon heavy-tool sessions, tight context budgets, and vs. subagents) and where a plain shared context is still simpler and faster.
 
 ## How it differs from subagents
 
