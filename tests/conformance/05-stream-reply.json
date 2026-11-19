@@ -151,6 +151,14 @@
      ],
      "skills": [
       {
+       "id": "search",
+       "name": "search",
+       "description": "Shipped capability. Search committed conversation history and merged branch outputs with search(query). Grant to a branch only when it needs details not passed in messages.",
+       "tags": [
+        "search"
+       ]
+      },
+      {
        "id": "website",
        "name": "website",
        "description": "Build and edit a small website (pages with text content).",

@@ -14,7 +14,7 @@ def noop(args):
     return "ok"
 
 
-@pytest.mark.parametrize("name", ["", "has space", "x" * 129, "fork", "merge", "stop", 7])
+@pytest.mark.parametrize("name", ["", "has space", "x" * 129, "fork", "merge", "stop", "search", 7])
 def test_a_tool_name_that_is_not_mcp_or_is_grafts_own_is_refused(name):
     with pytest.raises(ValueError):
         Tool(name=name, input_schema=SCHEMA, fn=noop)
@@ -28,11 +28,11 @@ def test_the_input_schema_must_be_an_object_schema_and_fn_callable():
 
 
 def test_the_definition_is_mcps_tool_with_only_the_fields_given():
-    plain = Tool(name="search", input_schema=SCHEMA, fn=noop, description="Find.")
-    assert plain.definition() == {"name": "search", "description": "Find.", "inputSchema": SCHEMA}
-    full = Tool(name="search", input_schema=SCHEMA, fn=noop, title="Search", output_schema={"type": "object"},
+    plain = Tool(name="lookup", input_schema=SCHEMA, fn=noop, description="Find.")
+    assert plain.definition() == {"name": "lookup", "description": "Find.", "inputSchema": SCHEMA}
+    full = Tool(name="lookup", input_schema=SCHEMA, fn=noop, title="Lookup", output_schema={"type": "object"},
                 annotations={"readOnlyHint": True})
-    assert full.definition()["title"] == "Search"
+    assert full.definition()["title"] == "Lookup"
     assert full.definition()["outputSchema"] == {"type": "object"}
     assert full.definition()["annotations"] == {"readOnlyHint": True}
 

@@ -175,6 +175,38 @@ branch's.
 - If you could not do your part, say why in your final reply.
 """
 
+SEARCH_TOOL = {
+    "name": "search",
+    "description": "Full-text search over out-of-view committed messages and merged branches' tool "
+                   "outputs (never rows already visible in your current view, never still-running "
+                   "branches or withdrawn messages). Only call when you need a detail not visible above.",
+    "inputSchema": obj({"query": S, "limit": {"type": "integer"}}, ["query"]),
+}
+
+SEARCH_INSTRUCTIONS = """\
+You hold `search(query, limit?)`, which runs full-text search over out-of-view committed messages
+and merged branches' raw tool outputs (rows already in your current view, still-running branches,
+and withdrawn messages are excluded).
+- ONLY call `search` when you are missing a specific fact, identifier, quote, or tool output that
+  is NOT already visible in your messages above. Never call `search` to double-check things you can
+  already see.
+- Make one short query per fact (2-3 specific keywords like `ERR-8492` or `14.7 cpu_pct`), not one
+  long query combining unrelated topics.
+- On main: when a request needs a detail from an earlier merged branch's tool output that is NOT
+  visible in your messages above, either call `search` directly (if no other skill is needed) or
+  include `"search"` in that branch's `skills` (for example `skills=["website", "search"]`) so
+  the branch can search merged outputs without re-running expensive tools. Do not attach `search`
+  to branches when everything they need is already visible in `messages`.
+"""
+
+SEARCH_SKILL = Skill(
+    name="search",
+    description="Shipped capability. Search committed conversation history and merged branch outputs "
+                "with search(query). Grant to a branch only when it needs details not passed in messages.",
+    instructions=SEARCH_INSTRUCTIONS,
+    tools=[SEARCH_TOOL],
+)
+
 CATALOG: list[Skill] = [
     Skill(name="fork",
           description="Built-in. You stay on main. Fork current and detached branches to do catalog-skill work.",
@@ -198,6 +230,7 @@ CATALOG: list[Skill] = [
           instructions=BACKGROUND_INSTRUCTIONS, tools=[
         JOIN_TOOL,
     ]),
+    SEARCH_SKILL,
     Skill("website", "Build and edit a small website (pages with text content).",
           "Website skill: write pages with site_write(page, content) and read them with "
           "site_read(page). Ask for missing details before writing. Write in a casual, playful "
@@ -259,7 +292,10 @@ def install(store: Store, tools: dict[str, dict] | None = None, skills: list[Ski
     definitions as they are, and each tool a skill names by name taken from `tools` (name -> MCP
     tool definition, the host's). A skill that names a tool the host did not give is refused."""
     given = tools or {}
-    for skill in (CATALOG if skills is None else skills):
+    chosen = list(CATALOG if skills is None else skills)
+    if any(s.name == "fork" for s in chosen) and not any(s.name == "search" for s in chosen):
+        chosen.append(SEARCH_SKILL)
+    for skill in chosen:
         resolved = []
         for t in skill.tools:
             if isinstance(t, dict):

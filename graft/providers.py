@@ -339,7 +339,7 @@ class OpenAIProvider(UsageMixin):
             raise MissingKey("OPENAI_API_KEY is not set (provider=openai).")
         import openai
 
-        self.client = openai.OpenAI()
+        self.client = openai.OpenAI(max_retries=6)
         self.model = model or pick_openai_model(self.client)
         # Responses API by default: it allows function tools together with reasoning.
         self.api = os.environ.get("GRAFT_OPENAI_API", "responses")

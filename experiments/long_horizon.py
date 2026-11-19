@@ -55,8 +55,10 @@ NEEDLES = {
     "error_code": "ERR-8492",
     "dependency": "upstream-auth-v3",
     "latency": "1480ms",
+    "pod": "checkout-7d9f4c-x2k9",
     "region": "us-east-2",
     "error_rate": "14.7%",
+    "cpu_pct": "39.2",
     "commit": "9a4f2c1",
     "bad_timeout": "50",
     "good_timeout": "5000",
@@ -376,21 +378,24 @@ SCRIPT = [
     "Dump the IAM audit log with audit_dump, find the stale legacy API key last used in 2024, and rotate it using key_rotate.",
     "Read our current `status` page with site_read, then update `status` with site_write noting the us-east-2 checkout latency incident and rollback in progress.",
     "Check the team calendar with calendar_list and book a meeting with calendar_book on 2026-11-20 at 14:00 titled `Checkout Incident Postmortem`.",
-    "Draft an internal engineering postmortem email to `eng@company.internal` using email_draft summarizing ALL findings from this session: error code, failing dependency, affected region and error rate, regressed commit hash and timeout change, rollback command, escalation channel, rotated IAM key, and credited billing account.",
+    "Draft an internal engineering postmortem email to `eng@company.internal` using email_draft summarizing ALL findings from this session: error code, failing dependency, exact failing pod name, affected region, error rate, exact `cpu_pct` recorded during the spike, regressed commit hash and timeout change, rollback command, escalation channel, rotated IAM key, and credited billing account. Use your existing conversation/history rather than re-running diagnostics if possible.",
 ]
 
 
 class SharedAgent:
-    """Single shared context with ALL 12 skill instructions pre-loaded (zero load_skill penalty)."""
+    """Single shared context with ALL 12 skill instructions pre-loaded (zero load_skill penalty).
+    When `context_limit` is set, summarizes earlier turns before each call that exceeds the budget."""
 
     def __init__(self, store: Store, provider: Provider, tools: list[Tool], persona: str = BASE_SYSTEM,
-                 nonce: str | None = None, max_steps: int = 8):
+                 nonce: str | None = None, max_steps: int = 8, context_limit: int | None = None):
         self.store = store
         self.provider = provider
         self.tools_map = by_name(list(tools))
         self.persona = persona
         self.nonce = nonce
         self.max_steps = max_steps
+        self.context_limit = context_limit
+        self.compactions = 0
         self.messages: list[dict] = []
         self.caps = [s.name for s in OPS_SKILLS if s.name not in BUILTIN]
 
@@ -400,6 +405,38 @@ class SharedAgent:
     def tool_defs(self) -> list[dict]:
         return [t.definition() for t in self.tools_map.values()]
 
+    def _est_tokens(self) -> int:
+        return (len(self.system()) + sum(len(json.dumps(m)) for m in self.messages)) // 4
+
+    def _maybe_compact(self) -> None:
+        if not self.context_limit or self._est_tokens() <= self.context_limit:
+            return
+        # Find the start of the latest plain-text user turn so in-flight tool loops stay valid.
+        cut = None
+        for idx in range(len(self.messages) - 1, 0, -1):
+            m = self.messages[idx]
+            if m["role"] == "user" and all(b.get("type") == "text" for b in m["content"]):
+                cut = idx
+                break
+        if cut is None or cut <= 1:
+            return
+        prefix = self.messages[:cut]
+        compact_prompt = (
+            "Summarize the conversation so far into a concise briefing preserving key decisions, "
+            "findings, identifiers, and completed actions. Omit verbose raw logs/dumps."
+        )
+        req = prefix + [{"role": "user", "content": [{"type": "text", "text": compact_prompt}]}]
+        tagger = getattr(self.provider, "usage_tag", None)
+        with tagger("shared:compaction") if tagger else contextlib.nullcontext():
+            blocks = self.provider.complete("You summarize prior conversation state concisely.", req, [])
+        summary = "\n".join(b["text"] for b in blocks if b["type"] == "text").strip() or "(compacted)"
+        self.messages = [
+            {"role": "user", "content": [{"type": "text", "text": f"[Summary of earlier conversation]\n{summary}"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Understood, continuing from summary."}]},
+            *self.messages[cut:],
+        ]
+        self.compactions += 1
+
     async def send(self, request: dict):
         text = request["message"]["parts"][0]["text"]
         self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
@@ -407,6 +444,7 @@ class SharedAgent:
         tools = self.tool_defs()
         allowed = {t["name"] for t in tools}
         for _ in range(self.max_steps):
+            self._maybe_compact()
             tagger = getattr(self.provider, "usage_tag", None)
             with tagger("shared") if tagger else contextlib.nullcontext():
                 blocks = self.provider.complete(self.system(), prefix_nonce(self.messages, self.nonce), tools)
@@ -445,6 +483,8 @@ class SharedAgent:
 def _fake_policy(arm: str):
     """Deterministic offline policy to smoke-test both arms without API calls."""
     def policy(system: str, messages: list[dict], tools: list[dict]) -> list[dict]:
+        if not tools:
+            return _text("Summary: " + " ".join(NEEDLES.values()))
         names = {t["name"] for t in tools}
         last = _last_block(messages)
         texts = _user_texts(messages)
@@ -531,7 +571,9 @@ def score(state: dict) -> dict[str, bool]:
         "status_page_updated": bool(state["writes"]) and "us-east-2" in site_blob and "rollback" in site_blob,
         "postmortem_meeting_booked": cal_ok,
         "email_has_error_and_dep": NEEDLES["error_code"].lower() in email_blob and NEEDLES["dependency"].lower() in email_blob,
+        "email_has_buried_pod": NEEDLES["pod"].lower() in email_blob,
         "email_has_region_and_rate": NEEDLES["region"].lower() in email_blob and "14.7" in email_blob,
+        "email_has_buried_cpu_pct": NEEDLES["cpu_pct"] in email_blob,
         "email_has_commit_and_timeout": NEEDLES["commit"].lower() in email_blob and "50" in email_blob and "5000" in email_blob,
         "email_has_rollback_and_channel": "418" in email_blob and "sev1-platform" in email_blob,
         "email_has_key_and_account": NEEDLES["stale_key"].lower() in email_blob and NEEDLES["account"].lower() in email_blob,
@@ -548,7 +590,10 @@ def _est_cost(usage: dict) -> float:
     ) / 1_000_000
 
 
-async def run_arm(arm: str, *, fake: bool, trace: bool) -> dict:
+_DIAG_TOOLS = ("logs_fetch", "metrics_dump", "code_read", "docs_read", "invoice_export", "audit_dump")
+
+
+async def run_arm(arm: str, *, fake: bool, trace: bool, context_limit: int | None = None) -> dict:
     db_path = os.path.join(tempfile.mkdtemp(prefix=f"graft-lh-{arm}-"), f"{arm}.db")
     store = Store(db_path)
     tools, state = make_ops_tools()
@@ -559,14 +604,27 @@ async def run_arm(arm: str, *, fake: bool, trace: bool) -> dict:
     if arm == "graft":
         agent = GraftAgent(
             store, provider, tools=tools,
-            config=GraftConfig(nonce=nonce, seeder=None, skills=OPS_SKILLS, trace=print if trace else None),
+            config=GraftConfig(
+                nonce=nonce, seeder=None, skills=OPS_SKILLS,
+                compact_tokens=context_limit, compaction_mode="summary",
+                trace=print if trace else None,
+            ),
         )
         async with agent:
             await run_script(agent, SCRIPT, echo=trace)
+        compactions = store.con.execute("SELECT COUNT(*) FROM compactions").fetchone()[0]
+        searches = [
+            (r[0], json.loads(r[1])["input"])
+            for r in store.con.execute(
+                "SELECT owner_timeline, content FROM turns WHERE kind='tool_use' AND tool_name='search' ORDER BY row_id"
+            )
+        ]
     else:
         install(store, tools={t.name: t.definition() for t in tools}, skills=OPS_SKILLS)
-        agent = SharedAgent(store, provider, tools=tools, nonce=nonce)
+        agent = SharedAgent(store, provider, tools=tools, nonce=nonce, context_limit=context_limit)
         await run_script(agent, SCRIPT, echo=trace)
+        compactions = agent.compactions
+        searches = []
 
     elapsed = round(time.perf_counter() - t0, 2)
     usage = dict(getattr(provider, "usage", {}))
@@ -574,15 +632,22 @@ async def run_arm(arm: str, *, fake: bool, trace: bool) -> dict:
     peak_in = max((c.get("input", 0) for c in call_log), default=0)
     by_tag = {k: dict(v) for k, v in getattr(provider, "by_tag", {}).items()}
     checks = score(state)
+    diag_counts = {n: sum(1 for t, _ in state["log"] if t == n) for n in _DIAG_TOOLS}
+    refetches = sum(max(0, c - 1) for c in diag_counts.values())
     return {
         "arm": arm,
         "provider": f"{provider.name}:{provider.model}",
+        "context_limit": context_limit,
         "elapsed_s": elapsed,
         "usage": usage,
         "peak_input": peak_in,
         "by_tag": by_tag,
         "est_cost": _est_cost(usage),
         "raw_bytes": state["raw_bytes_returned"],
+        "compactions": compactions,
+        "searches": searches,
+        "refetches": refetches,
+        "diag_counts": diag_counts,
         "checks": checks,
         "passed": sum(checks.values()),
         "total": len(checks),
@@ -592,6 +657,8 @@ async def run_arm(arm: str, *, fake: bool, trace: bool) -> dict:
 def main() -> None:
     p = argparse.ArgumentParser(description="Long-horizon heavy-tool-output benchmark: graft vs shared")
     p.add_argument("--arm", choices=("graft", "shared", "all"), default="all")
+    p.add_argument("--context-limit", type=int, default=None,
+                   help="Artificial context token limit forcing summary compaction on both arms (e.g. 16000)")
     p.add_argument("--fake", action="store_true")
     p.add_argument("--trace", action="store_true")
     args = p.parse_args()
@@ -599,8 +666,12 @@ def main() -> None:
     arms = ("graft", "shared") if args.arm == "all" else (args.arm,)
 
     async def go():
-        results = [await run_arm(arm, fake=args.fake, trace=args.trace) for arm in arms]
-        print("\n================ LONG-HORIZON HEAVY-TOOL BENCHMARK ================")
+        results = [
+            await run_arm(arm, fake=args.fake, trace=args.trace, context_limit=args.context_limit)
+            for arm in arms
+        ]
+        lim = f" (context_limit={args.context_limit:,} tok)" if args.context_limit else ""
+        print(f"\n================ LONG-HORIZON HEAVY-TOOL BENCHMARK{lim} ================")
         for r in results:
             u = r["usage"]
             in_tok = u.get("input", 0)
@@ -612,13 +683,16 @@ def main() -> None:
             verdict = "PASS" if r["passed"] == r["total"] else f"FAIL ({r['passed']}/{r['total']})"
             print(
                 f"\n[{verdict}] arm={r['arm']} ({r['provider']})  {r['elapsed_s']}s  "
-                f"calls={u.get('calls', 0)}  raw_tool_bytes={r['raw_bytes']:,}"
+                f"calls={u.get('calls', 0)}  compactions={r['compactions']}  "
+                f"searches={len(r['searches'])}  refetches={r['refetches']}  raw_tool_bytes={r['raw_bytes']:,}"
             )
             print(
                 f"    input={in_tok:,} (uncached={uncached:,}, cache_write={cache_write:,}, "
                 f"cached={cached:,} [{pct:.1f}%])  peak_call_in={r['peak_input']:,}  "
                 f"out={out_tok:,}  est_cost=${r['est_cost']:.4f}"
             )
+            if r["searches"]:
+                print(f"    search_calls: {r['searches']}")
             for k, ok in r["checks"].items():
                 print(f"    [{'ok' if ok else 'MISS'}] {k}")
             if r["arm"] == "graft":

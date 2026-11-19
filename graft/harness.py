@@ -545,7 +545,8 @@ class Host:
     async def start(self, root: str = "o", context_id: str = "context", position: int = 0) -> None:
         """Make the original's timeline and start the machines (`context_id`: the host's context;
         `position`: the event log's last position)."""
-        self.store.create_timeline(tl=root, source=None, skills=["fork"])
+        skills = ["fork", "search"] if "search" in self.store.skill_names() else ["fork"]
+        self.store.create_timeline(tl=root, source=None, skills=skills)
         await self.machines.start_root(root, context_id=context_id, position=position)
 
     def report(self, kind: str, src: str | None, branches: list[str], error: BaseException, quiet: bool,
@@ -812,6 +813,28 @@ class Host:
             parts.append(skill_listing(store=self.store, names=catalog,
                                        heading="Skill catalog (the skills a branch of yours can hold):"))
         return "\n\n".join(p for p in parts if p)
+
+    def search(self, tl: str, raw_input: Any) -> tuple[str, bool]:
+        """Run the built-in `search(query, limit?)` tool over out-of-view committed FTS5 history."""
+        if not isinstance(raw_input, dict):
+            return "search input must be an object with a non-empty string 'query'", True
+        query = raw_input.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return "search requires a non-empty string 'query'", True
+        limit = raw_input.get("limit", 5)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return "search 'limit' must be a positive integer", True
+        visible = {r["row_id"] for r in self.store.working_view(tl)}
+        hits = self.store.search(query, limit=min(limit, 10), exclude_rows=visible)
+        if not hits:
+            return "No matching history found.", False
+        lines = []
+        for h in hits:
+            where = "main" if h["source_id"] is None else (h["branch_name"] or self.shown(h["owner_timeline"]))
+            what = f"tool:{h['tool_name']}" if h["kind"] == "tool_result" and h["tool_name"] else h["role"]
+            snip = " ".join(str(h["snippet"]).split())
+            lines.append(f"[#{h['row_id']}] ({where}, {what}): {snip}")
+        return "\n".join(lines), False
 
     def say(self, tl: str, text: str, background: bool, tasks: tuple[str, ...]) -> None:
         """Only the branch holding the conversation speaks to the user: its text goes to the
@@ -1101,6 +1124,10 @@ class Host:
                 elif u["name"] not in allowed:
                     absent = NotRun(f"tool '{u['name']}' is not available to you")
                     self._store_results(tl=tl, results=[ToolResult(use=u, content=absent, is_error=True)])
+                elif u["name"] == "search":
+                    content, err = self.search(tl, u.get("input"))
+                    self.trace(f"[{tl}] search({u.get('input')!r}) -> {'error' if err else f'{len(content)} chars'}")
+                    await self._store_ran(tl=tl, result=ToolResult(use=u, content=Ran(content), is_error=err))
                 else:  # the activity of the machine's `calling` state; it also writes the result row
                     await self.machines.ask(tl=tl, name="tool_request", build=lambda reply, u=u: ToolCall(
                         use=u, reply=reply, interrupted=CANCELLED_WHILE_RUNNING, cancelled=CANCELLED_BY_THE_TOOL,

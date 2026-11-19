@@ -17,10 +17,40 @@ only mapping from rows to messages; there is no other normalization at render ti
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
+
+_FTS_SIMPLE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _fts_text(kind: str, content: str) -> str | None:
+    """Extract clean searchable text from a stored turn row (None for non-searchable kinds)."""
+    if kind == "text":
+        return content or None
+    if kind == "tool_result":
+        try:
+            data = json.loads(content)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(data, dict):
+            if data.get("not_run"):
+                return None
+            txt = str(data.get("content", ""))
+            return txt or None
+    return None
+
+
+def _fts_query(raw: str, *, use_or: bool = False) -> str:
+    """Build a safe FTS5 MATCH expression so identifiers with hyphens, hashes, dots, or colons
+    (e.g. 'ERR-8492', 'us-east-2', '#sev1-platform') never trigger FTS5 syntax errors."""
+    tokens = [t for t in raw.strip().split() if t]
+    if not tokens:
+        return ""
+    quoted = [t if _FTS_SIMPLE.match(t) else '"' + t.replace('"', '""') + '"' for t in tokens]
+    return (" OR " if use_or else " ").join(quoted)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS skills(
@@ -103,6 +133,11 @@ CREATE TRIGGER IF NOT EXISTS context_no_update BEFORE UPDATE ON context
   BEGIN SELECT RAISE(ABORT, 'context is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS context_no_delete BEFORE DELETE ON context
   BEGIN SELECT RAISE(ABORT, 'context is append-only'); END;
+
+-- Full-text search index over committed history (main's text rows + merged branches' text and
+-- tool_result rows, minus withdrawn and harness rows). Maintained transactionally with turns,
+-- commit_join, and mark_withdrawn.
+CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(content, tokenize='porter unicode61');
 """
 
 TURN_COLS = "row_id, owner_timeline, role, kind, tool_name, content, tokens, ts, harness"
@@ -244,11 +279,17 @@ class Store:
     def insert_turn(self, owner: str, role: str, kind: str, content: Any,
                     tool_name: str | None = None, harness: bool = False) -> int:
         text = content if isinstance(content, str) else json.dumps(content)
-        return self.con.execute(
+        rid = self.con.execute(
             "INSERT INTO turns(owner_timeline, role, kind, tool_name, content, tokens, ts, harness) "
             "VALUES (?,?,?,?,?,?,?,?)",
             (owner, role, kind, tool_name, text, max(1, len(text) // 4), time.time(), int(harness)),
         ).lastrowid
+        # Index committed root text rows immediately (branches are indexed atomically on commit_join).
+        if not harness and kind == "text" and text:
+            tl = self.con.execute("SELECT source_id FROM timelines WHERE timeline_id=?", (owner,)).fetchone()
+            if tl is not None and tl[0] is None:
+                self.con.execute("INSERT OR REPLACE INTO turns_fts(rowid, content) VALUES (?, ?)", (rid, text))
+        return rid
 
     def append(self, tl: str, row_id: int) -> int | None:
         """Append a pointer. Rows already pointed to are skipped (dedup by row_id)."""
@@ -348,6 +389,8 @@ class Store:
         try:
             self.con.executemany("INSERT OR IGNORE INTO withdrawals VALUES (?,?,?)",
                                  [(tl, r, time.time()) for tl in timelines for r in rows])
+            if rows:
+                self.con.executemany("DELETE FROM turns_fts WHERE rowid=?", [(r,) for r in rows])
             self.con.execute("COMMIT")
         except Exception:
             self.con.execute("ROLLBACK")
@@ -481,11 +524,71 @@ class Store:
             if trigger is not None:
                 self.append(tl=source, row_id=trigger)
             self.end_tx(tx, status=status, committed_sql=committed_sql, scratch=scratch)
+            # Index the merged branch's non-harness, non-withdrawn text and tool_result rows
+            # atomically with the join commit (never unmerged running branches, never search echoes).
+            if status == "committed":
+                for r in self.con.execute(
+                    "SELECT row_id, kind, content FROM turns "
+                    "WHERE owner_timeline=? AND harness=0 AND kind IN ('text', 'tool_result') "
+                    "AND (tool_name IS NULL OR tool_name != 'search') "
+                    "AND NOT EXISTS (SELECT 1 FROM withdrawals w WHERE w.row_id = turns.row_id)",
+                    (child,),
+                ):
+                    txt = _fts_text(r["kind"], r["content"])
+                    if txt:
+                        self.con.execute("INSERT OR REPLACE INTO turns_fts(rowid, content) VALUES (?, ?)",
+                                         (r["row_id"], txt))
             self.con.execute("COMMIT")
             return rec
         except Exception:
             self.con.execute("ROLLBACK")
             raise
+
+    def search(self, query: str, *, limit: int = 5, exclude_rows: Iterable[int] = ()) -> list[dict]:
+        """Full-text search (SQLite FTS5) over committed history: main's text rows plus merged
+        branches' text and tool_result rows, minus withdrawn, harness, and `exclude_rows`
+        (the caller's already-visible working view). Never returns unmerged/running branches."""
+        q = _fts_query(query, use_or=False)
+        if not q:
+            return []
+        limit = max(1, min(int(limit), 10))
+        excluded = sorted({int(r) for r in exclude_rows})
+        excl_sql = f" AND t.row_id NOT IN ({','.join('?' * len(excluded))})" if excluded else ""
+        sql = (
+            "SELECT t.row_id, t.owner_timeline, tl.source_id, tl.name AS branch_name, "
+            "       t.role, t.kind, t.tool_name, "
+            "       snippet(turns_fts, 0, '', '', '...', 64) AS snippet, "
+            "       bm25(turns_fts) AS rank "
+            "FROM turns_fts "
+            "JOIN turns t ON t.row_id = turns_fts.rowid "
+            "JOIN timelines tl ON tl.timeline_id = t.owner_timeline "
+            "WHERE turns_fts MATCH ? "
+            "  AND t.harness = 0 "
+            "  AND t.kind IN ('text', 'tool_result') "
+            "  AND (t.tool_name IS NULL OR t.tool_name != 'search') "
+            "  AND (tl.source_id IS NULL OR tl.status = 'joined' "
+            "       OR EXISTS(SELECT 1 FROM transactions tx WHERE tx.kind = 'join' "
+            "                 AND tx.target = tl.timeline_id AND tx.status = 'committed')) "
+            "  AND NOT EXISTS(SELECT 1 FROM withdrawals w WHERE w.row_id = t.row_id)"
+            f"{excl_sql} "
+            "ORDER BY rank, t.row_id DESC "
+            "LIMIT ?"
+        )
+
+        def run(expr: str) -> list[dict]:
+            return [dict(r) for r in self.con.execute(sql, (expr, *excluded, limit))]
+
+        try:
+            hits = run(q)
+        except sqlite3.OperationalError:
+            hits = []
+        if not hits and len(query.strip().split()) > 1:
+            q_or = _fts_query(query, use_or=True)
+            try:
+                hits = run(q_or)
+            except sqlite3.OperationalError:
+                hits = []
+        return hits
 
     def dump(self) -> str:
         out = []

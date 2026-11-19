@@ -129,7 +129,7 @@ def test_the_built_in_skills_and_tools_say_branch_and_merge():
     assert {"fork", "merge", "detached"} <= names and not {"branch", "join"} & names
     assert set(BUILTIN) == {"fork", "merge", "detached"}
     tools = {t["name"] for s in CATALOG for t in s.tools if isinstance(t, dict)}
-    assert {"fork", "merge", "stop"} <= tools and not {"branch", "join", "load_skill"} & tools
+    assert {"fork", "merge", "stop", "search"} <= tools and not {"branch", "join", "load_skill"} & tools
     branch_tool = next(t for s in CATALOG for t in s.tools if isinstance(t, dict) and t["name"] == "fork")
     assert set(branch_tool["inputSchema"]["properties"]) == {"current", "detached"}
     merge_tool = next(t for s in CATALOG for t in s.tools if isinstance(t, dict) and t["name"] == "merge")
@@ -396,7 +396,7 @@ from graft import compaction as compaction_mod, db as db_mod, harness as harness
 PRODUCERS = {
     harness_mod: ["merge_result", "SKIPPED_NOTE", "MERGED", "check_skill_link", "branch_entries", "_strings", "_messages", "cancel_ids",
                   "fork_result", "Host.resolve_messages", "Host.message_index", "ENTRY_SHAPE",
-                  "Host.cancel_text", "Host.system", "Host._names", "Host._running_note",
+                  "Host.cancel_text", "Host.system", "Host.search", "Host._names", "Host._running_note",
                   "Host.merge_call", "Host.fit_join", "Host.default_join",
                   "Host.task_of", "Host._stop_call", "_entry", "NOT_A_DRAWN_ID", "NO_FREE_ID", "Host.prepare_branch", "Host.refuse_branch",
                   "Host._prepare_branch", "Host._loop", "Host._missing_results",
@@ -409,8 +409,8 @@ PRODUCERS = {
     compaction_mod: ["COMPACT_TOOL", "EXTRACT_INSTRUCTION", "WITHDRAWN_INDEX", "index_text", "extract_request",
                      "SUMMARY_HEADER", "COMPACT_INSTRUCTION", "summary_turn"],
     seeder_mod: ["NOUL_TRUE", "NOUL_FALSE", "reduced_state", "reduced_question", "jev_request"],
-    skills_mod: ["LOAD_SKILL_TOOL", "JOIN_TOOL", "CANCEL_TOOL", "MESSAGES", "REASON", "BRANCH_INSTRUCTIONS", "JOIN_INSTRUCTIONS",
-                 "BACKGROUND_INSTRUCTIONS", "load_skill", "skill_listing", "skill_instructions"],
+    skills_mod: ["LOAD_SKILL_TOOL", "JOIN_TOOL", "CANCEL_TOOL", "SEARCH_TOOL", "MESSAGES", "REASON", "BRANCH_INSTRUCTIONS", "JOIN_INSTRUCTIONS",
+                 "BACKGROUND_INSTRUCTIONS", "SEARCH_INSTRUCTIONS", "load_skill", "skill_listing", "skill_instructions"],
 }
 # graft's own identifiers (store and transaction kinds, a graft's kind, its reason, the keys of the
 # harness's logs) and its audit records: compared and stored, never shown to a model.
