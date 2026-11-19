@@ -502,6 +502,7 @@ class SessionSM(hsm.Instance):
         self.context_id = context_id
         self.tasks: dict[str, "TaskRecord"] = {}  # open tasks
         self.ended: dict[str, str] = {}  # terminal tasks -> their state
+        self.answered_ended: set[int] = set()  # requests answered in a task that is now terminal
         self.req_task: dict[int, str] = {}  # request id -> its task
         self.graft_tasks: dict[str, tuple[str, ...]] = {}  # a background graft -> its tasks, until its join reaches the original
         self.grafts: set[str] = set()  # background grafts whose joins have not reached the original
@@ -4364,6 +4365,7 @@ class _Draft:
         self.tasks = {t: TaskRecord(state=r.state, requests=dict(r.requests), failed=r.failed, reply=r.reply)
                       for t, r in inst.tasks.items()}
         self.ended = dict(inst.ended)
+        self.answered_ended = set(inst.answered_ended)
         self.req_task = dict(inst.req_task)
         self.graft_tasks = dict(inst.graft_tasks)
         self.grafts, self.held = set(inst.grafts), set(inst.held)
@@ -4381,6 +4383,7 @@ class _Draft:
     def commit(self) -> None:
         inst = self.inst
         inst.tasks, inst.ended, inst.req_task, inst.graft_tasks = self.tasks, self.ended, self.req_task, self.graft_tasks
+        inst.answered_ended = self.answered_ended
         inst.grafts, inst.held = self.grafts, self.held
         inst.pending, inst.next_seq, inst.outbox, inst.after_write = self.pending, self.next_seq, self.outbox, self.after_write
         inst.waits = [(c, r) for c, r in self.waits if not r.done()]
@@ -4435,6 +4438,7 @@ class _Draft:
         message = rec.reply if reason is None else _message(self.inst, self.next_seq, task, reason, error=True)
         seq = self.emit(_status(self.inst, task, state, message))
         self.ended[task] = state
+        self.answered_ended |= {rid for rid, where in rec.requests.items() if where == "answered"}
         root = self.inst.root
         for rid, where in sorted(rec.requests.items()):
             if where != "queued":
@@ -4445,8 +4449,8 @@ class _Draft:
     def answer(self, rid: int, error: str | None) -> None:
         task = self.req_task.get(rid)
         rec = self.tasks.get(task) if task is not None else None
-        if rec is None:  # its task is terminal (or it has none): an error is still told, as a harness error
-            if error is not None:
+        if rec is None:  # its task is terminal (or it has none): an error is still told, as a harness error,
+            if error is not None and rid not in self.answered_ended:  # unless its task was told it already
                 self.tell(f"(harness error: {error})")
             return
         if rec.requests.get(rid) == "answered":
