@@ -47,7 +47,21 @@ The optional `jev` extra installs the TypeSafe SDK used by the Jev seeder: `uv a
 
 ## Quickstart
 
-The CLI has two commands:
+### Coding Agent (Toad TUI / ACP & Terminal REPL)
+
+graft ships a workspace-confined coding agent (`explore`, `code`, `shell`, plus `search`) with both an **ACP (Agent Client Protocol)** stdio server (for [Toad](https://github.com/batrachianai/toad), Zed, etc.) and a built-in terminal REPL:
+
+```bash
+# Run inside Toad (Textual TUI — collapsible branch/tool cards, syntax-highlighted diffs, Esc cancel):
+uvx --from batrachian-toad toad acp "uv run graft acp" --project-dir /path/to/repo --title "Graft"
+
+# Or run directly in the terminal:
+uv run graft code /path/to/repo
+```
+
+Both support `--provider`, `--model`, `--db`, `--skills-dir` (extra `SKILL.md` skills), and `--min-branch-skills` (default `2`, or `none` to auto-link child skills into their parent branch), plus slash commands `/branches`, `/usage`, `/search <query>`, and `/dump`.
+
+### Demo Chat & Store Dump
 
 ```bash
 export OPENAI_API_KEY=...            # or ANTHROPIC_API_KEY
@@ -123,8 +137,9 @@ Everything is read from environment variables at runtime. Keys are never read fr
 - `graft/compaction.py`: turn-based compaction with window provenance, and summary compaction.
 - `graft/subagent.py`: the subagent baseline (parent writes a handoff, subagent returns a summary).
 - `graft/providers.py`: OpenAI and Anthropic adapters with per-call cache accounting, context window defaults, and a scripted `FakeProvider`.
-- `graft/skills.py`, `graft/sim.py`, `graft/fake.py`: built-in skills (`fork`, `merge`, `detached`), shipped `search` skill, simulated demo skills/`FakeTools`, a scripted user, and deterministic offline policies.
-- `graft/cli.py`: the `graft` command.
+- `graft/skills.py`, `graft/sim.py`, `graft/fake.py`: built-in skills (`fork`, `merge`, `detached`), shipped `search` skill, explicit-path `SKILL.md` loader (`load_skills`), simulated demo skills/`FakeTools`, a scripted user, and deterministic offline policies.
+- `graft/coding.py`, `graft/acp.py`: workspace-confined coding tools (`Read`, `Grep`, `Glob`, `GitRead`, `Edit`, `Write`, `Bash`) & skills (`explore`, `code`, `shell`), plus the stdio ACP v1 server (`graft acp`).
+- `graft/cli.py`: the `graft` command (`acp`, `code`, `chat`, `dump`).
 - `experiments/`: benchmarks and evaluations (not part of the installed package).
 
 ## Experiments

@@ -23,4 +23,5 @@ runs/
 
 # local tool state
 .claude/
+.graft/
 .DS_Store
