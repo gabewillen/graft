@@ -50,7 +50,6 @@ class QueuedJoin(NamedTuple):
     reason: str
     trigger: int | None
     closing: dict[str, tuple[str, bool]] | None = None
-    silent: bool = False  # True when a focus branch replied directly to the user (no explicit merge())
 
 
 class Mode(NamedTuple):
@@ -200,10 +199,8 @@ class JoinState:
     hold: bool = False
     attempts: dict[str, int] = field(default_factory=dict)
     news: list[tuple[str, str]] = field(default_factory=list)
-    needs_wake: bool = False  # source: whether any join in this drain requires waking main
     ends_on_request: bool = False
     join_reason: str = "done"  # focus graft: decided on entry of handing_back
-    silent: bool = False  # focus graft: replied directly to user with no explicit merge()
     reason: str = ""  # background graft: join reason while recording
     close_first: bool = False  # background graft: close open calls before recording join
     forced: asyncio.Future | None = None

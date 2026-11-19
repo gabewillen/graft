@@ -527,7 +527,7 @@ def test_a_focus_graft_whose_tool_is_cancelled_by_its_host_goes_on(tmp_path):
 
     async def go():
         await chat_of(h).start()
-        assert await asyncio.wait_for(chat_of(h).say(REQUEST), WAIT_TIMEOUT) == ["done"]  # focus replied, nothing else running: no wake
+        assert await asyncio.wait_for(chat_of(h).say(REQUEST), WAIT_TIMEOUT) == ["done", "Back."]  # main runs once after the merge
         await h.close()
 
     asyncio.run(go())

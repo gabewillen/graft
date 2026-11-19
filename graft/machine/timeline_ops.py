@@ -508,8 +508,8 @@ def inbox_after(ctx, inst: Timeline, event) -> bool:
 
 
 def quiet_after(ctx, inst: Timeline, event) -> bool:
-    return (_after_open(inst) and not _inbox_live(inst) and not inst.joins.ends_on_request
-            and (not inst.joins.news or not inst.joins.needs_wake or inst.closing or _run_withdrawn(inst)))
+    return (_after_open(inst) and not _inbox_live(inst)
+            and (not inst.joins.news or inst.closing or _run_withdrawn(inst)))
 
 
 def answers_handback(ctx, inst: Timeline, event) -> bool:
@@ -1208,7 +1208,6 @@ def focus_back(ctx, inst: Timeline, event) -> None:
 def start_joining(ctx, inst: Timeline, event) -> None:
     inst.joins.hold = False
     inst.joins.news = []
-    inst.joins.needs_wake = False
     inst.joins.ends_on_request = False
     inst.req.woken_for = []
 
@@ -1222,8 +1221,6 @@ def applied(ctx, inst: Timeline, event) -> None:
     news = not any(_withdrawn(inst, r) for r in made_for)
     if news:
         inst.joins.news.append((join.child, join.reason))
-        if not join.silent or bool(inst.grafts.live):
-            inst.joins.needs_wake = True
         inst.req.woken_for += [r for r in made_for if all(r is not w for w in inst.req.woken_for)]
     inst.joins.ends_on_request = ends
     _forward(inst.machines.timelines.get(join.child), "join_commit" if committed_ else "join_rollback")
@@ -1265,7 +1262,6 @@ def decide_join_reason(ctx, inst: Timeline, event) -> None:
     outcome = event.data if isinstance(event.data, RunOutcome) else None
     reason = "done" if outcome is not None and outcome.kind in ("join", "replied", "empty") else "failed"
     inst.joins.join_reason = CANCELLED if _focus_withdrawn(inst) else reason
-    inst.joins.silent = (not _focus_withdrawn(inst)) and outcome is not None and outcome.kind == "replied"
 
 
 def _hand_back(inst: Timeline, event: hsm.Event | None) -> None:
@@ -1280,9 +1276,6 @@ def _hand_back(inst: Timeline, event: hsm.Event | None) -> None:
     join = join or QueuedJoin(child=inst.timeline_id, reason="failed", trigger=None)
     if inst.joins.unclosed is not None:
         join = join._replace(closing=inst.joins.unclosed)
-    if inst.joins.silent and join.reason == "done" and join.trigger is None:
-        join = join._replace(silent=True)
-    inst.joins.silent = False
     users = [w for w in inst.req.waiters if w.user] + also
     others = [w for w in inst.req.waiters if not w.user]
     payload = (join, users, list(inst.req.inbox), inst.req.answering,

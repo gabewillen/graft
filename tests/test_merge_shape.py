@@ -79,12 +79,12 @@ def run(*, h, says):
 SITE = {"id": "site", "skills": ["website"], "messages": [1], "reason": "Build the website."}
 
 
-def test_a_current_branch_that_replies_merges_quietly_when_nothing_else_runs(tmp_path):
+def test_a_current_branch_that_replies_merges_at_the_end_of_its_turn_and_main_runs_once(tmp_path):
     script = Script(entry=SITE, branch=lambda m: text("What pages should the site have?"))
     store, h, said = make(tmp_path=tmp_path, policy=script)
     out = run(h=h, says=[REQUEST])
-    assert out == [["What pages should the site have?"]]
-    assert len(script.main_after_merge) == 0  # current branch replied with nothing else running: no wasted wake
+    assert out == [["What pages should the site have?"]]  # main's run after the merge said nothing
+    assert len(script.main_after_merge) == 1  # main always runs once after a merge
     # the branch's timeline ends on the harness's argument-less merge call and its result
     tail = [(r["role"], r["kind"], r["tool_name"], r["harness"]) for r in store.view("c1")][-3:]
     assert tail == [("assistant", "text", None, 0), ("assistant", "tool_use", "merge", 1),
@@ -103,6 +103,33 @@ def test_a_current_branch_that_replies_merges_quietly_when_nothing_else_runs(tmp
     assert not [r for r in store.view("o") if r["harness"] and r["kind"] == "text"]
     assert store.timeline("c1")["join_reason"] == "done" and holder(store) == "o"
     assert validate(store.view("o"), "o") == []
+    # main's run after the merge sees the merge call as an assistant message
+    last_two = script.main_after_merge[0][-2:]
+    assert last_two[0]["role"] == "assistant" and last_two[0]["content"][-1]["name"] == "merge"
+
+
+def test_a_current_branch_plain_reply_wakes_main_to_fork_a_second_stage(tmp_path):
+    """Sequential two-stage workflow (e.g. diagnose -> practice): stage 1 ends in a plain reply
+    with nothing else running, merges, and main wakes immediately to fork stage 2."""
+    def policy(system, messages, tools):
+        names = {t["name"] for t in tools}
+        last = messages[-1]["content"][-1]
+        if "fork" in names:
+            if last["type"] == "text" and not last.get("harness") and last["text"].endswith(REQUEST):
+                return [fork_use(current={"id": "stage1", "skills": ["website"], "messages": [1],
+                                          "reason": "Stage 1."})]
+            if last["type"] == "tool_result" and last["content"].startswith("stage1 merged."):
+                return [fork_use(use_id="f2", current={"id": "stage2", "skills": ["slides"], "messages": [1],
+                                                       "reason": "Stage 2 after stage 1."})]
+            return []
+        if "site_write" in names:
+            return text("Stage 1 diagnosis reply.")
+        return text("Stage 2 practice reply.")
+
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
+    out = run(h=h, says=[REQUEST])
+    assert out == [["Stage 1 diagnosis reply.", "Stage 2 practice reply."]]
+    assert [w["joined"] for w in h.wakes] == [[("c1", "done")], [("c2", "done")]]
 
 
 def test_the_next_message_goes_to_main_never_to_the_merged_branch(tmp_path):
@@ -116,11 +143,9 @@ def test_the_next_message_goes_to_main_never_to_the_merged_branch(tmp_path):
     store, h, said = make(tmp_path=tmp_path, policy=script)
     run(h=h, says=[REQUEST, "Home and contact."])
     assert len(seen) == 1  # the branch ran one turn
-    # main skipped the silent wake, then ran on the next message (seeing the merge call + new user message)
-    assert len(script.main_after_merge) == 1
-    assert script.main_after_merge[0][-2]["role"] == "assistant"
-    assert script.main_after_merge[0][-2]["content"][-1]["name"] == "merge"
-    assert script.main_after_merge[0][-1]["content"][-1]["text"].endswith("Home and contact.")
+    # main ran after the merge, then on the next message, which is its own row
+    assert len(script.main_after_merge) == 2
+    assert script.main_after_merge[1][-1]["content"][-1]["text"].endswith("Home and contact.")
     owners = [r["owner_timeline"] for r in store.view("o") if r["content"] == "Home and contact."]
     assert owners == ["o"] and store.timeline("c1")["status"] == "joined"
 

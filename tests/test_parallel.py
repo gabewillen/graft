@@ -459,7 +459,7 @@ def test_parallel_experiment_runs_offline(capsys, tmp_path):
     seq, par = asyncio.run(go())
     assert parallel.report([seq, par], live=False, latency=0.0)
     assert all(seq["checks"].values()) and all(par["checks"].values())
-    assert (seq["focus"], seq["background"], seq["branch_calls"], seq["wakes"]) == (3, 0, 3, 0)  # focus replied cleanly: no wasted wake
+    assert (seq["focus"], seq["background"], seq["branch_calls"], seq["wakes"]) == (3, 0, 3, 3)  # a run after each merge
     assert (par["focus"], par["background"], par["branch_calls"]) == (0, 3, 1) and par["wakes"] >= 1
     assert [(s, j) for _, s, j in par["branches"]] == [("joined", "done")] * 3
     assert par["replies"][0].startswith("I have started") and len(par["replies"]) == 1 + par["wakes"]

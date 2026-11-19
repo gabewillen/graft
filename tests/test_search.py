@@ -18,7 +18,7 @@ import threading
 
 from _util import chat_of, conversation, install_fake
 from graft.db import Graft, Store
-from graft.fake import _last_block, _row_ids, _text, _use, _user_texts
+from graft.fake import _last_block, _row_ids, _text, _use, _user_texts, woken
 from graft.sim import run_script
 
 
@@ -191,6 +191,8 @@ def test_search_excludes_rows_already_in_callers_working_view(tmp_path):
         last = _last_block(messages)
         texts = _user_texts(messages)
         if "fork" in names:
+            if woken(messages):
+                return []
             cur = texts[-1] if texts else ""
             if "Fetch logs" in cur:
                 return _use(tool="fork", current={"skills": ["website"], "messages": _row_ids(messages)[-1:],
@@ -240,6 +242,8 @@ def test_branch_granted_history_can_search_merged_history(tmp_path):
         last = _last_block(messages)
         texts = _user_texts(messages)
         if "fork" in names:
+            if woken(messages):
+                return []
             cur = texts[-1] if texts else ""
             if "Remember" in cur:
                 return _text("Remembered.")
