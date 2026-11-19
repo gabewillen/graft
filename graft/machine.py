@@ -2826,10 +2826,12 @@ def applied(ctx, inst, event) -> None:
     join = inst.queue.pop(HEAD)
     inst.grafts.pop(join.child, None)
     inst.stopping.discard(join.child)
-    news = not _unwanted(inst=inst, child=join.child)  # every merge wakes it, but a graft's made for a withdrawn request
+    # the graft leaves the record of what it owes with its join (a read below that raises then
+    # loses only its wake, never leaves its tasks owed)
+    made_for = inst.graft_requests.pop(join.child, ())
+    news = not any(_withdrawn(inst=inst, request=r) for r in made_for)  # a graft's made for a withdrawn request wakes nothing
     inst.news += [(join.child, join.reason)] if news else []
     # the wake its news sets off is for the request the graft was made for, if any
-    made_for = inst.graft_requests.pop(join.child, ())
     inst.woken_for += [r for r in made_for if news and all(r is not w for w in inst.woken_for)]
     inst.ends_on_request = ends
     _forward(target=inst.machines.timelines.get(join.child), name="join_commit" if committed_ else "join_rollback")
