@@ -282,7 +282,9 @@ def test_window_defaults_per_model(tmp_path, monkeypatch):
     assert context_window("claude-sonnet-5-5") == 1_000_000
     assert context_window("anthropic.claude-opus-5-5") == 1_000_000
     assert context_window("claude-haiku-4-5") == 200_000 and context_window("claude-haiku-5-5") == 1_000_000
-    assert context_window("gpt-5-mini") is None and context_window(None) is None
+    assert context_window("gpt-6-luna") == 400_000 and context_window("openai.gpt-5-mini") == 400_000
+    assert context_window("gpt-4.1-mini") == 1_000_000 and context_window("gpt-4o-mini") == 128_000
+    assert context_window("unknown-model") is None and context_window(None) is None
     monkeypatch.delenv("GRAFT_WINDOW_TOKENS", raising=False)
     fp = FakeProvider(_no_compact_policy)
     assert window_tokens_for(fp) is None  # unknown model: off

@@ -50,6 +50,22 @@ def test_anthropic_request_enables_caching_and_reads_cache_usage():
     assert p.call_log[0]["tag"] == "original"
 
 
+def test_anthropic_wire_messages_prepends_user_turn_for_assistant_first_views():
+    user_first = AnthropicProvider.wire_messages(MSGS)
+    assert len(user_first) == 1 and user_first[0]["role"] == "user"
+    asst_first = [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "b1", "name": "fork",
+                                           "input": {"current": {"skills": ["website"], "messages": [], "reason": "go"}}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b1", "content": "ok"}]},
+    ]
+    wired = AnthropicProvider.wire_messages(asst_first)
+    assert [m["role"] for m in wired] == ["user", "assistant", "user"]
+    assert wired[0] == {"role": "user", "content": [{"type": "text", "text": "."}]}
+    assert wired[1]["content"][0]["type"] == "tool_use"
+    assert wired[2]["content"][0]["type"] == "tool_result"
+    assert len(asst_first) == 2  # input list untouched
+
+
 def _openai(api: str, resp) -> tuple[OpenAIProvider, Recorder]:
     p = object.__new__(OpenAIProvider)
     p.model, p.api, p.effort, p.use_cache_key = "gpt-6-luna", api, "low", True

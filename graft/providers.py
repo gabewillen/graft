@@ -23,19 +23,21 @@ ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-5-5"
 # Preference order for OpenAI; the first id that the Models API lists wins.
 OPENAI_PREFERENCE = ("gpt-6-luna", "gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini")
 
-# Context windows (input tokens) by model id prefix, longest prefix wins. Source: the Claude
-# API model table (2026-11). Models not listed have no known window: joins are not size-checked.
+# Context windows (input tokens) by model id prefix, longest prefix wins.
+# Models not listed have no known window: joins are not size-checked unless GRAFT_WINDOW_TOKENS is set.
 CONTEXT_WINDOWS = {
     "claude-fable-5": 1_000_000, "claude-mythos-5": 1_000_000,
     "claude-opus-5": 1_000_000, "claude-opus-4-8": 1_000_000, "claude-opus-4-7": 1_000_000,
     "claude-opus-4-6": 1_000_000, "claude-sonnet-5": 1_000_000, "claude-sonnet-4-6": 1_000_000,
     "claude-haiku-5": 1_000_000, "claude-haiku-4-5": 200_000,
+    "gpt-6": 400_000, "gpt-5": 400_000, "gpt-4.1": 1_000_000, "gpt-4o": 128_000,
+    "o3": 200_000, "o4-mini": 200_000,
 }
 
 
 def context_window(model: str | None) -> int | None:
-    """Known context window for a model id (Bedrock 'anthropic.' prefix allowed), else None."""
-    mid = (model or "").removeprefix("anthropic.")
+    """Known context window for a model id (provider prefixes like 'anthropic.'/'openai.' allowed), else None."""
+    mid = (model or "").removeprefix("anthropic.").removeprefix("openai.")
     hits = [k for k in CONTEXT_WINDOWS if mid.startswith(k)]
     return CONTEXT_WINDOWS[max(hits, key=len)] if hits else None
 
@@ -252,6 +254,11 @@ class AnthropicProvider(UsageMixin):
                         blocks.append({"type": "thinking", "thinking": b["thinking"],
                                        "signature": b["signature"]})
             out.append({"role": m["role"], "content": blocks})
+        # Anthropic's Messages API requires the first message to be a user turn; a branch started
+        # with messages=[] + reason renders assistant-first (its parent's fork call), so prepend a
+        # minimal wire-only user turn without touching stored rows.
+        if out and out[0]["role"] != "user":
+            out.insert(0, {"role": "user", "content": [{"type": "text", "text": "."}]})
         return out
 
     @staticmethod
