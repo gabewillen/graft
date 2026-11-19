@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import threading
+import types
 from typing import Callable, Iterator, Protocol
 
 ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-5-5"
@@ -32,6 +33,8 @@ CONTEXT_WINDOWS = {
     "claude-haiku-5": 1_000_000, "claude-haiku-4-5": 200_000,
     "gpt-6": 400_000, "gpt-5": 400_000, "gpt-4.1": 1_000_000, "gpt-4o": 128_000,
     "o3": 200_000, "o4-mini": 200_000,
+    "gabe-xai/grok-4.7": 500_000, "gabe-xai/grok-4.6": 500_000,
+    "grok-4.7": 500_000, "grok-4.6": 500_000,
 }
 
 
@@ -346,6 +349,7 @@ class OpenAIProvider(UsageMixin):
         if self.api not in ("responses", "chat"):
             raise SystemExit(f"GRAFT_OPENAI_API must be 'responses' or 'chat', got {self.api!r}")
         self.effort = os.environ.get("GRAFT_REASONING_EFFORT", "low")
+        self.stream_responses = os.environ.get("GRAFT_OPENAI_STREAM", "1") != "0"
         # prompt_cache_key: only if this installed SDK accepts it (checked, not assumed).
         create = self.client.responses.create if self.api == "responses" else self.client.chat.completions.create
         self.use_cache_key = (os.environ.get("GRAFT_PROMPT_CACHE_KEY", "1") != "0"
@@ -391,18 +395,53 @@ class OpenAIProvider(UsageMixin):
                 # thinking blocks are Anthropic-only and are not sent
         return out
 
+    @staticmethod
+    def _consume_response_stream(stream):
+        """Consume a Responses API SSE stream into the final Response object."""
+        resp = None
+        fallback_items = []
+        for ev in stream:
+            et = getattr(ev, "type", None)
+            if et in ("response.completed", "response.incomplete"):
+                resp = getattr(ev, "response", None)
+            elif et == "response.failed":
+                r = getattr(ev, "response", None)
+                err = getattr(r, "error", None)
+                raise RuntimeError(f"OpenAI response failed: {err or r}")
+            elif et == "error":
+                raise RuntimeError(f"OpenAI stream error: {getattr(ev, 'message', ev)}")
+            elif et == "response.output_item.done":
+                item = getattr(ev, "item", None)
+                if item is not None:
+                    fallback_items.append(item)
+        if resp is not None:
+            return resp
+        if fallback_items:
+            return types.SimpleNamespace(usage=None, output=fallback_items)
+        raise RuntimeError("OpenAI response stream ended without a completed response")
+
     def complete_responses(self, system, messages, tools, max_tokens, model=None, effort=None, site=None):
         model, effort = model or self.model, effort or self.effort
         kwargs: dict = self._cache_kwargs(system, tools)
         if tools:
             kwargs["tools"] = self.wire_tools_responses(tools)
-        if model.startswith(("gpt-5", "gpt-6", "o")):
-            kwargs["reasoning"] = {"effort": effort}
+        if model.startswith(("gpt-5", "gpt-6", "o")) or "grok" in model.lower():
+            if effort and effort != "none":
+                kwargs["reasoning"] = {"effort": effort}
+            else:
+                effort = None
         else:
             effort = None
-        resp = self.client.responses.create(
-            model=model, instructions=system, input=self.wire_input(messages),
-            max_output_tokens=max_tokens, store=False, **kwargs)
+        if getattr(self, "stream_responses", False):
+            kwargs["stream"] = True
+            stream = self.client.responses.create(
+                model=model, instructions=system, input=self.wire_input(messages),
+                max_output_tokens=max_tokens, store=False, **kwargs)
+            resp = self._consume_response_stream(stream)
+        else:
+            resp = self.client.responses.create(
+                model=model, instructions=system, input=self.wire_input(messages),
+                max_output_tokens=max_tokens, store=False, **kwargs)
         self._record_openai(resp.usage, "input_tokens", "output_tokens", "input_tokens_details",
                             kwargs.get("prompt_cache_key"), model=model, effort=effort, site=site)
         blocks: list[dict] = []
@@ -457,6 +496,9 @@ class OpenAIProvider(UsageMixin):
         return out
 
     def complete(self, system, messages, tools, max_tokens=4096, *, model=None, effort=None, site=None):
+        env_max = os.environ.get("GRAFT_MAX_TOKENS")
+        if env_max and max_tokens == 4096:
+            max_tokens = int(env_max)
         if self.api == "responses":
             return self.complete_responses(system, messages, tools, max_tokens, model, effort, site)
         model = model or self.model
@@ -467,12 +509,16 @@ class OpenAIProvider(UsageMixin):
                 for t in tools]
         if model.startswith(("gpt-5.", "gpt-6")):
             kwargs["reasoning_effort"] = "none"  # no extended thinking; required for tools here
+        elif "grok" in model.lower():
+            eff = effort or self.effort
+            if eff and eff != "none":
+                kwargs["reasoning_effort"] = eff
         resp = self.client.chat.completions.create(
             model=model, messages=self.wire_messages(system, messages),
             max_completion_tokens=max_tokens, **kwargs)
         self._record_openai(resp.usage, "prompt_tokens", "completion_tokens", "prompt_tokens_details",
                             kwargs.get("prompt_cache_key"), model=model,
-                            effort="none" if model.startswith(("gpt-5.", "gpt-6")) else None, site=site)
+                            effort=kwargs.get("reasoning_effort"), site=site)
         msg = resp.choices[0].message
         blocks: list[dict] = []
         if msg.content:

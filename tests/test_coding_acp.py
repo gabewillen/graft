@@ -102,6 +102,15 @@ def test_coding_workspace_git_read_and_bash_cancellation(tmp_path):
             pass
         assert time.monotonic() - t0 < 3.0
 
+        # Timed-out Bash command preserves partial flushed stdout
+        to_res = await tools["Bash"].fn({
+            "command": "python3 -u -c 'import time; print(\"step-1\"); print(\"step-2\"); time.sleep(10)'",
+            "timeout": 1.0,
+        }, call)
+        assert to_res.is_error
+        assert "Command timed out after 1s." in to_res.text()
+        assert "step-1" in to_res.text() and "step-2" in to_res.text()
+
     asyncio.run(go())
 
 

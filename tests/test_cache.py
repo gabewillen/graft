@@ -190,3 +190,40 @@ def test_retag_last_moves_usage_between_tags():
     fp.retag_last("handoff")
     assert fp.by_tag["parent"]["calls"] == 0 and fp.by_tag["handoff"]["cached"] == 5
     assert fp.call_log[-1]["tag"] == "handoff" and fp.usage["calls"] == 1
+
+
+def test_openai_responses_streaming_and_grok_reasoning(monkeypatch):
+    usage = NS(input_tokens=1500, output_tokens=40,
+               input_tokens_details=NS(cached_tokens=1152, cache_write_tokens=0))
+    fn_item = NS(type="function_call", call_id="c1", name="a", arguments='{"x": 1}')
+    msg_item = NS(type="message", content=[NS(type="output_text", text="done")])
+    completed = NS(usage=usage, output=[msg_item, fn_item])
+    stream_events = [
+        NS(type="response.created"),
+        NS(type="response.output_item.done", item=msg_item),
+        NS(type="response.completed", response=completed),
+    ]
+    p, rec = _openai("responses", iter(stream_events))
+    p.model = "gabe-xai/grok-4.7-build-fast"
+    p.stream_responses = True
+    monkeypatch.setenv("GRAFT_MAX_TOKENS", "16384")
+
+    blocks = p.complete("SYS", MSGS, TOOLS)
+    assert rec.kwargs[0]["stream"] is True
+    assert rec.kwargs[0]["reasoning"] == {"effort": "low"}
+    assert rec.kwargs[0]["max_output_tokens"] == 16384
+    assert blocks == [
+        {"type": "text", "text": "done"},
+        {"type": "tool_use", "id": "c1", "name": "a", "input": {"x": 1}},
+    ]
+    assert (p.usage["uncached"], p.usage["cached"], p.usage["output"]) == (348, 1152, 40)
+
+
+def test_openai_responses_stream_failed_raises():
+    p, _ = _openai("responses", iter([NS(type="response.failed", response=NS(error="boom"))]))
+    p.stream_responses = True
+    try:
+        p.complete("SYS", MSGS, [])
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "boom" in str(e)

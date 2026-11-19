@@ -24,6 +24,7 @@ Skills:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fnmatch
 import inspect
 import os
@@ -416,16 +417,52 @@ class CodingWorkspace:
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
+        chunks: list[bytes] = []
+        cap = MAX_BASH_BYTES * 4
+        total_kept = 0
+
+        async def _drain_stdout() -> None:
+            nonlocal total_kept
+            assert proc.stdout is not None
+            while True:
+                chunk = await proc.stdout.read(8192)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total_kept += len(chunk)
+                while total_kept > cap and len(chunks) > 1:
+                    total_kept -= len(chunks.pop(0))
+
+        reader = asyncio.create_task(_drain_stdout())
         try:
-            stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
         except TimeoutError:
             await self._kill_group(proc)
-            return f"Command timed out after {timeout:g}s.", True, None
+            try:
+                await asyncio.wait_for(reader, timeout=1.0)
+            except TimeoutError:
+                reader.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reader
+            partial = b"".join(chunks).decode("utf-8", errors="replace").strip()
+            msg = f"Command timed out after {timeout:g}s."
+            if partial:
+                msg += "\n" + _truncate(partial, MAX_BASH_BYTES, tail=True)
+            return msg, True, None
         except asyncio.CancelledError:
             await self._kill_group(proc)
+            reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reader
             raise
+        try:
+            await asyncio.wait_for(reader, timeout=2.0)
+        except TimeoutError:
+            reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reader
         rc = proc.returncode if proc.returncode is not None else -1
-        text = stdout_b.decode("utf-8", errors="replace").strip()
+        text = b"".join(chunks).decode("utf-8", errors="replace").strip()
         out = f"(exit {rc})\n" + (_truncate(text, MAX_BASH_BYTES, tail=True) if text else "(no output)")
         return out, rc != 0, None
 
