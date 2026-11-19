@@ -110,7 +110,7 @@ def last_block(messages):
     return messages[-1]["content"][-1]
 
 
-def make(tmp_path, policy, name, **kw):
+def make(*, tmp_path, policy, name, **kw):
     store = Store(str(tmp_path / f"{name}.db"))
     install_fake(store)
     rec = Recorder(policy)

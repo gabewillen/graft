@@ -15,7 +15,7 @@ from graft.providers import FakeProvider
 from test_parallel import REQUEST, text
 
 
-def make(tmp_path, names=None, policy=None):
+def make(*, tmp_path, names=None, policy=None):
     store = Store(str(tmp_path / "ids.db"))
     install_fake(store)
     h = conversation(store, policy or (lambda *a: text("ok")), seeder=None, names=names).h
@@ -47,7 +47,7 @@ def test_the_default_source_draws_six_lowercase_hex_characters():
 
 def test_ids_given_and_drawn_name_the_branch_everywhere_and_never_its_timeline_id(tmp_path):
     drawn = iter(["3fa9c1", "77aa00"])
-    store, h = make(tmp_path, names=lambda: next(drawn))
+    store, h = make(tmp_path=tmp_path, names=lambda: next(drawn))
 
     async def go():
         await chat_of(h).start()
@@ -74,7 +74,7 @@ def test_ids_given_and_drawn_name_the_branch_everywhere_and_never_its_timeline_i
 
 def test_an_id_is_never_reused_and_a_colliding_draw_is_drawn_again(tmp_path):
     drawn = iter(["site", "site", "deck"])  # the first two collide with the given id
-    store, h = make(tmp_path, names=lambda: next(drawn))
+    store, h = make(tmp_path=tmp_path, names=lambda: next(drawn))
 
     async def go():
         await chat_of(h).start()
@@ -97,7 +97,7 @@ def test_an_id_is_never_reused_and_a_colliding_draw_is_drawn_again(tmp_path):
 def test_an_id_source_that_cannot_give_an_id_refuses_the_call(tmp_path, source):
     """Draws are bounded: a source that keeps colliding, or gives something that is not an id, is
     an error of the preparation, so the call is refused and nothing is made."""
-    store, h = make(tmp_path, names=(lambda: "site") if source == "collides" else (lambda: "Not An Id"))
+    store, h = make(tmp_path=tmp_path, names=(lambda: "site") if source == "collides" else (lambda: "Not An Id"))
 
     async def go():
         await chat_of(h).start()
@@ -133,7 +133,7 @@ def test_stop_takes_branch_ids_and_a_timeline_id_names_nothing(tmp_path):
             return [{"type": "tool_use", "id": "s1", "name": "stop", "input": {"ids": ["c1", "site"]}}]
         return text("Okay.")
 
-    store, h = make(tmp_path, policy=policy)
+    store, h = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await chat_of(h).start()
@@ -202,7 +202,7 @@ def test_a_request_handed_back_any_number_of_times_may_still_be_forked_for(tmp_p
             return text("ok")
         return [{"type": "tool_use", "id": f"f{forks}", "name": "fork", "input": {"current": {"skills": ["website"]}}}]
 
-    store, h = make(tmp_path, policy=policy)
+    store, h = make(tmp_path=tmp_path, policy=policy)
 
     async def go():
         await chat_of(h).start()

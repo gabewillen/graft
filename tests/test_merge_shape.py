@@ -23,7 +23,7 @@ def fork_use(use_id="f1", **inp):
     return {"type": "tool_use", "id": use_id, "name": "fork", "input": inp}
 
 
-def make(tmp_path, policy, **kw):
+def make(*, tmp_path, policy, **kw):
     store = Store(str(tmp_path / "merge.db"))
     install_fake(store)
     h = conversation(store, policy, seeder=None, **kw).h
@@ -62,7 +62,7 @@ class Script:
         return self.branch(messages)
 
 
-def run(h, *says):
+def run(*, h, says):
     out = []
 
     async def go():
@@ -81,8 +81,8 @@ SITE = {"id": "site", "skills": ["website"], "messages": [REQUEST], "reason": "B
 
 def test_a_current_branch_that_replies_merges_at_the_end_of_its_turn_and_main_runs_once(tmp_path):
     script = Script(entry=SITE, branch=lambda m: text("What pages should the site have?"))
-    store, h, said = make(tmp_path, script)
-    out = run(h, REQUEST)
+    store, h, said = make(tmp_path=tmp_path, policy=script)
+    out = run(h=h, says=[REQUEST])
     assert out == [["What pages should the site have?"]]  # main's run after the merge said nothing
     assert len(script.main_after_merge) == 1  # main always runs once after a merge
     # the branch's timeline ends on the harness's argument-less merge call and its result
@@ -116,8 +116,8 @@ def test_the_next_message_goes_to_main_never_to_the_merged_branch(tmp_path):
         return text("What pages?")
 
     script = Script(entry=SITE, branch=branch, after=lambda m: [])
-    store, h, said = make(tmp_path, script)
-    run(h, REQUEST, "Home and contact.")
+    store, h, said = make(tmp_path=tmp_path, policy=script)
+    run(h=h, says=[REQUEST, "Home and contact."])
     assert len(seen) == 1  # the branch ran one turn
     # main ran after the merge, then on the next message, which is its own row
     assert len(script.main_after_merge) == 2
@@ -130,8 +130,8 @@ def test_merge_with_a_reason_and_no_reply_hands_the_request_back_and_main_reads_
     branch = lambda m: [{"type": "tool_use", "id": "m1", "name": "merge",
                          "input": {"reason": "The user also wants slides; I only build sites."}}]
     script = Script(entry=SITE, branch=branch, after=lambda m: text("I'll do the slides too."))
-    store, h, said = make(tmp_path, script)
-    out = run(h, REQUEST)
+    store, h, said = make(tmp_path=tmp_path, policy=script)
+    out = run(h=h, says=[REQUEST])
     assert out == [["I'll do the slides too."]]
     assert store.timeline("c1")["join_reason"] == "out_of_scope"  # graft's own word; the model never sees it
     merge = [r for r in store.view("o") if r["kind"] == "tool_use" and r["tool_name"] == "merge"][0]
@@ -148,8 +148,8 @@ def test_calls_beside_a_merge_are_not_run_and_stay_in_the_branch(tmp_path):
                         + [{"type": "tool_use", "id": "w1", "name": "site_write", "input": {"page": "x", "content": "y"}},
                            {"type": "tool_use", "id": "m1", "name": "merge", "input": {}}])
     script = Script(entry=SITE, branch=branch)
-    store, h, said = make(tmp_path, script)
-    run(h, REQUEST)
+    store, h, said = make(tmp_path=tmp_path, policy=script)
+    run(h=h, says=[REQUEST])
     assert chat_of(h).world.site == {}
     mine = [(r["kind"], r["tool_name"]) for r in store.view("o") if r["owner_timeline"] == "c1"]
     assert mine == [("text", None), ("tool_use", "merge")]  # the sibling call is not pointed at
@@ -165,7 +165,7 @@ def test_a_detached_branch_merges_and_main_is_told_the_user_has_not_seen_it(tmp_
 
     entry = {"id": "deck", "skills": ["slides"], "messages": [], "reason": "A five-slide deck."}
     script = Script(entry=entry, branch=branch, after=lambda m: text("I built the deck."), current=False)
-    store, h, said = make(tmp_path, script)
+    store, h, said = make(tmp_path=tmp_path, policy=script)
 
     async def go():
         await chat_of(h).start()
@@ -197,7 +197,7 @@ def test_a_malformed_or_oversized_merge_call_still_ends_the_turn_but_main_reads_
         store = Store(str(tmp_path / f"b{len(json.dumps(bad))}" / "m.db"))
         install_fake(store)
         h = conversation(store, script, seeder=None).h
-        run(h, REQUEST)
+        run(h=h, says=[REQUEST])
         refusal = [json.loads(r["content"]) for r in store.view("c1") if r["kind"] == "tool_result"
                    and r["tool_name"] == "merge" and not r["harness"]][0]
         assert refusal["is_error"] and refusal["content"].startswith("merged without your reason")
@@ -223,9 +223,9 @@ def test_an_entry_with_no_messages_and_no_reason_is_refused_in_the_model_loop(tm
             return text("Sorry.")
         return [fork_use(current={"skills": ["website"], "messages": []})]
 
-    store, h, said = make(tmp_path, policy)
+    store, h, said = make(tmp_path=tmp_path, policy=policy)
     h.provider.policy = policy  # the raw policy: no quotes filled in
-    run(h, REQUEST)
+    run(h=h, says=[REQUEST])
     assert results and "current: give it messages, a reason, or both" in results[0]
     assert store.con.execute("SELECT count(*) FROM timelines WHERE source_id IS NOT NULL").fetchone()[0] == 0
 
@@ -243,8 +243,8 @@ def test_main_text_beside_its_fork_call_is_no_reply_of_the_branch(tmp_path):
             return text("On it.") + blocks
         return blocks
 
-    store, h, said = make(tmp_path, with_text)
-    run(h, REQUEST)
+    store, h, said = make(tmp_path=tmp_path, policy=with_text)
+    run(h=h, says=[REQUEST])
     assert store.timeline("c1")["join_reason"] == "out_of_scope"
     assert merge_results(store)[0].startswith("site merged without answering the user's last message")
 

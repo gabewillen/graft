@@ -26,7 +26,7 @@ def fork_use(use_id="f1", **inp):
     return {"type": "tool_use", "id": use_id, "name": "fork", "input": inp}
 
 
-def make(tmp_path, policy, **kw):
+def make(*, tmp_path, policy, **kw):
     store = Store(str(tmp_path / "fork.db"))
     install_fake(store)
     h = conversation(store, policy, seeder=kw.pop("seeder", None), **kw).h
@@ -54,7 +54,7 @@ class Main:
         return text("Here is your site.")
 
 
-def run(h, *says):
+def run(*, h, says):
     async def go():
         await chat_of(h).start()
         for s in says:
@@ -85,8 +85,8 @@ def test_a_branch_sees_only_the_messages_main_points_at_then_main_fork_turn_and_
     main = Main([{"type": "text", "text": "On it."},
                  fork_use(current={"id": "site", "skills": ["website"], "messages": [REQUEST, "dental practice"],
                                    "reason": "Build the site; ask what pages they want."})])
-    store, h = make(tmp_path, main)
-    run(h, ASK, SECRET, REQUEST)
+    store, h = make(tmp_path=tmp_path, policy=main)
+    run(h=h, says=[ASK, SECRET, REQUEST])
     sent = main.branch_sent
     flat = json.dumps(sent)
     assert "hunter2" not in flat  # main did not point at it: the branch never sees it
@@ -112,8 +112,8 @@ def test_a_branch_sees_only_the_messages_main_points_at_then_main_fork_turn_and_
 def test_a_branch_with_no_messages_starts_on_main_fork_turn(tmp_path):
     main = Main([fork_use(detached=[{"id": "deck", "skills": ["slides"], "messages": [],
                                      "reason": "A five-slide deck for a dental practice."}])])
-    store, h = make(tmp_path, main)
-    run(h, REQUEST)
+    store, h = make(tmp_path=tmp_path, policy=main)
+    run(h=h, says=[REQUEST])
     sent = main.branch_sent
     assert [m["role"] for m in sent] == ["assistant", "user"]
     assert sent[1]["content"][0]["content"].startswith("You are now on branch deck (detached: ")
@@ -135,8 +135,8 @@ def test_a_pointer_that_names_no_message_refuses_the_call_and_lists_the_messages
         return [fork_use(current={"skills": ["website"], "messages": [
             "nothing like this", "dental", 999, 1, "Build"]})]
 
-    store, h = make(tmp_path, policy)
-    run(h, ASK, "I run a dental clinic too.", REQUEST)
+    store, h = make(tmp_path=tmp_path, policy=policy)
+    run(h=h, says=[ASK, "I run a dental clinic too.", REQUEST])
     refusal = calls[0]
     assert refusal.startswith("fork refused; no branch was started:")
     assert "current: quote 'nothing like this' matches no message" in refusal
@@ -148,7 +148,7 @@ def test_a_pointer_that_names_no_message_refuses_the_call_and_lists_the_messages
 
 
 def test_pointers_to_tool_rows_harness_rows_and_withdrawn_messages_are_refused(tmp_path):
-    store, h = make(tmp_path, lambda *a: text("ok"))
+    store, h = make(tmp_path=tmp_path, policy=lambda *a: text("ok"))
 
     async def go():
         await chat_of(h).start()
@@ -174,8 +174,8 @@ def test_other_calls_of_the_fork_turn_carry_main_results_in_the_branch_and_think
     main = Main([{"type": "thinking", "thinking": "hmm", "signature": "s"},
                  fork_use(current={"skills": ["website"], "messages": [REQUEST]}),
                  {"type": "tool_use", "id": "l1", "name": "load_skill", "input": {"name": "fork"}}])
-    store, h = make(tmp_path, main)
-    run(h, REQUEST)
+    store, h = make(tmp_path=tmp_path, policy=main)
+    run(h=h, says=[REQUEST])
     sent = main.branch_sent
     assert [b["type"] for b in sent[1]["content"]] == ["tool_use", "tool_use"]
     results = {b["tool_use_id"]: b["content"] for b in sent[2]["content"]}
@@ -202,8 +202,8 @@ def test_a_refusal_lists_a_bounded_number_of_problems_and_cuts_long_row_ids(tmp_
             return text("Sorry.")
         return [fork_use(current={"skills": ["website"], "messages": [10 ** 200] + list(range(900, 940))})]
 
-    store, h = make(tmp_path, policy)
-    run(h, REQUEST)
+    store, h = make(tmp_path=tmp_path, policy=policy)
+    run(h=h, says=[REQUEST])
     refusal = calls[0]
     assert refusal.count("\n- ") == MAX_PROBLEMS + 1 and f"and {41 - MAX_PROBLEMS} more" in refusal
     assert "1" + "0" * 200 not in refusal and "row 100000000000000000000000... is not in" in refusal
