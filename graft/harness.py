@@ -711,10 +711,15 @@ class Host:
             raise  # a cancel is the activity's to tell apart (it has the state's context)
         except BaseException as error:  # noqa: BLE001 - it was invoked: it ran, with an error
             return Ran(f"raised {type(error).__name__}{_shown(error)}; it may have acted"), True
-        result = CallToolResult.from_value(outcome)
-        if result is None:
-            return Ran(f"returned a {type(outcome).__name__}, not a tool result; it may have acted"), True
-        return Ran(result.text()), result.is_error
+        try:  # the result is the tool's object: reading it may raise too (a str subclass, a deep dict)
+            result = CallToolResult.from_value(outcome)
+            if result is None:
+                return Ran(f"returned a {type(outcome).__name__}, not a tool result; it may have acted"), True
+            return Ran(str.__str__(result.text())), result.is_error is True
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as error:  # noqa: BLE001 - it ran; its result could not be read
+            return Ran(f"returned a result that could not be read ({type(error).__name__}); it may have acted"), True
 
     def close_tool_uses(self, tl: str, known: dict[str, tuple[str, bool]]) -> None:
         self._close_tool_uses(tl=tl, known=known)

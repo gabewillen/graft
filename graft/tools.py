@@ -47,25 +47,29 @@ class CallToolResult:
             blocks = value.get("content", [])
             if all(isinstance(b, dict) for b in blocks):
                 return cls(content=list(blocks), structured_content=value.get("structuredContent"),
-                           is_error=bool(value.get("isError", False)))
+                           is_error=value.get("isError", False) is True)
         return None
 
     def text(self) -> str:
         """What the model reads: the text blocks, joined; with none, the structured content as JSON."""
         texts = [b["text"] for b in self.content if b.get("type") == "text" and isinstance(b.get("text"), str)]
         if texts:
-            return "\n".join(texts)
+            return "\n".join(str.__str__(t) for t in texts)
         if self.structured_content is not None:
             try:
                 return json.dumps(self.structured_content)
-            except (TypeError, ValueError):
-                return repr(self.structured_content)[:2000]
+            except (TypeError, ValueError, RecursionError):
+                return "(structured content that is not JSON)"
         return ""
 
 
 @dataclass
 class Tool:
-    """One host tool: an MCP tool definition and the function graft calls with the arguments."""
+    """One host tool: an MCP tool definition and the function graft calls with the arguments. `fn`
+    is called on the agent's event loop: a sync function must return at once (it blocks every
+    machine while it runs); one that waits on I/O is async, or hands its blocking work to
+    `asyncio.to_thread`. Its return is a str (one text block), a CallToolResult or its MCP JSON
+    form; a raise is a result with isError true."""
     name: str
     input_schema: dict
     fn: Callable[[dict], Any | Awaitable[Any]]
