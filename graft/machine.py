@@ -1968,11 +1968,10 @@ def request_held(ctx, inst, event) -> None:
 
 
 def request_failed(ctx, inst, event) -> None:
-    """The message's row could not be written: its caller gets the error, the user is told, and no
-    run starts for it."""
+    """The message's row could not be written: no run starts for it, and it is answered with the
+    error at rest (the session tells the error on its task, once)."""
     request, inst.request = inst.request, None
     inst.waiters.append(Waiter(reply=request.reply, user=True, error=event.data, request=request))
-    _report(inst=inst, kind="request", clones=[], error=event.data, keep=False)
 
 
 def stash_message(ctx, inst, event) -> None:
@@ -4594,13 +4593,18 @@ def h_rested_root(draft: _Draft, event) -> None:
 
 
 def h_rested_focus(draft: _Draft, event) -> None:
-    """A focus graft came to rest (a fault before its run began): the tasks it answered wait for input."""
+    """A focus graft came to rest (a fault before its run began): the tasks it answered wait for
+    input, but one whose requests are all answered and that failed, with no background graft out
+    for it, fails (as at the original's rest)."""
     rested: Rested = event.data
     for rid, error in rested.answered:
         draft.answer(rid=rid, error=error)
+    owed = frozenset(t for tasks in draft.graft_tasks.values() for t in tasks)
     for task in draft.tasks_of(rid for rid, _ in rested.answered):
         rec = draft.tasks[task]
-        if rec.state != a2a_INPUT_REQUIRED:
+        if rec.failed and task not in owed and all(w == "answered" for w in rec.requests.values()):
+            draft.end(task=task, state=a2a_FAILED)
+        elif rec.state != a2a_INPUT_REQUIRED:
             draft.emit_status(task=task, state=a2a_INPUT_REQUIRED, message=rec.reply)
 
 

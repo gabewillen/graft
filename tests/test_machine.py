@@ -835,7 +835,7 @@ def test_a_request_row_that_cannot_be_written_fails_the_call_explicitly_and_runs
         reply = await say(m=m, text="hi")
         with pytest.raises(OSError, match="disk full"):
             await reply
-        assert ("request", ["disk full"]) == (host.reports[-1][0], [host.reports[-1][2]])
+        assert not host.reports  # the session tells it on the task, from the answer (once)
         assert await at_rest(m) == "ended" and not host.logged(prefix=("run",))  # no run started
         await m.stop()
     run(go)
