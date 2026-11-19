@@ -47,11 +47,12 @@ class Machines:
     def future(self) -> asyncio.Future:
         return asyncio.get_running_loop().create_future()
 
-    def request(self, text: str, task: str | None = None) -> Request:
+    def request(self, text: str, task: str | None = None, metadata: dict[str, Any] | None = None) -> Request:
         self.requests += 1
         reply = self.future()
         reply.add_done_callback(_taken)
-        return Request(id=self.requests, text=text, reply=reply, task=task)
+        return Request(id=self.requests, text=text, reply=reply, task=task,
+                       metadata=dict(metadata) if metadata else {})
 
     def _target(self, tl: str, name: str) -> hsm.Instance:
         sm = self.session if tl == "session" else self.timelines.get(tl)

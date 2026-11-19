@@ -87,6 +87,7 @@ class Request:
     reply: asyncio.Future
     row: int | None = None
     task: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class GraftPlan(NamedTuple):

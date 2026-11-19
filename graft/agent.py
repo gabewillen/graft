@@ -31,7 +31,7 @@ from .a2a import (A2AError, AgentCard, AgentInterface, AgentSkill, CancelTaskReq
                   StreamResponse, SubscribeToTaskRequest, Task, TaskNotCancelable, TaskNotFound,
                   UnsupportedOperation)
 from .db import Store
-from .harness import MODEL_CALL_TIMEOUT, Host
+from .harness import MODEL_CALL_TIMEOUT, ForkContext, Host
 from .machine import Submission, TransitionRefused, described
 from .providers import Provider
 from .skills import BASE_SYSTEM, BUILTIN, CATALOG, install
@@ -62,6 +62,7 @@ class GraftConfig:
     names: Callable[[], str] | None = None  # the source of branch ids a fork leaves out
     nonce: str | None = None
     trace: Callable[[str], None] | None = None  # a debug hook for internal trace lines, not a channel
+    before_fork: Callable[[ForkContext], Any] | None = None  # host policy hook to allow or refuse a fork
     skills: Sequence | None = None  # the skill catalog (default: graft.skills.CATALOG)
     ids: Callable[[], str] | None = None  # the source of context and task ids (default: uuid4)
     context_id: str | None = None
@@ -134,7 +135,8 @@ class GraftAgent:
                           persona=self.config.persona, nonce=self.config.nonce,
                           compact_tokens=self.config.compact_tokens, compaction_mode=self.config.compaction_mode,
                           seeder=self.config.seeder, window_tokens=self.config.window_tokens,
-                          call_timeout=self.config.call_timeout, names=self.config.names)
+                          call_timeout=self.config.call_timeout, names=self.config.names,
+                          before_fork=self.config.before_fork)
 
     # ------------------------------------------------------------ lifetime
     async def start(self) -> None:
@@ -230,7 +232,7 @@ class GraftAgent:
                            context_id=self.context_id, task_id=task_id, metadata=message.metadata,
                            extensions=message.extensions, reference_task_ids=message.reference_task_ids)
         cursor = self.store.event_position()
-        request = self._host.machines.request(text=message.text, task=task_id)
+        request = self._host.machines.request(text=message.text, task=task_id, metadata=message.metadata)
         answer = await self._host.machines.ask(tl="session", name="submit", build=lambda reply: (
             Submission(task=task_id, follow_up=follow_up, message=sent.to_dict(), request=request), reply))
         if answer == "not_found":

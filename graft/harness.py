@@ -66,7 +66,7 @@ import random
 import re
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, NamedTuple, Sequence
+from typing import Any, Callable, NamedTuple, Sequence
 
 from . import callsites, compaction
 from . import seeder as seeder_mod
@@ -75,7 +75,7 @@ from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, Cancel, CancelCall, Branch, 
                       Prepared, QueuedJoin, RunOutcome, ToolCall, TransitionRefused, Unwritten, described)
 from .providers import Provider, prefix_nonce, window_tokens_for
 from .skills import BASE_SYSTEM, BRANCH_ID_PATTERN, BUILTIN, MAX_MESSAGES, REASON_CHARS, skill_instructions, skill_listing
-from .tools import CallToolResult, Tool, by_name
+from .tools import CallToolResult, Tool, ToolContext, by_name, invoke_tool
 
 # Seconds one model call may take before it is abandoned as a mechanical failure (the harness's
 # `call_timeout`; None disables it). Without it a hung call keeps a graft live for ever.
@@ -451,6 +451,22 @@ def _reason(reason: str) -> str:
 
 
 
+@dataclass(frozen=True)
+class ForkContext:
+    """Context passed to the host's `before_fork(ctx)` policy hook.
+
+    Return `None` (or empty string / empty sequence) to allow the fork call, or a non-empty refusal
+    string (or sequence of strings) to atomically refuse the entire fork call. May be sync or async."""
+    source: str
+    entries: tuple[BranchEntry, ...]
+    seeds: tuple[tuple[int, ...], ...]
+    forks_this_message: int
+    live_branches: int
+    total_branches: int
+    store: Store
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class BranchBatch:
     """The harness's record of a prepared branch call, which the original's machine decides:
@@ -481,10 +497,13 @@ class Host:
                  compact_tokens: int | None = None, compaction_mode: str = "turns", seeder=...,
                  window_tokens: int | None = ...,
                  call_timeout: float | None = MODEL_CALL_TIMEOUT,
-                 names: Callable[[], str] | None = None):
+                 names: Callable[[], str] | None = None,
+                 before_fork: Callable[[ForkContext], Any] | None = None):
         self.store = store
         # The source of the ids a fork call leaves out (seeded in tests).
         self.names = names or new_names()
+        # Optional host policy hook called before a fork commits (returns None to allow, or refusal string(s)).
+        self.before_fork = before_fork
         self.persona = persona  # user-provided; identical, verbatim, on every timeline
         self.provider = provider
         self.tools = by_name(list(tools))  # the host's tools, by name (graft/tools.py)
@@ -703,19 +722,66 @@ class Host:
     def store_result(self, tl: str, use: dict, content: str, is_error: bool) -> None:
         self._store_results(tl=tl, results=[ToolResult(use=use, content=content, is_error=is_error)])
 
+    def _active_metadata(self, tl: str) -> dict[str, Any]:
+        """The A2A message metadata of the active request for timeline `tl`, or {} if none."""
+        machines = getattr(self, "machines", None)
+        if machines is None:
+            return {}
+        seen: set[str] = set()
+        cur: str | None = tl
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            sm = machines.timelines.get(cur)
+            if sm is None:
+                return {}
+            if sm.req.answering is not None:
+                return dict(sm.req.answering.metadata)
+            if sm.req.woken_for:
+                return dict(sm.req.woken_for[-1].metadata)
+            if sm.made_for:
+                return dict(sm.made_for[-1].metadata)
+            cur = sm.source_id
+        return {}
+
+    def _forks_this_message(self, src: str) -> int:
+        """Committed `fork` calls on `src` since the last live human message in `src`'s working view."""
+        rows = self.store.working_view(src)
+        last_user = -1
+        for i, r in enumerate(rows):
+            if r["role"] == "user" and seeder_mod.is_candidate(r):
+                last_user = i
+        count = 0
+        for r in rows[last_user + 1:]:
+            if r["kind"] == "tool_result" and r["tool_name"] == "fork":
+                try:
+                    data = json.loads(r["content"])
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(data, dict) and not data.get("is_error"):
+                    count += 1
+        return count
+
     async def call_tool(self, tl: str, use: dict) -> tuple[Ran, bool]:
         """A host tool call (the activity of tl's machine's `calling` state): the tool's function is
-        called with the call's arguments; an awaitable it returns is awaited here, so other
-        timelines go on while it waits, and a cancel of the activity reaches the tool where it
-        waits. Its result is MCP's CallToolResult (a str is one text block); once the tool is
-        invoked it has run, whatever follows: a tool that raises, or returns anything but a result,
-        gets a result marked run, with an error naming what happened (it may have acted), never a
-        failure of the run. Its trace line is the machine's (through the scribe)."""
+        called with the call's arguments (and a `ToolContext` if it accepts one); an awaitable it
+        returns is awaited here, so other timelines go on while it waits, and a cancel of the
+        activity reaches the tool where it waits. Its result is MCP's CallToolResult (a str is one
+        text block); once the tool is invoked it has run, whatever follows: a tool that raises, or
+        returns anything but a result, gets a result marked run, with an error naming what happened
+        (it may have acted), never a failure of the run. Its trace line is the machine's (through
+        the scribe)."""
         tool = self.tools.get(use["name"])
         if tool is None:  # a skill's tool the host no longer gives: not run
             return Ran(f"tool '{use['name']}' is not available"), True
+        store = getattr(self, "store", None)
+        call = ToolContext(
+            branch=tl,
+            branch_name=store.name_of(tl) if store is not None else None,
+            tool_use_id=str(use.get("id", "")),
+            metadata=Host._active_metadata(self, tl),
+        )
         try:
-            outcome = tool.fn(use["input"])
+            outcome = invoke_tool(tool.fn, use["input"], call)
             if inspect.isawaitable(outcome):
                 outcome = await outcome
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -1669,6 +1735,26 @@ class Host:
                 sc["seeder"] = decision
             scratch.append(sc)
         violations = shape + given + [f"{e.label}: {x}" for e, v in zip(entries, per_entry) for x in v]
+        if not violations and self.before_fork is not None:
+            ctx = ForkContext(
+                source=src,
+                entries=tuple(entries),
+                seeds=tuple(tuple(s) for s in seeds),
+                forks_this_message=self._forks_this_message(src),
+                live_branches=sum(len(m.grafts.live) for m in self.machines.timelines.values()),
+                total_branches=self.store.con.execute(
+                    "SELECT COUNT(*) FROM timelines WHERE source_id IS NOT NULL").fetchone()[0],
+                store=self.store,
+                metadata=self._active_metadata(src),
+            )
+            decision = self.before_fork(ctx)
+            if inspect.isawaitable(decision):
+                decision = await decision
+            if isinstance(decision, str):
+                if decision.strip():
+                    violations.append(decision.strip())
+            elif decision is not None:
+                violations += [str(x).strip() for x in decision if str(x).strip()]
         if violations:
             for tx, sc in zip(txs, scratch):
                 self.store.end_tx(tx, status="rolled_back", committed_sql=None,

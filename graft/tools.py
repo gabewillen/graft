@@ -9,6 +9,7 @@ result is its text blocks, or, with none, its `structuredContent` as JSON.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from dataclasses import dataclass, field
@@ -63,16 +64,45 @@ class CallToolResult:
         return ""
 
 
+@dataclass(frozen=True)
+class ToolContext:
+    """Per-invocation context passed to host tools that accept a second parameter (`fn(args, call)`)
+    or `call` kwarg / `**kwargs`. Stays strictly in-process (branches never appear on the A2A wire)."""
+    branch: str
+    branch_name: str | None = None
+    tool_use_id: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def invoke_tool(fn: Callable[..., Any], args: dict, call: ToolContext) -> Any:
+    """Invoke a host tool function: `fn(args)` for 1-arg tools (backward-compatible),
+    `fn(args, call)` for 2-arg tools, or `fn(args, call=call)` for keyword/kwargs tools."""
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return fn(args)
+    pos = [p for p in params if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+    has_varargs = any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params)
+    has_varkw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+    kw_only = {p.name for p in params if p.kind is inspect.Parameter.KEYWORD_ONLY}
+    if len(pos) >= 2 or has_varargs:
+        return fn(args, call)
+    if "call" in kw_only or has_varkw:
+        return fn(args, call=call)
+    return fn(args)
+
+
 @dataclass
 class Tool:
     """One host tool: an MCP tool definition and the function graft calls with the arguments. `fn`
     is called on the agent's event loop: a sync function must return at once (it blocks every
     machine while it runs); one that waits on I/O is async, or hands its blocking work to
-    `asyncio.to_thread`. Its return is a str (one text block), a CallToolResult or its MCP JSON
-    form; a raise is a result with isError true."""
+    `asyncio.to_thread`. It may take `(args)` or `(args, call)` / `(args, *, call)` / `(args, **kw)`
+    where `call` is a `ToolContext` naming the calling branch. Its return is a str (one text block),
+    a CallToolResult or its MCP JSON form; a raise is a result with isError true."""
     name: str
     input_schema: dict
-    fn: Callable[[dict], Any | Awaitable[Any]]
+    fn: Callable[..., Any | Awaitable[Any]]
     description: str = ""
     title: str | None = None
     output_schema: dict | None = None
