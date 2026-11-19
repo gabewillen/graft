@@ -3,14 +3,15 @@ import sqlite3
 
 import pytest
 
+from _util import install_fake
+
 from graft.db import Graft, Store, render, validate
-from graft.skills import install
 
 
 @pytest.fixture
 def store(tmp_path):
     s = Store(str(tmp_path / "t.db"))
-    install(s)
+    install_fake(s)
     s.create_timeline(tl="o", source=None, skills=["fork"])
     return s
 

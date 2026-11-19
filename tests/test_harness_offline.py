@@ -4,13 +4,12 @@ import asyncio
 
 import pytest
 
-from _util import clone_in_turn, clones, holders, status
+from _util import clone_in_turn, clones, holders, status, conversation, chat_of, install_fake
 from graft.db import Graft, Store
 from graft.fake import pivot_policy
-from graft.harness import Harness, check_skill_link
+from graft.harness import Host, check_skill_link
 from graft.providers import FakeProvider
 from graft.sim import run_script
-from graft.skills import install
 
 
 def clone_use(skills, focus=True, id="t"):
@@ -22,8 +21,8 @@ def clone_use(skills, focus=True, id="t"):
 @pytest.fixture
 def harness(tmp_path):
     store = Store(str(tmp_path / "h.db"))
-    install(store)
-    return Harness(store, FakeProvider(pivot_policy))
+    install_fake(store)
+    return conversation(store, pivot_policy).h
 
 
 def test_pivot_flow_offline(harness):
@@ -34,8 +33,8 @@ def test_pivot_flow_offline(harness):
     h = harness
 
     async def go():
-        await h.start()
-        await run_script(h, [
+        await chat_of(h).start()
+        await run_script(chat_of(h).agent, [
             "I need a website.", "It is for dentists in Ohio.", "Formal tone please.",
             "Our services: cleaning, implants, whitening.", "Instead let's build a slide show."], echo=False)
         assert holders(h.store) == ["o"]
@@ -58,7 +57,7 @@ def test_pivot_flow_offline(harness):
     tx = s.con.execute("SELECT committed_sql FROM transactions WHERE kind='join' AND target='c5'").fetchone()
     assert tx[0].startswith("DEFAULT JOIN c5 reason=done")
     assert h.provider.by_tag["original:clone_tx"]["calls"] == 5  # one fork call per message
-    assert "ohio" in h.world.deck_text().lower()
+    assert "ohio" in chat_of(h).world.deck_text().lower()
     c5_tools = {c["tools"][i]["name"] for c in h.provider.calls if "slides_create" in str(c["tools"])
                 for i in range(len(c["tools"]))}
     assert "site_write" not in c5_tools and "fork" not in c5_tools
@@ -68,7 +67,7 @@ def test_one_shot_clone_refused_with_violations_then_retry(harness):
     h = harness
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         s = h.store
         s.add_turn("o", "user", "text", "hello")
         s.add_turn("o", "assistant", "text", "hi")
@@ -95,7 +94,7 @@ def test_default_join_is_deterministic_text_rows_only(harness):
     h = harness
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         s = h.store
         seed = s.add_turn("o", "user", "text", "Make a deck.")
         (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["slides"]))
@@ -126,7 +125,7 @@ def test_default_join_failed_puts_the_merge_call_and_its_result_before_the_trigg
     h = harness
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         s = h.store
         s.add_turn("o", "user", "text", "Make a site.")
         (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"]))
@@ -149,7 +148,7 @@ def test_working_view_after_compaction_bounds_the_default_join(harness):
     h = harness
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         s = h.store
         seed = s.add_turn("o", "user", "text", "Plan a long project.")
         (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"]))
@@ -215,12 +214,12 @@ def test_load_skill_scoped_to_linked_skills(harness):
 
 def test_load_skill_result_is_an_ordinary_row(tmp_path):
     store = Store(str(tmp_path / "p.db"))
-    install(store)
-    h = Harness(store, FakeProvider(pivot_policy))
+    install_fake(store)
+    h = conversation(store, pivot_policy).h
 
     async def go():
-        await h.start()
-        await run_script(h, ["I need a website.", "For dentists in Ohio."], echo=False)
+        await chat_of(h).start()
+        await run_script(chat_of(h).agent, ["I need a website.", "For dentists in Ohio."], echo=False)
         await h.machines.stop()
 
     asyncio.run(go())
@@ -240,12 +239,12 @@ def test_oversized_join_falls_back_to_last_reply_and_survives_refused_compaction
     from graft.db import render
     from graft.harness import JOIN_WINDOW_FRACTION
     store = Store(str(tmp_path / "w.db"))
-    install(store)
-    h = Harness(store, FakeProvider(_no_compact_policy), compact_tokens=50, window_tokens=400)
+    install_fake(store)
+    h = conversation(store, _no_compact_policy, compact_tokens=50, window_tokens=400).h
     limit = int(400 * JOIN_WINDOW_FRACTION)
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         s = h.store
         seed = s.add_turn("o", "user", "text", "Write a long report.")
         (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"]))
@@ -280,7 +279,7 @@ def test_join_without_window_is_not_size_checked(harness):
     h = harness
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         s = h.store
         seed = s.add_turn("o", "user", "text", "Write.")
         (child,), _ = await clone_in_turn(h=h, use=clone_use(skills=["website"]))
@@ -304,12 +303,12 @@ def test_window_defaults_per_model(tmp_path, monkeypatch):
     assert window_tokens_for(fp) is None  # unknown model: off
     fp.model = "claude-sonnet-5-5"
     store = Store(str(tmp_path / "m.db"))
-    assert Harness(store, fp).window_tokens == 1_000_000  # on by default for a known model
+    assert conversation(store, provider=fp).h.window_tokens == 1_000_000  # on by default for a known model
     monkeypatch.setenv("GRAFT_WINDOW_TOKENS", "5000")
-    assert Harness(store, fp).window_tokens == 5000
+    assert conversation(store, provider=fp).h.window_tokens == 5000
     monkeypatch.setenv("GRAFT_WINDOW_TOKENS", "0")
-    assert Harness(store, fp).window_tokens is None
-    assert Harness(store, fp, window_tokens=123).window_tokens == 123  # explicit wins
+    assert conversation(store, provider=fp).h.window_tokens is None
+    assert conversation(store, provider=fp, window_tokens=123).h.window_tokens == 123  # explicit wins
 
 
 def _always_fails_policy(system, messages, tools):

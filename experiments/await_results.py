@@ -29,9 +29,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from graft.db import Store, validate  # noqa: E402
-from graft.harness import Harness  # noqa: E402
+from graft.agent import GraftAgent, GraftConfig  # noqa: E402
+from graft.fake import FakeWorld  # noqa: E402
 from graft.providers import FakeProvider, make_provider  # noqa: E402
-from graft.skills import World, install  # noqa: E402
+from graft.sim import follow, say as send  # noqa: E402
 
 REQUEST = ("We are Okafor Dental in Columbus, Ohio. Our services: cleaning, implants, whitening. "
            "Our open house is on 2026-12-05 at 10:00. Please build our website home page with me; "
@@ -47,7 +48,7 @@ WAIT_LIMIT = 900.0  # seconds the whole conversation may take before the run is 
 FILING = {"slides_add_slide": "slides", "calendar_book": "calendar", "newsletter_draft": "newsletter"}
 
 
-class Awaiting(World):
+class Awaiting(FakeWorld):
     """site_write awaits until the slides, the booking and the newsletter are filed, then writes.
     Each filing sets its event when its tool runs; the wait is an asyncio wait, not a poll.
     `gate`: each filing tool first awaits `focus_waiting`, which site_write sets when it starts
@@ -97,7 +98,7 @@ class Awaiting(World):
         if name in FILING and self.gate and not self.focus_waiting.is_set():
             self.note(f"{name} waits until site_write is waiting")
             await self.focus_waiting.wait()
-        result = World.execute(self, name, args)
+        result = FakeWorld.execute(self, name, args)
         self.note(f"{name} ran" + (" (error)" if result[1] else ""))
         if not result[1] and name in FILING:
             self._file(FILING[name])
@@ -137,12 +138,12 @@ async def run(live: bool, trace: bool, gate: bool = False) -> dict:
     provider = make_provider() if live else FakeProvider(scripted)
     path = os.path.join(tempfile.mkdtemp(prefix="graft-await-"), "m.db")
     store = Store(path)
-    install(store)
     world = Awaiting(gate=gate)
     world.provider = provider
-    h = Harness(store, provider, world=world, trace=(lambda m: print("  · " + m)) if trace else None,
-                **({} if live else {"seeder": None}))
-    await h.start()
+    agent = GraftAgent(store, provider, tools=world.tools(), config=GraftConfig(
+        trace=(lambda m: print("  · " + m)) if trace else None, **({} if live else {"seeder": None})))
+    await agent.start()
+    tasks: list[str] = []
     transcript, follow_ups, stuck = [], 0, False
     t0 = time.perf_counter()
 
@@ -155,7 +156,9 @@ async def run(live: bool, trace: bool, gate: bool = False) -> dict:
     async def say(text):
         print(f"\nUSER: {text}")
         transcript.append(("user", text))
-        return heard(await h.user_says(text))
+        task, texts = await send(agent, text)
+        tasks.append(task.id)
+        return heard(texts)
 
     async def converse():
         # settle only at the end: with the gate, a background clone waits for the focus clone's
@@ -167,7 +170,7 @@ async def run(live: bool, trace: bool, gate: bool = False) -> dict:
         while follow_ups < MAX_FOLLOW_UPS and not world.site:
             follow_ups += 1
             replies = await say(FOLLOW_UP)
-        heard(await h.settle())
+        heard(await follow(agent, tasks))
 
     try:
         await asyncio.wait_for(converse(), WAIT_LIMIT)
@@ -187,7 +190,7 @@ async def run(live: bool, trace: bool, gate: bool = False) -> dict:
         replied = any(r["role"] == "assistant" and r["kind"] == "text" for r in store.view(tl)
                       if r["owner_timeline"] == tl)
         clones.append({"clone": tl, "skills": skills, "status": status, "join_reason": reason,
-                       "replied": replied, "tools_run": h.tools_run(tl)})
+                       "replied": replied, "tools_run": agent._host.tools_run(tl)})
     focus = [c for c in clones if "website" in c["skills"]]
     usage = provider.usage
     res = {
@@ -205,7 +208,7 @@ async def run(live: bool, trace: bool, gate: bool = False) -> dict:
         "site_written": bool(world.site), "view_violations": validate(store.view("o"), "o", require_user_end=False),
         "replies": [t for who, t in transcript if who == "assistant"], "db": path,
     }
-    await h.close()
+    await agent.close()
     return res
 
 

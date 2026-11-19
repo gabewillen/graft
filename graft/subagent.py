@@ -17,24 +17,28 @@ delegate), subagent (subagent work calls), summary (the subagent's final, tool-f
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 from dataclasses import dataclass, field
+from typing import Sequence
 
 from . import callsites, compaction
 from .db import Store
 from .providers import Provider, prefix_nonce
-from .skills import BASE_SYSTEM, CATALOG, LOAD_SKILL_TOOL, BUILTIN, World, load_skill, skill_listing
+from . import a2a
+from .skills import BASE_SYSTEM, CATALOG, LOAD_SKILL_TOOL, BUILTIN, load_skill, skill_listing
+from .tools import CallToolResult, Tool, by_name
 from .skills import obj
 
 CAPABILITIES = [s.name for s in CATALOG if s.name not in BUILTIN]
-SKILL_TOOLS = {s.name: s.tools for s in CATALOG}
+SKILL_TOOLS = {s.name: list(s.tools) for s in CATALOG}  # each capability skill's tool names
 
 DELEGATE_TOOL = {
     "name": "delegate",
     "description": ("Hand a task to a subagent that holds one skill. The subagent sees only "
                     "task_prompt, not this conversation, so include every fact it needs. It does the "
                     "work with that skill's tools and returns a summary of what it did."),
-    "input_schema": obj({"skill": {"type": "string", "enum": CAPABILITIES},
+    "inputSchema": obj({"skill": {"type": "string", "enum": CAPABILITIES},
                          "task_prompt": {"type": "string"}}, ["skill", "task_prompt"])}
 
 SUBAGENT_NOTE = ("You are a subagent. You cannot talk to the user. Complete the task with your tools "
@@ -65,9 +69,12 @@ class Delegation:
 
 @dataclass
 class SubagentRunner:
+    """The baseline arm, behind the same interface as `graft.agent.GraftAgent` (`send`, `get_task`,
+    `start`, `close`), so an experiment drives both arms the same way. Each message is one task,
+    answered within the call (no work outlives it), so `send` returns it completed."""
     store: Store  # skill catalog only (descriptions/instructions); no timelines are used
     provider: Provider
-    world: World = field(default_factory=World)
+    tools: Sequence[Tool] = ()
     persona: str = BASE_SYSTEM
     nonce: str | None = None
     max_steps: int = 10
@@ -79,6 +86,8 @@ class SubagentRunner:
     messages: list[dict] = field(default_factory=list)
     delegations: list[Delegation] = field(default_factory=list)
     out: list[str] = field(default_factory=list)
+    tasks: dict[str, a2a.Task] = field(default_factory=dict)
+    context_id: str = "subagent"
 
     def parent_system(self) -> str:
         parts = [self.persona, skill_listing(
@@ -108,8 +117,47 @@ class SubagentRunner:
         if callable(self.trace):
             self.trace(msg)
 
+    # ------------------------------------------------------------ the host interface
+    async def start(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def __aenter__(self) -> "SubagentRunner":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+    async def send(self, request: a2a.SendMessageRequest | dict) -> a2a.SendMessageResponse:
+        """SendMessage: the parent's turn on the message; its replies are the task's history."""
+        req = request if isinstance(request, a2a.SendMessageRequest) else a2a.SendMessageRequest.from_dict(request)
+        task_id = req.message.task_id or f"task-{len(self.tasks) + 1}"
+        prior = self.tasks.get(task_id)
+        if req.message.task_id is not None and prior is None:
+            raise a2a.TaskNotFound(f"task {task_id[:64]!r} not found")
+        if prior is not None:
+            raise a2a.UnsupportedOperation(f"task {task_id[:64]!r} is in a terminal state")
+        user = a2a.Message(message_id=req.message.message_id, role=a2a.ROLE_USER, parts=req.message.parts,
+                           context_id=self.context_id, task_id=task_id)
+        replies = await self._turn(req.message.text)
+        history = [user] + [a2a.Message(message_id=f"{task_id}-r{i}", role=a2a.ROLE_AGENT, parts=[a2a.Part(text=t)],
+                                        context_id=self.context_id, task_id=task_id) for i, t in enumerate(replies)]
+        task = a2a.Task(id=task_id, context_id=self.context_id,
+                        status=a2a.TaskStatus(state=a2a.COMPLETED, message=history[-1] if replies else None),
+                        history=history)
+        self.tasks[task_id] = task
+        return a2a.SendMessageResponse(task=task)
+
+    def get_task(self, request: a2a.GetTaskRequest | dict) -> a2a.Task:
+        req = request if isinstance(request, a2a.GetTaskRequest) else a2a.GetTaskRequest.from_dict(request)
+        if req.id not in self.tasks:
+            raise a2a.TaskNotFound(f"task {req.id[:64]!r} not found")
+        return self.tasks[req.id]
+
     # ------------------------------------------------------------ parent
-    async def user_says(self, text: str) -> list[str]:
+    async def _turn(self, text: str) -> list[str]:
         start = len(self.out)
         self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
         self.messages = self._maybe_compact("parent", self.parent_system(), self.messages)
@@ -136,6 +184,21 @@ class SubagentRunner:
             self.messages.append({"role": "user", "content": results})
         return self.out[start:]
 
+    def _call(self, name: str, args: dict) -> tuple[str, bool]:
+        """A host tool, called synchronously (this baseline runs no tool concurrently); an async
+        tool's awaitable is closed and refused."""
+        try:
+            outcome = by_name(list(self.tools))[name].fn(args)
+        except Exception as e:  # noqa: BLE001 - it ran, with an error
+            return f"raised {type(e).__name__}: {str(e)[:200]}; it may have acted", True
+        if inspect.isawaitable(outcome):
+            getattr(outcome, "close", lambda: None)()
+            return "async tools are not supported by the subagent baseline", True
+        result = CallToolResult.from_value(outcome)
+        if result is None:
+            return f"returned a {type(outcome).__name__}, not a tool result", True
+        return result.text(), result.is_error
+
     def _maybe_compact(self, who: str, system: str, msgs: list[dict]) -> list[dict]:
         if len(msgs) < 2 or not compaction.needs_compaction(msgs, self.compact_tokens):
             return msgs
@@ -161,7 +224,7 @@ class SubagentRunner:
         if skill not in CAPABILITIES:
             d.summary = f"error: unknown skill '{skill}'"
             return d
-        tools = [LOAD_SKILL_TOOL] + SKILL_TOOLS[skill]
+        tools = [LOAD_SKILL_TOOL] + [by_name(list(self.tools))[n].definition() for n in SKILL_TOOLS[skill]]
         d.system, d.tools = self.subagent_system(skill), tools
         allowed = {t["name"] for t in tools}
         msgs = [{"role": "user", "content": [{"type": "text", "text": task_prompt}]}]
@@ -187,7 +250,7 @@ class SubagentRunner:
                     d.loaded.append(str(u["input"].get("name", "")))
                     content, err = load_skill(self.store, {skill}, str(u["input"].get("name", "")))
                 else:
-                    content, err = self.world.execute(u["name"], u["input"])
+                    content, err = self._call(u["name"], u["input"])
                     self._log(f"  [sub {skill}] {u['name']}({json.dumps(u['input'])[:120]}) -> {content[:80]}")
                 results.append({"type": "tool_result", "tool_use_id": u["id"], "content": content, "is_error": err})
             msgs.append({"role": "user", "content": results})

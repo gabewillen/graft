@@ -18,7 +18,7 @@ every function that writes model-facing text (PRODUCERS) are scanned, and each p
 to be scanned by a mutation of its own text that the check catches."""
 
 import ast
-from _util import ran, started, woke
+from _util import ran, started, woke, conversation, chat_of, install_fake
 import asyncio
 import inspect
 import json
@@ -31,7 +31,7 @@ import pytest
 from graft.db import Store
 from graft.harness import (CANCELLED_BY_THE_TOOL, CANCELLED_WHILE_RUNNING, FAILED_AFTER_INVOKED,
                            NOT_RUN_BESIDE_CLONE, NOT_RUN_INTERRUPTED, NOT_RUN_JOINING, WITHDRAWN_SEED,
-                           Harness)
+                           Host)
 from graft.providers import FakeProvider
 from graft import seeder as seeder_mod
 from graft.skills import BACKGROUND_INSTRUCTIONS, BUILTIN, CATALOG, CLONE_INSTRUCTIONS, JOIN_INSTRUCTIONS, \
@@ -112,9 +112,9 @@ def last_block(messages):
 
 def make(tmp_path, policy, name, **kw):
     store = Store(str(tmp_path / f"{name}.db"))
-    install(store)
+    install_fake(store)
     rec = Recorder(policy)
-    h = Harness(store=store, provider=FakeProvider(policy=rec), seeder=None, **kw)
+    h = conversation(store, rec, seeder=None, **kw).h
     return store, h, rec
 
 
@@ -128,15 +128,15 @@ def test_the_built_in_skills_and_tools_say_branch_and_merge():
     names = {s.name for s in CATALOG}
     assert {"fork", "merge", "detached"} <= names and not {"clone", "join"} & names
     assert set(BUILTIN) == {"fork", "merge", "detached"}
-    tools = {t["name"] for s in CATALOG for t in s.tools}
+    tools = {t["name"] for s in CATALOG for t in s.tools if isinstance(t, dict)}
     assert {"fork", "merge", "stop", "load_skill"} <= tools and not {"clone", "join"} & tools
-    branch_tool = next(t for s in CATALOG for t in s.tools if t["name"] == "fork")
-    assert set(branch_tool["input_schema"]["properties"]) == {"current", "detached"}
-    merge_tool = next(t for s in CATALOG for t in s.tools if t["name"] == "merge")
-    assert set(merge_tool["input_schema"]["properties"]) == {"reason"} and merge_tool["input_schema"]["required"] == []
-    assert merge_tool["input_schema"]["properties"]["reason"]["type"] == "string"  # its own words: no enum
-    assert "enum" not in merge_tool["input_schema"]["properties"]["reason"]
-    assert set(branch_tool["input_schema"]["properties"]["current"]["properties"]) == {"id", "skills", "messages", "reason"}
+    branch_tool = next(t for s in CATALOG for t in s.tools if isinstance(t, dict) and t["name"] == "fork")
+    assert set(branch_tool["inputSchema"]["properties"]) == {"current", "detached"}
+    merge_tool = next(t for s in CATALOG for t in s.tools if isinstance(t, dict) and t["name"] == "merge")
+    assert set(merge_tool["inputSchema"]["properties"]) == {"reason"} and merge_tool["inputSchema"]["required"] == []
+    assert merge_tool["inputSchema"]["properties"]["reason"]["type"] == "string"  # its own words: no enum
+    assert "enum" not in merge_tool["inputSchema"]["properties"]["reason"]
+    assert set(branch_tool["inputSchema"]["properties"]["current"]["properties"]) == {"id", "skills", "messages", "reason"}
     # the first-person framing: a branch is you, and what you did there is your memory
     focus, background, original = (" ".join(t.split()) for t in (JOIN_INSTRUCTIONS, BACKGROUND_INSTRUCTIONS,
                                                                    CLONE_INSTRUCTIONS))
@@ -226,10 +226,10 @@ def test_background_parts_cancel_and_refusals_say_branch_and_merge(tmp_path):
     store, h, rec = make(tmp_path=tmp_path, policy=policy, name="a")
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
-        await h.user_says("Stop the slides.")
-        await h.settle()
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
+        await chat_of(h).say("Stop the slides.")
+        await chat_of(h).quiet()
         slides_gate.set()
         await h.close()
 
@@ -273,12 +273,12 @@ def test_focus_merges_hand_back_and_failure_say_branch_and_merge(tmp_path):
     store, h, rec = make(tmp_path=tmp_path, policy=policy, name="b")
 
     async def go():
-        await h.start()
-        await h.user_says("Build me a website.")
-        await h.user_says("Blue. Also send an email to Bob.")
-        await h.user_says("Book a room.")
-        await h.user_says("Make slides.")
-        await h.settle()
+        await chat_of(h).start()
+        await chat_of(h).say("Build me a website.")
+        await chat_of(h).say("Blue. Also send an email to Bob.")
+        await chat_of(h).say("Book a room.")
+        await chat_of(h).say("Make slides.")
+        await chat_of(h).quiet()
         await h.close()
 
     asyncio.run(go())
@@ -295,7 +295,7 @@ def test_a_merge_too_large_for_the_context_says_branch(tmp_path):
     store, h, rec = make(tmp_path=tmp_path, policy=lambda **_: text(t="Reporting."), name="e", window_tokens=120)
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
         store.add_turn(tl="o", role="assistant", kind="text", content="Started.")
         (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork",
@@ -331,8 +331,8 @@ def test_the_old_tool_names_run_nothing(tmp_path):
     store, h, rec = make(tmp_path=tmp_path, policy=policy, name="f")
 
     async def go():
-        await h.start()
-        await h.user_says("Build me a website.")
+        await chat_of(h).start()
+        await chat_of(h).say("Build me a website.")
         await h.close()
 
     asyncio.run(go())
@@ -344,7 +344,7 @@ def test_the_old_tool_names_run_nothing(tmp_path):
     # `join` did not end it: its turn ended on its reply, and the harness merged it
     assert store.timeline("c1")["join_reason"] == "done"
     assert [r["tool_name"] for r in store.view("c1")][-2:] == ["merge", "merge"]
-    assert h.world.log == []
+    assert chat_of(h).world.log == []
     echoes = {"tool 'clone' is not available to you", "tool 'join' is not available to you"}  # the model's own words
     check([(w, t) for w, t in rec.seen + store_texts(store) if t not in echoes])
 
@@ -367,7 +367,7 @@ def test_a_merge_whose_view_would_be_invalid_says_branch(tmp_path, monkeypatch):
     store, h, rec = make(tmp_path=tmp_path, policy=lambda **_: text(t="Reporting."), name="g")
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
         store.add_turn(tl="o", role="assistant", kind="text", content="Started.")
         (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork",
@@ -395,11 +395,11 @@ from graft import compaction as compaction_mod, db as db_mod, harness as harness
 # added here, not missed.
 PRODUCERS = {
     harness_mod: ["merge_result", "SKIPPED_NOTE", "MERGED", "check_skill_link", "clone_entries", "_strings", "_messages", "cancel_ids",
-                  "fork_result", "Harness.resolve_messages", "Harness.message_index", "ENTRY_SHAPE",
-                  "Harness.cancel_text", "Harness.system", "Harness.load", "Harness._names", "Harness._running_note",
-                  "Harness.merge_call", "Harness.fit_join", "Harness.default_join",
-                  "Harness.task_of", "Harness._stop_call", "_entry", "NOT_A_DRAWN_ID", "NO_FREE_ID", "Harness.prepare_clone", "Harness.refuse_clone",
-                  "Harness._prepare_clone", "Harness._loop", "Harness._missing_results",
+                  "fork_result", "Host.resolve_messages", "Host.message_index", "ENTRY_SHAPE",
+                  "Host.cancel_text", "Host.system", "Host.load", "Host._names", "Host._running_note",
+                  "Host.merge_call", "Host.fit_join", "Host.default_join",
+                  "Host.task_of", "Host._stop_call", "_entry", "NOT_A_DRAWN_ID", "NO_FREE_ID", "Host.prepare_clone", "Host.refuse_clone",
+                  "Host._prepare_clone", "Host._loop", "Host._missing_results",
                   "NOT_RUN_INTERRUPTED", "NOT_RUN_JOINING", "NOT_RUN_BESIDE_CLONE", "CANCELLED_WHILE_RUNNING",
                   "CANCELLED_BY_THE_TOOL", "FAILED_AFTER_INVOKED", "WITHDRAWN_SEED"],
     machine_mod: ["clone_refusal", "decline_why", "clone_why", "cancel_refusal", "_cancel_rows", "refuse_clone_call",
@@ -502,7 +502,7 @@ def test_the_merge_result_of_a_branch_that_wrote_nothing_and_plural_stops_say_br
     store, h, rec = make(tmp_path=tmp_path, policy=lambda **_: text(t="Reporting."), name="h")
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         store.add_turn(tl="o", role="user", kind="text", content=REQUEST)
         store.add_turn(tl="o", role="assistant", kind="text", content="Started.")
         (c1,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork",

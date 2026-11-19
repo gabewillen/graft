@@ -40,7 +40,7 @@ from scenarios import SCENARIOS, RunContext, Scenario, fact_survival  # noqa: E4
 from graft import cachestats, callsites  # noqa: E402
 from graft.db import Store  # noqa: E402
 from graft.fake import bench_graft_policy, bench_subagent_policy  # noqa: E402
-from graft.harness import Harness  # noqa: E402
+from graft.agent import GraftAgent, GraftConfig  # noqa: E402
 from graft.providers import FakeProvider, add_usage, empty_usage, make_provider  # noqa: E402
 from graft.sim import run_script  # noqa: E402
 from graft.skills import install  # noqa: E402
@@ -84,17 +84,16 @@ async def run_one(sc: Scenario, arm: str, i: int, fake: bool, compact: int | Non
             store_path = os.path.join(tempfile.mkdtemp(prefix=f"bench-{sc.name}-"), "m.db")
             rec["store"] = store_path  # kept on disk for post-hoc diagnosis
             store = Store(store_path)
-            install(store)
-            agent = Harness(store, provider, world=world, nonce=nonce, compact_tokens=compact,
-                            compaction_mode=compaction_mode)
+            agent = GraftAgent(store, provider, tools=world.tools(), config=GraftConfig(
+                nonce=nonce, compact_tokens=compact, compaction_mode=compaction_mode))
             await agent.start()
-            transcript = await run_script(agent, sc.script, echo=False)
+            transcript = await run_script(agent, sc.script, echo=False, world=world)
         else:
             store = Store(":memory:")
-            install(store)
-            agent = SubagentRunner(store, provider, world=world, nonce=nonce, compact_tokens=compact,
+            install(store, tools=world.definitions())
+            agent = SubagentRunner(store, provider, tools=world.tools(), nonce=nonce, compact_tokens=compact,
                                    batched=arm == "subagent_batched")
-            transcript = await run_script(agent, sc.script, echo=False)
+            transcript = await run_script(agent, sc.script, echo=False, world=world)
         rec["error"] = None
     except Exception as e:  # a crashed run is a failed run; keep going
         rec["error"] = f"{type(e).__name__}: {e}"
@@ -127,7 +126,8 @@ async def run_one(sc: Scenario, arm: str, i: int, fake: bool, compact: int | Non
             else role_cost.get(role, 0.0) + cc
     rec["call_sites"], rec["role_cost"] = dict(sites), role_cost
     # seed actor (graft/seeder.py): its own role, priced per model; not part of the OpenAI usage
-    slog = list(getattr(agent, "seeder_log", []) or []) if agent is not None else []
+    records = getattr(agent, "_host", agent)  # the graft arm's diagnostic records are its host's
+    slog = list(getattr(records, "seeder_log", []) or []) if agent is not None else []
     if slog:
         su = empty_usage()
         su.update(calls=sum(x.get("requests") or 0 for x in slog),
@@ -160,21 +160,21 @@ async def run_one(sc: Scenario, arm: str, i: int, fake: bool, compact: int | Non
         rec["context_out"] = sum(roles.get(k, {}).get("output", 0) for k in ("handoff/clone-tx", "summary"))
     else:
         rec["handoffs"], rec["context_out"] = 0, 0
-    rec["compactions"] = len(getattr(agent, "compactions", []) or [])
-    log = list(getattr(agent, "compaction_log", []) or [])
+    rec["compactions"] = len(getattr(records, "compactions", []) or [])
+    log = list(getattr(records, "compaction_log", []) or [])
     rec["compaction"] = {
         "ratios": [e["before_tokens"] / max(1, e["after_tokens"]) for e in log],
         "before": [e["before_tokens"] for e in log], "after": [e["after_tokens"] for e in log],
         "kept": [len(e.get("kept_ids", [])) for e in log],
         "compressed_msgs": [len(e.get("windows", [])) if "windows" in e else 1 for e in log],
-        "failures": len(getattr(agent, "compaction_failures", []) or []),
+        "failures": len(getattr(records, "compaction_failures", []) or []),
         "output_tokens": [e.get("output_tokens", 0) for e in log],
         "calls": [e.get("calls", 0) for e in log],
         "kept_head": [e.get("kept_head") for e in log if "kept_head" in e],
         "prefix_rows": [len(e.get("prefix", [])) for e in log],
         "after_cached": [e["first_call_after"]["cached"] for e in log if e.get("first_call_after")],
         "after_input": [e["first_call_after"]["input"] for e in log if e.get("first_call_after")],
-        "failed_output_tokens": sum(f["output_tokens"] for f in getattr(agent, "compaction_failure_calls", []) or [])}
+        "failed_output_tokens": sum(f["output_tokens"] for f in getattr(records, "compaction_failure_calls", []) or [])}
     if sc.survival_facts:
         rec["fact_survival"] = fact_survival(log, sc.survival_facts)
     rec["transcript"] = transcript

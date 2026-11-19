@@ -4,16 +4,16 @@ import asyncio
 from types import SimpleNamespace as NS
 
 from graft import cachestats
+from _util import chat_of, conversation, install_fake
 from graft.db import Store
-from graft.fake import pivot_policy
-from graft.harness import Harness
+from graft.fake import FakeWorld, pivot_policy
+from graft.harness import Host
 from graft.providers import (AnthropicProvider, FakeProvider, OpenAIProvider, _accepts, prefix_nonce,
                                prompt_cache_key)
 from graft.sim import run_script
-from graft.skills import install
 
-TOOLS = [{"name": "b_tool", "description": "b", "input_schema": {"type": "object", "properties": {}}},
-         {"name": "a_tool", "description": "a", "input_schema": {"type": "object", "properties": {}}}]
+TOOLS = [{"name": "b_tool", "description": "b", "inputSchema": {"type": "object", "properties": {}}},
+         {"name": "a_tool", "description": "a", "inputSchema": {"type": "object", "properties": {}}}]
 MSGS = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
 
 
@@ -102,13 +102,13 @@ def test_prefix_nonce_copies_and_prefixes_first_message_only():
 
 def test_harness_applies_nonce_and_tags_roles(tmp_path):
     store = Store(str(tmp_path / "c.db"))
-    install(store)
+    install_fake(store)
     fp = FakeProvider(pivot_policy)
-    h = Harness(store, fp, nonce="run123")
+    h = conversation(store, provider=fp, nonce="run123").h
 
     async def go():
-        await h.start()
-        await run_script(h, ["I need a website.", "It is for dentists in Ohio.",
+        await chat_of(h).start()
+        await run_script(chat_of(h).agent, ["I need a website.", "It is for dentists in Ohio.",
                              "Instead let's build a slide show."], echo=False)
 
     asyncio.run(go())
@@ -145,16 +145,17 @@ def test_subagent_baseline_isolates_subagent_and_tags_roles():
     from graft.subagent import DELEGATE_TOOL, SubagentRunner
 
     store = Store(":memory:")
-    install(store)
+    install_fake(store)
     fp = FakeProvider(subagent_policy)
-    r = SubagentRunner(store, fp, nonce="n1")
+    world = FakeWorld()
+    r = SubagentRunner(store, fp, tools=world.tools(), nonce="n1")
 
     async def go():
         await run_script(r, ["It is for dentists in Ohio.", "Formal tone.", "Let's build a slide show."],
                          echo=False)
 
     asyncio.run(go())
-    assert [d.skill for d in r.delegations] == ["slides"] and r.world.decks
+    assert [d.skill for d in r.delegations] == ["slides"] and world.decks
     d = r.delegations[0]
     sub_calls = [c for c in fp.calls if c["tools"] != [DELEGATE_TOOL]]
     # the subagent sees only the parent-written prompt (plus its own tool loop), never the user turns

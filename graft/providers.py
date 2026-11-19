@@ -256,7 +256,7 @@ class AnthropicProvider(UsageMixin):
 
     @staticmethod
     def wire_tools(tools: list[dict]) -> list[dict]:
-        return [{"name": t["name"], "description": t["description"], "input_schema": t["input_schema"]}
+        return [{"name": t["name"], "description": t["description"], "input_schema": t["inputSchema"]}
                 for t in tools]
 
     @classmethod
@@ -351,7 +351,7 @@ class OpenAIProvider(UsageMixin):
     @staticmethod
     def wire_tools_responses(tools: list[dict]) -> list[dict]:
         return [{"type": "function", "name": t["name"], "description": t["description"],
-                 "parameters": t["input_schema"]} for t in tools]
+                 "parameters": t["inputSchema"]} for t in tools]
 
     def count_prefix_tokens(self, system, tools):
         """Exact counts via the Responses input-token counting endpoint (differences against a
@@ -456,7 +456,7 @@ class OpenAIProvider(UsageMixin):
         kwargs: dict = self._cache_kwargs(system, tools)
         if tools:
             kwargs["tools"] = [{"type": "function", "function": {
-                "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
+                "name": t["name"], "description": t["description"], "parameters": t["inputSchema"]}}
                 for t in tools]
         if model.startswith(("gpt-5.", "gpt-6")):
             kwargs["reasoning_effort"] = "none"  # no extended thinking; required for tools here

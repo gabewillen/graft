@@ -42,10 +42,11 @@ from replay import loader, sandbox, secret_filter, worktree  # noqa: E402
 
 from graft import cachestats, callsites  # noqa: E402
 from graft.db import Skill, Store, render  # noqa: E402
-from graft.harness import Harness  # noqa: E402
+from graft.harness import Host  # noqa: E402
+from graft.tools import CallToolResult, Tool  # noqa: E402
 from graft.providers import OpenAIProvider, add_usage, empty_usage  # noqa: E402
 from graft.seeder import JevSeeder  # noqa: E402
-from graft.skills import BASE_SYSTEM, World, install  # noqa: E402
+from graft.skills import BASE_SYSTEM, BUILTIN, CATALOG  # noqa: E402
 
 MODEL = "gpt-6-luna"
 PRICING = cachestats.Pricing.from_env()
@@ -163,25 +164,26 @@ async def arm_s(e, sb: sandbox.Sandbox, max_steps: int) -> dict:
             "usage": dict(p.usage), "by_model": {m: u for m, u in p.by_model.items() if u["calls"]}}
 
 
-class SandboxWorld(World):
-    def __init__(self, sb: sandbox.Sandbox):
-        super().__init__()
-        self.sb = sb
-
-    def execute(self, name, args):
-        if name in {t["name"] for t in self.sb.tools()}:
-            return self.sb.execute(name, args)
-        return super().execute(name, args)
+def sandbox_tools(sb: sandbox.Sandbox) -> list[Tool]:
+    """The sandbox's tools as host tools: each runs in the sandbox, its (text, is_error) a result."""
+    def run(name):
+        def fn(args):
+            text, err = sb.execute(name, args)
+            return CallToolResult(content=[{"type": "text", "text": text}], is_error=err)
+        return fn
+    return [Tool(name=t["name"], description=t["description"], input_schema=t["inputSchema"], fn=run(t["name"]))
+            for t in sb.tools()]
 
 
 async def arm_g(e, sb: sandbox.Sandbox, max_steps: int, workdir: str) -> dict:
     p = OpenAIProvider(MODEL)
     store = Store(os.path.join(workdir, f"g-{e.agent_id[:14]}-{uuid.uuid4().hex[:6]}.db"))
-    install(store)
+    for builtin in [s for s in CATALOG if s.name in BUILTIN]:  # graft's own skills (fork, merge, detached)
+        store.add_skill(builtin)
     skill = EDIT_SKILL if sb.writable else CODE_SKILL
     store.add_skill(skill)
-    h = Harness(store, p, world=SandboxWorld(sb), max_steps=max_steps, nonce=uuid.uuid4().hex[:12],
-                seeder=JevSeeder())
+    h = Host(store, p, tools=sandbox_tools(sb), max_steps=max_steps, nonce=uuid.uuid4().hex[:12],
+             seeder=JevSeeder())
     await h.start()
     rows = [store.add_turn(tl="o", role=t.role, kind="text", content=t.text) for t in e.parent_prefix]
     rows.append(store.add_turn(tl="o", role="user", kind="text", content=subtask_text(e)))

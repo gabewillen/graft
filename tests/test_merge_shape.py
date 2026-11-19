@@ -7,11 +7,10 @@ import asyncio
 import json
 import threading
 
-from _util import holder, ran
+from _util import holder, ran, conversation, chat_of, install_fake
 from graft.db import Store, validate
-from graft.harness import Harness
+from graft.harness import Host
 from graft.providers import FakeProvider
-from graft.skills import install
 
 REQUEST = "Build the practice a website and a slide deck."
 
@@ -26,9 +25,9 @@ def fork_use(use_id="f1", **inp):
 
 def make(tmp_path, policy, **kw):
     store = Store(str(tmp_path / "merge.db"))
-    install(store)
-    said = []
-    h = Harness(store, FakeProvider(policy), seeder=None, emit=said.append, **kw)
+    install_fake(store)
+    h = conversation(store, policy, seeder=None, **kw).h
+    said = chat_of(h)
     return store, h, said
 
 
@@ -67,10 +66,10 @@ def run(h, *says):
     out = []
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         for s in says:
-            out.append(await h.user_says(s))
-        await h.settle()
+            out.append(await chat_of(h).say(s))
+        await chat_of(h).quiet()
         await h.close()
 
     asyncio.run(go())
@@ -151,7 +150,7 @@ def test_calls_beside_a_merge_are_not_run_and_stay_in_the_branch(tmp_path):
     script = Script(entry=SITE, branch=branch)
     store, h, said = make(tmp_path, script)
     run(h, REQUEST)
-    assert h.world.site == {}
+    assert chat_of(h).world.site == {}
     mine = [(r["kind"], r["tool_name"]) for r in store.view("o") if r["owner_timeline"] == "c1"]
     assert mine == [("text", None), ("tool_use", "merge")]  # the sibling call is not pointed at
     assert validate(store.view("o"), "o") == []
@@ -169,12 +168,12 @@ def test_a_detached_branch_merges_and_main_is_told_the_user_has_not_seen_it(tmp_
     store, h, said = make(tmp_path, script)
 
     async def go():
-        await h.start()
-        first = await h.user_says(REQUEST)
+        await chat_of(h).start()
+        first = await chat_of(h).say(REQUEST)
         assert first == ["Started."]
         gate.set()
         await h.join_queued("c1")
-        assert await h.settle() == ["I built the deck."]
+        assert await chat_of(h).quiet() == ["I built the deck."]
         await h.close()
 
     asyncio.run(go())
@@ -196,8 +195,8 @@ def test_a_malformed_or_oversized_merge_call_still_ends_the_turn_but_main_reads_
         script = Script(entry=SITE, branch=branch)
         (tmp_path / f"b{len(json.dumps(bad))}").mkdir()
         store = Store(str(tmp_path / f"b{len(json.dumps(bad))}" / "m.db"))
-        install(store)
-        h = Harness(store, FakeProvider(script), seeder=None)
+        install_fake(store)
+        h = conversation(store, script, seeder=None).h
         run(h, REQUEST)
         refusal = [json.loads(r["content"]) for r in store.view("c1") if r["kind"] == "tool_result"
                    and r["tool_name"] == "merge" and not r["harness"]][0]
@@ -254,4 +253,4 @@ def test_the_schema_bounds_match_the_harness_bounds():
     from graft.harness import MAX_MESSAGES, REASON_CHARS
     from graft.skills import JOIN_TOOL, MESSAGES, REASON
     assert MESSAGES["maxItems"] == MAX_MESSAGES
-    assert REASON["maxLength"] == REASON_CHARS == JOIN_TOOL["input_schema"]["properties"]["reason"]["maxLength"]
+    assert REASON["maxLength"] == REASON_CHARS == JOIN_TOOL["inputSchema"]["properties"]["reason"]["maxLength"]

@@ -7,6 +7,8 @@ import sys
 
 import pytest
 
+from _util import conversation, chat_of, install_fake
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "experiments"))
 
 import bench  # noqa: E402
@@ -14,11 +16,11 @@ from scenarios import SCENARIOS, RunContext, score_failure, score_long, score_mu
 
 from graft import compaction  # noqa: E402
 from graft.db import Store  # noqa: E402
-from graft.fake import bench_graft_policy, bench_subagent_policy  # noqa: E402
-from graft.harness import Harness  # noqa: E402
+from graft.fake import FakeWorld, bench_graft_policy, bench_subagent_policy  # noqa: E402
+from graft.harness import Host  # noqa: E402
 from graft.providers import FakeProvider  # noqa: E402
 from graft.sim import run_script  # noqa: E402
-from graft.skills import World, install  # noqa: E402
+from graft.skills import install  # noqa: E402
 from graft.subagent import SubagentRunner  # noqa: E402
 
 
@@ -39,7 +41,7 @@ def _ctx(world, texts=(), arm="subagent"):
 
 
 def test_revisions_scorer():
-    w = World()
+    w = FakeWorld()
     w.decks.append({"title": "Riverside Library Book Fair", "audience": "Families with young children",
                     "tone": "Warm and professional", "slides": [
                         {"title": "Welcome To The Book Fair", "bullets": ["a", "b", "c"]},
@@ -54,16 +56,16 @@ def test_revisions_scorer():
 
 
 def test_failure_scorer_honesty():
-    w = World(failures={"calendar_book": "ERROR"})
+    w = FakeWorld(failures={"calendar_book": "ERROR"})
     w.execute("calendar_book", {"date": "2026-11-10", "time": "14:00", "what": "x"})
     assert not w.calendar
     assert score_failure(_ctx(w, ["Sorry, the calendar service is unavailable, so I could not book it."]))[0]
     assert not score_failure(_ctx(w, ["Your cleaning is booked for 2026-11-10 at 14:00."]))[0]
-    assert not score_failure(_ctx(World(), ["I could not book it."]))[0]  # never attempted
+    assert not score_failure(_ctx(FakeWorld(), ["I could not book it."]))[0]  # never attempted
 
 
 def test_long_and_multi_scorers():
-    w = World()
+    w = FakeWorld()
     w.decks.append({"title": "Harbor Light Dental", "audience": "Families in Duluth", "tone": "formal",
                     "slides": [{"title": "Our Dentists", "bullets": ["Dr. Amara Okafor", "Dr. Lena Brandt",
                                                                      "Call 218-555-0143"]},
@@ -71,17 +73,17 @@ def test_long_and_multi_scorers():
     ok, checks, diag = score_long(_ctx(w))
     assert ok, checks
     assert diag["diag_facts"]["families"] and not diag["diag_facts"]["tagline"]
-    w2 = World()
+    w2 = FakeWorld()
     w2.execute("calendar_book", {"date": "2026-11-12", "time": "09:30", "what": "cleaning"})
     w2.decks.append({"title": "Open House", "audience": "local seniors", "tone": "formal",
                      "slides": [{"title": "Cleanings and Implants", "bullets": ["a", "b", "c"]}]})
     assert score_multi(_ctx(w2))[0]
-    assert not score_multi(_ctx(World()))[0]
+    assert not score_multi(_ctx(FakeWorld()))[0]
 
 
 def test_subagent_compaction_replaces_parent_messages():
     store = Store(":memory:")
-    install(store)
+    install_fake(store)
     fp = FakeProvider(bench_subagent_policy)
     r = SubagentRunner(store, fp, compact_tokens=30)
 
@@ -115,9 +117,9 @@ def test_welch_matches_known_values():
 # ------------------------------------------------------------------ graft compaction (turns)
 def _compacting_harness(tmp_path, policy=None, mode="turns", threshold=80):
     store = Store(str(tmp_path / "c.db"))
-    install(store)
+    install_fake(store)
     fp = FakeProvider(policy or bench_graft_policy)
-    return store, fp, Harness(store, fp, compact_tokens=threshold, compaction_mode=mode)
+    return store, fp, conversation(store, provider=fp, compact_tokens=threshold, compaction_mode=mode).h
 
 
 LONG_SCRIPT = ["I need a website for my dental practice.",
@@ -129,8 +131,8 @@ def test_turns_compaction_keeps_user_rows_and_compresses_windows(tmp_path):
     store, fp, h = _compacting_harness(tmp_path)
 
     async def go():
-        await h.start()
-        await run_script(h, LONG_SCRIPT, echo=False)
+        await chat_of(h).start()
+        await run_script(chat_of(h).agent, LONG_SCRIPT, echo=False)
         await h.machines.stop()
 
     asyncio.run(go())
@@ -200,8 +202,8 @@ def test_invalid_compaction_gets_one_retry_then_gives_up(tmp_path):
     store, fp, h = _compacting_harness(tmp_path, policy)
 
     async def go():
-        await h.start()
-        await run_script(h, LONG_SCRIPT[:2], echo=False)
+        await chat_of(h).start()
+        await run_script(chat_of(h).agent, LONG_SCRIPT[:2], echo=False)
         await h.machines.stop()
 
     asyncio.run(go())
@@ -212,7 +214,7 @@ def test_invalid_compaction_gets_one_retry_then_gives_up(tmp_path):
 def test_turn_structure_validated_after_partition(tmp_path):
     """A partition that leaves a tool_use without its tool_result is refused by the validator."""
     store = Store(str(tmp_path / "v.db"))
-    install(store)
+    install_fake(store)
     store.create_timeline(tl="o", source=None, skills=["fork"])
     u = store.add_turn("o", "user", "text", "hi")
     tu = store.add_turn("o", "assistant", "tool_use", {"id": "x", "input": {}}, "load_skill")
@@ -231,8 +233,8 @@ def test_summary_mode_is_one_user_row_over_the_whole_prefix(tmp_path):
     store, fp, h = _compacting_harness(tmp_path, mode="summary")
 
     async def go():
-        await h.start()
-        await run_script(h, LONG_SCRIPT, echo=False)
+        await chat_of(h).start()
+        await run_script(chat_of(h).agent, LONG_SCRIPT, echo=False)
         await h.machines.stop()
 
     asyncio.run(go())
@@ -246,7 +248,7 @@ def test_summary_mode_is_one_user_row_over_the_whole_prefix(tmp_path):
 
 def test_working_view_follows_latest_compaction(tmp_path):
     s = Store(str(tmp_path / "w.db"))
-    install(s)
+    install_fake(s)
     s.create_timeline(tl="o", source=None, skills=["fork"])
     a = s.add_turn("o", "user", "text", "old 1")
     b = s.add_turn("o", "assistant", "text", "old 2")
@@ -290,8 +292,8 @@ def test_compaction_over_budget_is_refused(tmp_path):
     store, fp, h = _compacting_harness(tmp_path, keep_all)
 
     async def go():
-        await h.start()
-        await run_script(h, LONG_SCRIPT, echo=False)
+        await chat_of(h).start()
+        await run_script(chat_of(h).agent, LONG_SCRIPT, echo=False)
         await h.machines.stop()
 
     asyncio.run(go())
@@ -308,8 +310,8 @@ def test_compaction_metrics_logged(tmp_path):
     store, fp, h = _compacting_harness(tmp_path)
 
     async def go():
-        await h.start()
-        await run_script(h, LONG_SCRIPT, echo=False)
+        await chat_of(h).start()
+        await run_script(chat_of(h).agent, LONG_SCRIPT, echo=False)
         await h.machines.stop()
 
     asyncio.run(go())
@@ -329,7 +331,7 @@ def test_op_discriminator_disambiguates_filled_fields():
     assert not probs and rows[0]["row_id"] == 1 and rows[1]["window"] == (2, 2)
     _, probs = compaction.partition(prefix, [{"op": "drop", "row_id": 1}, {"op": "keep", "row_id": 2}])
     assert probs and "op" in probs[0]
-    schema = compaction.COMPACT_TOOL["input_schema"]["properties"]["items"]["items"]["anyOf"]
+    schema = compaction.COMPACT_TOOL["inputSchema"]["properties"]["items"]["items"]["anyOf"]
     assert [s["properties"]["op"]["enum"] for s in schema] == [["keep"], ["compress"]]
 
 
@@ -338,8 +340,8 @@ def test_second_compaction_keeping_an_earlier_compressed_row(tmp_path):
     store, fp, h = _compacting_harness(tmp_path, threshold=200)
 
     async def go():
-        await h.start()
-        await run_script(h, LONG_SCRIPT + ["Our tagline is 'Bright smiles on the lake', and keep the tone formal.",
+        await chat_of(h).start()
+        await run_script(chat_of(h).agent, LONG_SCRIPT + ["Our tagline is 'Bright smiles on the lake', and keep the tone formal.",
                                            "The audience is families in the Duluth area; parking is on Lake Avenue."],
                          echo=False)
         await h.machines.stop()

@@ -262,6 +262,7 @@ class Request:
     text: str
     reply: asyncio.Future
     row: int | None = None
+    task: str | None = None  # the host's task this request belongs to (spec: Host Interface)
 
 
 class GraftPlan(NamedTuple):
@@ -273,7 +274,7 @@ class GraftPlan(NamedTuple):
     focus: bool
     waiters: list["Waiter"]
     answering: "Request | None"
-    made_for: "Request | None"
+    made_for: "tuple[Request, ...]"
 
 
 @dataclass
@@ -338,7 +339,8 @@ class Host(Protocol):
     """What the machines need from the harness: I/O only, always called from an activity (or the
     scribe's), always by keyword. Whatever the host needs to know about a timeline (its kind, the
     grafts still running) comes in the call: the host never reads a machine."""
-    def run_busy(self, tl: str, kind: str, woken: list[tuple[str, str]] | None = None) -> Any: ...
+    def run_busy(self, tl: str, kind: str, woken: list[tuple[str, str]] | None = None,
+                 tasks: tuple[str, ...] = ()) -> Any: ...
     def run_background(self, tl: str) -> Any: ...
     def mirror(self, tl: str, status: str) -> None: ...
     def report(self, kind: str, src: str | None, clones: list[str], error: BaseException, quiet: bool,
@@ -368,7 +370,7 @@ class Host(Protocol):
 class TimelineSM(hsm.Instance):
     def __init__(self, machines: "Machines", timeline_id: str, source_id: str | None, kind: str,
                  held: bool = False, waiters: list[Waiter] | None = None,
-                 answering: Request | None = None, made_for: Request | None = None,
+                 answering: Request | None = None, made_for: tuple[Request, ...] = (),
                  withdrawn: set[int] | None = None):
         super().__init__()
         self.machines = machines
@@ -403,10 +405,10 @@ class TimelineSM(hsm.Instance):
         # A background graft: the request the run that made it answers. If that request is
         # withdrawn (by its caller: not answered), the graft stops at its next step and joins
         # `cancelled`; it never starts if it was withdrawn before the graft was made.
-        self.made_for: Request | None = made_for
+        self.made_for: tuple[Request, ...] = tuple(made_for)
         # The original: each background graft made for a request -> that request, until the
         # graft's join is applied. A join of a graft made for a withdrawn request wakes nothing.
-        self.graft_requests: dict[str, Request] = {}
+        self.graft_requests: dict[str, tuple[Request, ...]] = {}
         self.focus: str | None = None
         self.closing = False  # nothing is woken from now on
         self.final = False  # shut down: once nothing is left to apply, close
@@ -483,22 +485,35 @@ class TimelineSM(hsm.Instance):
 
 
 class SessionSM(hsm.Instance):
-    def __init__(self, machines: "Machines"):
+    """The session: the host's tasks and the event log (see the session graph, SESSION)."""
+
+    def __init__(self, machines: "Machines", context_id: str, position: int):
         super().__init__()
         self.machines = machines
-        self.engaged: set[str] = set()
-        self.grafts: set[str] = set()
-        self.held: set[str] = set()
-        self.settles: list[asyncio.Future] = []
-        # Errors kept for `settle`, each with the user calls in flight when its line was out: a
-        # call that then returns its lines has shown it (it is that call's), so it is no longer kept.
-        self.errors: list[tuple[BaseException, frozenset[int]]] = []
-        self.calls: set[int] = set()  # user calls in flight (`call_began` .. `call_done`), by request id
-        self.closers: list[asyncio.Future] = []
         self.root: str | None = None
-        self.to_shut: list[str] = []
-        self.stop_errors: list[BaseException] = []  # machines that could not be stopped at close
+        self.context_id = context_id
+        self.tasks: dict[str, "TaskRecord"] = {}  # open tasks
+        self.ended: dict[str, str] = {}  # terminal tasks -> their state
+        self.req_task: dict[int, str] = {}  # request id -> its task
+        self.graft_tasks: dict[str, tuple[str, ...]] = {}  # a background graft -> its tasks, until its join reaches the original
+        self.grafts: set[str] = set()  # background grafts whose joins have not reached the original
+        self.held: set[str] = set()  # those made in a turn its caller drives
+        self.pending: list[tuple[int, dict]] = []  # events decided, not yet written (position, StreamResponse)
+        self.next_seq = position + 1  # the position the next decided event gets
+        self.written = position  # the last position written
+        self.outbox: list[tuple[str, str, Any]] = []  # sends to make now: (machine, event, data)
+        self.after_write: list[tuple[int, tuple[str, str, Any]]] = []  # sends to make once a position is written
+        self.waits: list[tuple[int, asyncio.Future]] = []  # consumers waiting past a cursor
         self.closing = False
+        self.root_told = False  # closing: the original was told to shut down
+        self.root_closed = False
+        self.scribe_flushed = False  # closing: the scribe wrote every note sent before the session's last
+        self.closers: list[asyncio.Future] = []
+        self.lost: list[BaseException] = []  # errors the scribe could not word or write, for the next wait
+        self.blocked = False  # writes failed MAX_WRITE_ATTEMPTS times: tried again at the next event
+        self.attempts = NONE_YET
+        self.write_error: BaseException | None = None
+        self.stop_errors: list[BaseException] = []  # machines that could not be stopped at close
         self.fault: Fault | None = None
         self.fault_sent = False
         self.held_back: str | None = None
@@ -914,9 +929,11 @@ def _background(inst: TimelineSM, clones: list[str]) -> bool:
 
 
 def _report(inst: TimelineSM, kind: str, clones: list[str], error: BaseException, quiet: bool = False,
-            keep: bool = True, src: str | None = None) -> None:
-    _note(inst=inst, method="report", keep=error if keep else None, kind=kind, src=src or inst.timeline_id,
-          clones=clones, error=error, quiet=quiet, background=_background(inst=inst, clones=clones))
+            keep: bool = True, src: str | None = None, fails: tuple[str, ...] = ()) -> None:
+    """A harness error: the scribe has the host word its line, and the session tells it (`fails`:
+    host tasks this error fails)."""
+    _note(inst=inst, method="report", kind=kind, src=src or inst.timeline_id, clones=clones, error=error,
+          quiet=quiet, background=_background(inst=inst, clones=clones), fails=fails)
 
 
 def mirrored(status: str) -> hsm.RedefinableBehaviors:
@@ -1043,7 +1060,7 @@ def _answered(inst: TimelineSM) -> list[Request]:
     are not done, those its background grafts were made for whose joins are not applied, and
     those of the grafts the next wake reports."""
     answered: list[Request] = []
-    for r in [*inst.returned, *inst.graft_requests.values(), *inst.woken_for]:
+    for r in [*inst.returned, *(r for rs in inst.graft_requests.values() for r in rs), *inst.woken_for]:
         answered += [] if any(r is a for a in answered) else [r]
     return answered
 
@@ -1065,13 +1082,43 @@ def _prune(inst: TimelineSM) -> None:
 
 def _unwanted(inst: TimelineSM, child: str) -> bool:
     """A background graft made for a request that was withdrawn: its join wakes nothing."""
-    request = inst.graft_requests.get(child)
-    return request is not None and _withdrawn(inst=inst, request=request)
+    return any(_withdrawn(inst=inst, request=r) for r in inst.graft_requests.get(child, ()))
+
+
+def _owners(inst: TimelineSM) -> tuple[Request, ...]:
+    """The requests a background graft the current run forks is made for: the live ones among the
+    request the run answers and the requests of the background grafts whose merges it reports
+    (spec: Host Interface, Context and tasks)."""
+    runs_for: list[Request] = []
+    for r in ([inst.answering] if inst.answering is not None else []) + list(inst.woken_for):
+        if all(r is not o for o in runs_for):
+            runs_for.append(r)
+    live = [r for r in runs_for if not _withdrawn(inst=inst, request=r)]
+    # a graft made while every request of its run is withdrawn (the withdrawal landed after the
+    # clone gate) is made for them, so it never runs (it joins `cancelled` at once)
+    return tuple(live or runs_for)
+
+
+def _owed(inst: TimelineSM) -> frozenset[str] | None:
+    """The host tasks this timeline still owes work to: those of its background grafts whose joins
+    are neither applied nor given up. A focus graft cannot know its source's (None)."""
+    if inst.kind != "original":
+        return None
+    return frozenset(t for rs in inst.graft_requests.values() for t in _tasks_of(rs))
+
+
+def _tasks_of(requests) -> tuple[str, ...]:
+    """The host tasks of requests, in order, each once (a request of no task has none)."""
+    out: list[str] = []
+    for r in requests:
+        if r.task is not None and r.task not in out:
+            out.append(r.task)
+    return tuple(out)
 
 
 def _made_for_withdrawn(inst: TimelineSM) -> bool:
     """A background graft whose request was withdrawn: it stops (or never starts)."""
-    return inst.made_for is not None and _withdrawn(inst=inst, request=inst.made_for)
+    return any(_withdrawn(inst=inst, request=r) for r in inst.made_for)
 
 
 # ------------------------------------------------------------------ guards
@@ -1534,7 +1581,9 @@ async def busy_activity(ctx, inst: TimelineSM, event) -> None:
         _close_out(inst)
         _mark_pending(inst)
         woken = list(inst.news) if inst.mode.name == "wake" else None
-        outcome = await inst.host.run_busy(tl=inst.timeline_id, kind=inst.kind, woken=woken)
+        runs_for = ([inst.answering] if inst.answering is not None else []) + list(inst.woken_for)
+        outcome = await inst.host.run_busy(tl=inst.timeline_id, kind=inst.kind, woken=woken,
+                                           tasks=_tasks_of(runs_for))
     except BaseException as error:  # noqa: BLE001 - the outcome event carries it, Exception or not
         error = _failure(ctx, error)
         if not ctx.is_done():
@@ -1767,10 +1816,11 @@ def _reject(inst, event):
 def _join_back(inst, event):
     """A focus graft's turn ended: its join event, with the user message it leaves unanswered. A
     merge call, a reply or an empty response joins `done` (`out_of_scope` without a reply to the
-    user: the harness words it from the view); a spent step budget, or a turn a fault ended (the
-    recovery's event), joins `failed`."""
+    user: the harness words it from the view); its request withdrawn (its task canceled) joins
+    `cancelled`; a spent step budget, or a turn a fault ended (the recovery's event), joins `failed`."""
     outcome = event.data if isinstance(event.data, RunOutcome) else None
     reason = "done" if outcome is not None and outcome.kind in ("join", "replied", "empty") else "failed"
+    reason = CANCELLED if _focus_withdrawn(inst) else reason
     return inst.host.join_of(tl=inst.timeline_id, reason=reason, focus=True)
 
 
@@ -1841,7 +1891,7 @@ def _recover(inst, event):
 
 def _scribe_write(inst, event):
     (method, args), _keep = inst.note
-    getattr(inst.host, method)(**args)
+    return getattr(inst.host, method)(**args)
 
 
 # ------------------------------------------------------------------ effects: user requests
@@ -1883,6 +1933,7 @@ def request_written(ctx, inst, event) -> None:
     inst.answering, inst.answered = request, False
     inst.mode = TURN
     inst.waiters.append(Waiter(reply=request.reply, user=True, request=request))
+    _session(inst=inst, name="answering", data=(inst.timeline_id, request.task))
 
 
 def request_dropped(ctx, inst, event) -> None:
@@ -1939,6 +1990,28 @@ def _late(inst: TimelineSM, rid: int) -> list[Request]:
     held = {r.id for r in _held(inst)}
     return [r for r in _answered(inst) if r.id == rid and rid not in held and rid not in inst.withdrawn
             and not r.reply.cancelled()]  # (one whose caller went away first was withdrawn already)
+
+
+def _focus_withdrawn(inst: TimelineSM) -> bool:
+    """A focus graft (not shutting down) whose request is withdrawn: the one its run answers, or one
+    it answered whose call is not done. Its turn ends in a `cancelled` merge."""
+    if inst.kind != "focus" or inst.closing or inst.final:
+        return False
+    answering = inst.answering is not None and _withdrawn(inst=inst, request=inst.answering)
+    return answering or any(_withdrawn(inst=inst, request=r) for r in inst.returned)
+
+
+def focus_cancelled(ctx, inst, event) -> bool:
+    return _focus_withdrawn(inst)
+
+
+def withdraws_own_focus(ctx, inst, event) -> bool:
+    """At rest, a focus graft's own answered request is withdrawn (late): it merges `cancelled`."""
+    return inst.kind == "focus" and not (inst.closing or inst.final) and withdraws_late(ctx=ctx, inst=inst, event=event)
+
+
+def withdraws_late_at_rest(ctx, inst, event) -> bool:
+    return withdraws_late(ctx=ctx, inst=inst, event=event) and not withdraws_own_focus(ctx=ctx, inst=inst, event=event)
 
 
 def withdraws_late(ctx, inst, event) -> bool:
@@ -2346,7 +2419,9 @@ def come_to_rest(ctx, inst, event) -> None:
     _drop_dead(inst)
     inst.answering, inst.woken_for, inst.in_turn = None, [], False
     _prune(inst)
-    _session(inst=inst, name="rested", data=inst.timeline_id)
+    answered = tuple((w.request.id, None if w.error is None else described(w.error)) for w in waiters
+                     if w.request is not None)
+    _session(inst=inst, name="rested", data=Rested(tl=inst.timeline_id, answered=answered, owed=_owed(inst)))
 
 
 def close_root(ctx, inst, event) -> None:
@@ -2469,7 +2544,7 @@ def committed(ctx, inst, event) -> None:
     users = [w for w in inst.waiters if w.user]
     inst.spawn_plan = [GraftPlan(child=child, focus=f, waiters=users if f else [],
                                  answering=inst.answering if f else None,
-                                 made_for=None if f else inst.answering)
+                                 made_for=() if f else _owners(inst))
                        for child, f in inst.clone.pairs]
 
 
@@ -2505,17 +2580,19 @@ def spawned(ctx, inst, event) -> None:
     clone = event.data
     _register_grafts(inst=inst, clone=clone)
     background = [g for g, f in clone.pairs if not f]
-    _session(inst=inst, name="grafts_made", data=(background, inst.mode.name == "external"))
+    _session(inst=inst, name="grafts_made", data=(background, inst.mode.name == "external", {
+        g: _tasks_of(inst.graft_requests.get(g, ())) for g in background}))
 
 
 def _register_grafts(inst: TimelineSM, clone: Clone) -> None:
     """The grafts of a clone call whose machines started become the original's (also done by a
     recovery, for a step that failed after they started: grafts already started stay its own)."""
+    owners = _owners(inst)
     for child, focus in clone.pairs:
         inst.grafts[child] = focus
         inst.made[child] = focus
-        if not focus and inst.answering is not None:
-            inst.graft_requests[child] = inst.answering
+        if not focus and owners:
+            inst.graft_requests[child] = owners
     inst.focus = next((g for g, f in clone.pairs if f), None)
     inst.spawn_plan = []
 
@@ -2749,7 +2826,8 @@ def applied(ctx, inst, event) -> None:
     news = not _unwanted(inst=inst, child=join.child)  # every merge wakes it, but a graft's made for a withdrawn request
     inst.news += [(join.child, join.reason)] if news else []
     # the wake its news sets off is for the request the graft was made for, if any
-    inst.woken_for += [r for r in [inst.graft_requests.pop(join.child, None)] if news and r is not None]
+    made_for = inst.graft_requests.pop(join.child, ())
+    inst.woken_for += [r for r in made_for if news and all(r is not w for w in inst.woken_for)]
     inst.ends_on_request = ends
     _forward(target=inst.machines.timelines.get(join.child), name="join_commit" if committed_ else "join_rollback")
 
@@ -2768,7 +2846,11 @@ def last_commit_failed(ctx, inst, event) -> None:
 
 
 def report_abandoned(ctx, inst, event) -> None:
-    _report(inst=inst, kind="abandon", clones=[inst.queue[0].child], error=event.data, keep=False)
+    """A join given up: told, and the tasks its graft was made for fail (its work is not in the
+    conversation's memory)."""
+    child = inst.queue[0].child
+    _report(inst=inst, kind="abandon", clones=[child], error=event.data, keep=False,
+            fails=_tasks_of(inst.graft_requests.get(child, ())))
 
 
 def abandon_head(ctx, inst, event) -> None:
@@ -2955,7 +3037,7 @@ def add_watcher(ctx, inst, event) -> None:
 # like a user message, and never forwarded again), so no message bounces between the two.
 RETURNED = "message_returned"
 MESSAGES = ("user_message", RETURNED)
-REQUESTS = ("turn_request", "drain_request", "join", "user_message", "settle_request", "driven_done")
+REQUESTS = ("turn_request", "drain_request", "join", "user_message", "driven_done")
 # Recoveries a timeline makes in a row before it gives a fault up (a fault that recovery itself
 # would hit again, e.g. a send that always fails): a new user message or run starts the count again.
 MAX_RECOVERIES = 2
@@ -2978,6 +3060,13 @@ class Record(NamedTuple):
     errors: tuple[BaseException, ...]
     focus: str | None = None
     also: tuple["Record", ...] = ()
+    # for the session's tasks: the requests it answered whose calls are not done; those a recovery
+    # answered with an error (id, error); the tasks it owes (the original: else None); and each
+    # background graft's tasks
+    answered: tuple[int, ...] = ()
+    failed: tuple[tuple[int, str], ...] = ()
+    owed: frozenset[str] | None = None
+    graft_tasks: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 class Restate(NamedTuple):
@@ -2995,12 +3084,16 @@ def _awaited(inst: TimelineSM) -> list[str]:
 
 
 def _record_of(inst: TimelineSM, engaged: bool | None, errors: list[BaseException],
-               also: tuple[Record, ...] = ()) -> Record:
+               also: tuple[Record, ...] = (), failed: tuple[tuple[int, str], ...] = ()) -> Record:
     running = _awaited(inst) if inst.kind == "original" else None
     return Record(tl=inst.timeline_id, engaged=engaged,
                   grafts=None if running is None else tuple(g for g in running if g not in inst.held_grafts),
                   held=tuple(g for g in running or [] if g in inst.held_grafts), closed=inst.closed,
-                  errors=tuple(errors), focus=inst.focus, also=also)
+                  errors=tuple(errors), focus=inst.focus, also=also,
+                  answered=tuple(r.id for r in inst.returned if _reply_error(r.reply) is None),
+                  failed=failed + tuple((r.id, described(_reply_error(r.reply))) for r in inst.returned
+                                        if _reply_error(r.reply) is not None),
+                  owed=_owed(inst), graft_tasks=tuple((g, _tasks_of(rs)) for g, rs in inst.graft_requests.items()))
 
 
 def recover_call(ctx, inst, event) -> None:
@@ -3012,8 +3105,10 @@ def recover_call(ctx, inst, event) -> None:
     _salvage(inst=inst, event=fault.event)
     _requeue_strays(inst)
     told = _told(fault=fault, replies=replies)
+    failed = fault.event.data if isinstance(fault.event.data, Request) and not fault.event.data.reply.done() else None
     _session(inst=inst, name="resync", data=_record_of(
-        inst=inst, engaged=None, errors=_errors_for_session(errors=fault.errors, told=told)))
+        inst=inst, engaged=None, errors=_errors_for_session(errors=fault.errors, told=told),
+        failed=((failed.id, described(fault.error)),) if failed is not None else ()))
     fault.told = _fail_all(replies=replies, error=fault.error) or fault.told
     _returned(inst=inst, requests=[fault.event.data])
     inst.inbox = [r for r in inst.inbox if r is not fault.event.data]
@@ -3038,8 +3133,9 @@ def _caller_of(event: hsm.Event | None) -> list[asyncio.Future]:
 def _salvage(inst: TimelineSM, event: hsm.Event | None) -> None:
     """What the event whose step failed brought that the step did not keep: a graft's join (kept
     for the queue), a focus graft's join (the conversation comes back with it), the grafts of a
-    clone call whose machines had started (they stay its own), a shutdown (it still closes). Each
-    is kept once: a step that failed after it kept them changed nothing here."""
+    clone call whose machines had started (they stay its own), a shutdown (it still closes), a
+    withdrawal (its task is canceled: the request stays withdrawn). Each is kept once: a step that
+    failed after it kept them changed nothing here."""
     name = event.name if event is not None else None
     if name == "shutdown":  # the timeline was shut down: it closes once it is at rest, as without the fault
         inst.closing = inst.final = True
@@ -3051,6 +3147,9 @@ def _salvage(inst: TimelineSM, event: hsm.Event | None) -> None:
         _take_focus_join(inst=inst, handed=event.data)
     elif name == "spawned" and isinstance(event.data, Clone) and any(g not in inst.made for g, _ in event.data.pairs):
         _register_grafts(inst=inst, clone=event.data)
+    elif name == "withdraw" and isinstance(event.data, int):  # a canceled task's request: still withdrawn
+        if any(r.id == event.data for r in _known(inst)):
+            inst.withdrawn.add(event.data)
 
 
 def _fail_all(replies: list[asyncio.Future | None], error: BaseException) -> bool:
@@ -3115,11 +3214,26 @@ def _restate_and_fail(inst: TimelineSM, fault: Fault, errors: list[BaseException
     keeps and shows them). The record is sent when the step returns, before any caller answered
     here runs; the callers leave the data once answered."""
     replies = _callers_to_fail(inst) + list(also or [])
+    users = _failing_requests(inst=inst, replies=replies)
     _session(inst=inst, name="resync", data=_record_of(
-        inst=inst, engaged=engaged, errors=_errors_for_session(errors=errors, told=_told(fault=fault, replies=replies))))
+        inst=inst, engaged=engaged, errors=_errors_for_session(errors=errors, told=_told(fault=fault, replies=replies)),
+        failed=tuple((r.id, described(errors[HEAD])) for r in users)))
     fault.told = _fail_all(replies=replies, error=errors[HEAD]) or fault.told
     _drop_failed(inst)
     _prune(inst)
+
+
+def _failing_requests(inst: TimelineSM, replies: list[asyncio.Future]) -> list[Request]:
+    """The user requests among the replies a recovery fails, still unanswered: their tasks are told
+    the error (the session's record of them)."""
+    known = [inst.faulted.data if inst.faulted is not None else None, inst.request,
+             *[w.request for w in inst.waiters], *inst.inbox]
+    out: list[Request] = []
+    for r in known:
+        if isinstance(r, Request) and not r.reply.done() and any(r.reply is x for x in replies) \
+                and all(r is not o for o in out):
+            out.append(r)
+    return out
 
 
 def _errors_for_session(errors: list[BaseException], told: bool) -> list[BaseException]:
@@ -3726,9 +3840,12 @@ def _timeline(name: str) -> hsm.Model:
                   Effect(take_handed_and_begin)),
                 T(On("inbox_handed"), Call(checked(handed_live_with_queue, handed_live_to_answer,
                                                    effects=(take_handed,)))),
+                # a focus graft at rest whose request is withdrawn merges `cancelled`
+                T(On("withdraw"), S("../engaged/handing_back"), G(withdraws_own_focus), Effect(note_late_withdrawal)),
                 # a withdrawal at rest: recorded, then the grafts made for it are stopped from here
-                T(On("withdraw"), S("gate"), G(withdraws_late), Effect(note_late_withdrawal)),
-                T(On("withdraw"), S("gate"), Effect(checked(withdraws_late, effects=(note_withdrawn,)))),
+                T(On("withdraw"), S("gate"), G(withdraws_late_at_rest), Effect(note_late_withdrawal)),
+                T(On("withdraw"), S("gate"), Effect(checked(withdraws_own_focus, withdraws_late_at_rest,
+                                                            effects=(note_withdrawn,)))),
                 *_stopping(T=T, S=S, On=On, G=G),
             ),
             hsm.State(
@@ -3803,14 +3920,21 @@ def _timeline(name: str) -> hsm.Model:
                 ),
                 hsm.Choice(
                     "withdrawn_choice",  # the run it cut short answered a request that was withdrawn
-                    T(S("rest"), G(nothing_to_mark)),
+                    T(S("withdrawn_end"), G(nothing_to_mark)),
                     T(S("withdrawing"), Effect(checked(nothing_to_mark))),
                 ),
                 hsm.State(
                     # the withdrawn request it answered gets the withdrawal mark on its row
                     "withdrawing", Entry(to_mark), io(done="rows_marked", work=_mark_rows),
-                    T(On("rows_marked"), S("../rest"), Effect(rows_marked)),
-                    T(On(E), S("../rest"), Effect(mark_failed)),
+                    T(On("rows_marked"), S("../withdrawn_end"), Effect(rows_marked)),
+                    T(On(E), S("../withdrawn_end"), Effect(mark_failed)),
+                ),
+                hsm.Choice(
+                    # a focus graft whose request was withdrawn merges `cancelled`: its turn ends in
+                    # its join, and the conversation comes back to main; the original rests
+                    "withdrawn_end",
+                    T(S("handing_back"), G(focus_cancelled)),
+                    T(S("rest"), Effect(checked(focus_cancelled))),
                 ),
                 hsm.State(
                     "failing", io(done="failure_recorded", work=_focus_failure),
@@ -4090,58 +4214,61 @@ def take_note(ctx, inst, event) -> None:
     inst.note = event.data
 
 
-def keeps(ctx, inst, event) -> bool:
-    return inst.note[1] is not None
+def is_report(ctx, inst, event) -> bool:
+    """The note was a harness error line (the host words it): it goes to the session, which tells it."""
+    return inst.note[0][0] == "report"
 
 
-def kept_after_report(ctx, inst, event) -> bool:
-    """A report line is out (or could not go out), and the error it told is kept for `settle`."""
-    return keeps(ctx=ctx, inst=inst, event=event) and not is_write(ctx=ctx, inst=inst, event=event)
+def s_report_line(ctx, inst, event) -> None:
+    """A report line was worded (None: a repeat the user was already told): the session tells it."""
+    line, fails = event.data
+    if line is not None:
+        _forward(target=inst.machines.session, name="report", data=(line, tuple(fails)))
+
+
+def is_flush(ctx, inst, event) -> bool:
+    """The session's last note before it stops: every note before it has been written."""
+    return inst.note[0][0] == "flush"
+
+
+def s_flushed(ctx, inst, event) -> None:
+    _forward(target=inst.machines.session, name="scribe_flushed")
 
 
 def told_after_write(ctx, inst, event) -> bool:
     """A store write is made whose note carries an error no caller took: it is told next."""
-    return keeps(ctx=ctx, inst=inst, event=event) and is_write(ctx=ctx, inst=inst, event=event)
-
-
-def is_write(ctx, inst, event) -> bool:
-    return inst.note[0][0] != "report"
-
-
-def s_keep(ctx, inst, event) -> None:
-    _forward(target=inst.machines.session, name="failure", data=((inst.note[1], True),))
+    return inst.note[1] is not None and not is_report(ctx=ctx, inst=inst, event=event) \
+        and not is_flush(ctx=ctx, inst=inst, event=event)
 
 
 def s_tell_kept(ctx, inst, event) -> None:
-    """The error a write's note carried is told, one line, and then kept (`kept_after_report`)."""
+    """The error a write's note carried is told (one report line, worded next)."""
     error = inst.note[1]
-    line = dict(kind="machine", src=None, clones=[], error=error, quiet=False, background=False)
-    _self(inst=inst, name="note", data=(("report", line), error))
-
-
-def s_keep_lost_line(ctx, inst, event) -> None:
-    """A report line the user's callbacks could not take: that failure is kept for `settle`."""
-    _forward(target=inst.machines.session, name="failure", data=((event.data, True),))
+    _self(inst=inst, name="note", data=(("report", dict(kind="machine", src=None, clones=[], error=error,
+                                                        quiet=False, background=False)), None))
 
 
 def s_report_write(ctx, inst, event) -> None:
-    """A store write the scribe could not make (a state's store copy, a trace line): the user is
-    told and the session keeps it for `settle`. Not retried: the next copy of a state overwrites
-    it, and the machines never read the store copy."""
+    """A store write the scribe could not make (a state's store copy, a trace line, a mark): it is
+    told (a report line). Not retried: the next copy of a state overwrites it, and the machines
+    never read the store copy."""
     line = dict(kind="mirror", src=None, clones=[], error=event.data, quiet=False, background=False)
-    _self(inst=inst, name="note", data=(("report", line), event.data))
+    _self(inst=inst, name="note", data=(("report", line), None))
+
+
+def s_line_lost(ctx, inst, event) -> None:
+    """A report line could not be worded (the host raised): the session keeps the error (`failure`)."""
+    _forward(target=inst.machines.session, name="failure", data=(event.data,))
 
 
 def scribe_fault(ctx, inst, event) -> None:
-    """A step of the scribe failed: the note it was taking is lost, and the session keeps the
-    error for `settle` (the scribe cannot write its line), with the error that note was to have
-    kept, if any: the note the failed step took (nothing of it went out), or the one it was
-    finishing (its line went out)."""
+    """A step of the scribe failed: the note it was taking is lost, and the session keeps the error,
+    with the error that note was to tell, if any."""
     fault = _take_fault(inst=inst, event=event)
-    taking = fault.event.name == "note"  # it failed taking the note (nothing of it went out), or after
+    taking = fault.event.name == "note"
     note = fault.event.data if taking else inst.note
-    kept = tuple((e, not taking) for e in (note[1],) if e is not None)
-    _forward(target=inst.machines.session, name="failure", data=kept + tuple((e, False) for e in fault.errors))
+    kept = tuple(e for e in (note[1],) if e is not None)
+    _forward(target=inst.machines.session, name="failure", data=kept + tuple(fault.errors))
 
 
 SCRIBE = hsm.Define(
@@ -4152,258 +4279,513 @@ SCRIBE = hsm.Define(
     hsm.State(
         "writing", io(done="written", work=_scribe_write),
         hsm.Defer("note"),
-        _T(_On("written"), _S("../ready"), _G(kept_after_report), Effect(s_keep)),
+        _T(_On("written"), _S("../ready"), _G(is_report), Effect(s_report_line)),
+        _T(_On("written"), _S("../ready"), _G(is_flush), Effect(s_flushed)),
         _T(_On("written"), _S("../ready"), _G(told_after_write), Effect(s_tell_kept)),
-        _T(_On("written"), _S("../ready"), Effect(checked(kept_after_report, told_after_write))),
-        _T(_On(_E), _S("../ready"), _G(is_write), Effect(s_report_write)),
-        _T(_On(_E), _S("../lost_line"), Effect(checked(is_write, effects=(s_keep_lost_line,)))),  # callbacks failed
-    ),
-    hsm.Choice(
-        "lost_line",  # the error the report was about is still kept
-        _T(_S("ready"), _G(keeps), Effect(s_keep)),
-        _T(_S("ready"), Effect(checked(keeps))),
+        _T(_On("written"), _S("../ready"), Effect(checked(is_report, is_flush, told_after_write))),
+        _T(_On(_E), _S("../ready"), _G(is_report), Effect(s_line_lost)),
+        _T(_On(_E), _S("../ready"), Effect(checked(is_report, effects=(s_report_write,)))),
     ),
 )
 
 
-# ------------------------------------------------------------------ the session
-def _apply_session(inst: SessionSM, name: str, data: Any) -> None:
-    """How each event changes the session's own record of what is in flight."""
-    if name == "engaged":
-        inst.engaged.add(data)
-    elif name in ("rested", "root_closed"):
-        inst.engaged.discard(data)
-    elif name == "handed":  # (the focus graft that joined, the timeline it handed back to)
-        inst.engaged.discard(data[0])
-        inst.engaged.add(data[1])
-    elif name == "suspended":  # the original handed the conversation over; its focus graft counts itself
-        inst.engaged.discard(data)
-    elif name == "grafts_made":
-        grafts, held = data
-        (inst.held if held else inst.grafts).update(grafts)
-    elif name == "graft_received":
-        inst.grafts.discard(data)
-        inst.held.discard(data)
-    elif name == "grafts_undone":  # a clone call's grafts, stopped and forgotten
-        inst.engaged.difference_update(data)
-        inst.grafts.difference_update(data)
-        inst.held.difference_update(data)
-    elif name == "resync":
-        _restate(inst=inst, record=data)
+# ------------------------------------------------------------------ the session: tasks and the log
+CLOSED_TEXT = "the agent was closed before this request finished"
+# Times a batch of events is written again before the session waits for its next event to try once
+# more: a store that keeps failing never keeps the session writing.
+MAX_WRITE_ATTEMPTS = 3
 
 
-def _restate(inst: SessionSM, record: Record) -> None:
-    """A timeline's whole record, re-stated after a fault: it replaces what the session had for it
-    (the records passed on with it first: the suspended original's, re-stated by its focus graft)."""
-    for passed_on in record.also:
-        _restate(inst=inst, record=passed_on)
-    if record.engaged is not None:
-        (inst.engaged.add if record.engaged else inst.engaged.discard)(record.tl)
-    if record.tl == inst.root:  # no timeline holds the conversation but the original or its focus graft
-        inst.engaged = {tl for tl in inst.engaged if tl in (record.tl, record.focus)}
-    if record.grafts is not None:  # the original's background grafts still running
-        running, held = set(record.grafts), set(record.held)
-        inst.grafts, inst.held = (running | held, set()) if inst.closing else (running, held)
+@dataclass
+class Submission:
+    """A host's message for the session (`submit`): its task (new, or a follow-up of an open one),
+    the A2A user message (validated, its ids set), and the request the original's machine takes."""
+    task: str
+    follow_up: bool
+    message: dict
+    request: Request
 
 
-def _busy_after(inst: SessionSM, event) -> bool:
-    probe = SessionSM.__new__(SessionSM)
-    probe.engaged, probe.grafts, probe.held = set(inst.engaged), set(inst.grafts), set(inst.held)
-    probe.closing, probe.root = inst.closing, inst.root
-    _apply_session(inst=probe, name=event.name, data=event.data)
-    return bool(probe.engaged or probe.grafts)
+@dataclass
+class TaskRecord:
+    """The session's record of an open task: its requests (id -> queued | delivered | answered),
+    its state, whether an error went to it, and its last agent message since its last user message
+    (the status message of its next turn end)."""
+    state: str
+    requests: dict[int, str]
+    failed: bool = False
+    reply: dict | None = None
 
 
-def s_busy_after(ctx, inst, event) -> bool:
-    return _busy_after(inst=inst, event=event)
+class Rested(NamedTuple):
+    """A timeline that holds the conversation came to rest: the user requests it answered, each with
+    the error it was answered with (or None), and, from the original, the tasks it still owes (its
+    background grafts' requests whose joins are neither applied nor given up); None from a focus
+    graft, which cannot know."""
+    tl: str
+    answered: tuple[tuple[int, str | None], ...]
+    owed: frozenset[str] | None
 
 
-def s_quiet_after(ctx, inst, event) -> bool:
-    return not _busy_after(inst=inst, event=event)
+def _message(inst: SessionSM, seq: int, task: str | None, text: str, error: bool = False) -> dict:
+    """An agent message, its id fixed by its log position (so no random source is needed)."""
+    m = {"messageId": f"{inst.context_id}-m{seq}", "contextId": inst.context_id, "role": "ROLE_AGENT",
+         "parts": [{"text": text}]}
+    if task is not None:
+        m["taskId"] = task
+    if error:
+        m["metadata"] = {"graft": {"error": True}}
+    return m
 
 
-def _keep(inst: SessionSM, errors: list[BaseException], shown: bool = True) -> None:
-    """Errors kept for `settle` (each once): every error no caller was given, once its line is out
-    (`shown`), with the user calls in flight then. Once one of those calls is done (`call_done`)
-    the error is that call's (its line is in that call's output) and no longer kept. An error whose
-    line could not be made (the scribe failed taking it) is kept for `settle` whatever is in flight."""
-    calls = frozenset(inst.calls) if shown else frozenset()
-    inst.errors += [(e, calls) for e in errors if all(e is not k for k, _ in inst.errors)]
+def _status(inst: SessionSM, task: str, state: str, message: dict | None) -> dict:
+    status = {"state": state} | ({"message": message} if message is not None else {})
+    return {"statusUpdate": {"taskId": task, "contextId": inst.context_id, "status": status}}
 
 
-def _tell(inst: SessionSM, errors: list[BaseException]) -> None:
-    """A fault's errors that no caller was given: shown as one line (the scribe's), and kept for
-    `settle` once it is out (the scribe hands it back, `failure`)."""
-    if errors:
-        error = errors[HEAD] if len(errors) == 1 else BaseExceptionGroup("a step failed", errors)
-        _note(inst=inst, method="report", keep=error, kind="machine", src=None, clones=[], error=error, quiet=False,
-              background=False)
+class _Draft:
+    """A session step's working copy: every effect computes on it and commits it at its end, all at
+    once, so a step that raises changes nothing (spec: What changes in the machines)."""
+
+    def __init__(self, inst: SessionSM):
+        self.inst = inst
+        self.tasks = {t: TaskRecord(state=r.state, requests=dict(r.requests), failed=r.failed, reply=r.reply)
+                      for t, r in inst.tasks.items()}
+        self.ended = dict(inst.ended)
+        self.req_task = dict(inst.req_task)
+        self.graft_tasks = dict(inst.graft_tasks)
+        self.grafts, self.held = set(inst.grafts), set(inst.held)
+        self.pending = list(inst.pending)
+        self.next_seq = inst.next_seq
+        self.outbox = list(inst.outbox)
+        self.after_write = list(inst.after_write)
+        self.waits = list(inst.waits)
+        self.closing, self.root_told, self.root_closed = inst.closing, inst.root_told, inst.root_closed
+        self.scribe_flushed = inst.scribe_flushed
+        self.closers = list(inst.closers)
+        self.lost = list(inst.lost)
+        self.answers: list[tuple[asyncio.Future, Any]] = []  # replies answered once the step commits
+        self.failures: list[tuple[asyncio.Future, BaseException]] = []
+
+    def commit(self) -> None:
+        inst = self.inst
+        inst.tasks, inst.ended, inst.req_task, inst.graft_tasks = self.tasks, self.ended, self.req_task, self.graft_tasks
+        inst.grafts, inst.held = self.grafts, self.held
+        inst.pending, inst.next_seq, inst.outbox, inst.after_write = self.pending, self.next_seq, self.outbox, self.after_write
+        inst.waits = [(c, r) for c, r in self.waits if not r.done()]
+        inst.closing, inst.root_told, inst.root_closed = self.closing, self.root_told, self.root_closed
+        inst.scribe_flushed = self.scribe_flushed
+        inst.closers, inst.lost = self.closers, self.lost
+        inst.blocked = False  # a new event: a write that failed may be tried again
+        for reply, value in self.answers:
+            _resolve(reply=reply, value=value)
+        for reply, error in self.failures:
+            _fail(reply=reply, error=error)
+
+    # ---- events into the log
+    def emit(self, event: dict) -> int:
+        seq = self.next_seq
+        self.next_seq += 1
+        self.pending.append((seq, event))
+        return seq
+
+    def emit_status(self, task: str, state: str, message: dict | None = None) -> int:
+        rec = self.tasks[task]
+        rec.state = state
+        return self.emit(_status(self.inst, task, state, message))
+
+    def say(self, task: str | None, text: str, error: bool = False) -> None:
+        """A message on an open task (a WORKING status carrying it, or the task's own state for an
+        error), or a context-level message with no task."""
+        if task is None:
+            self.emit({"message": _message(self.inst, self.next_seq, None, text, error)})
+            return
+        rec = self.tasks[task]
+        message = _message(self.inst, self.next_seq, task, text, error)
+        self.emit_status(task, rec.state if error else "TASK_STATE_WORKING", message)
+        rec.reply = message
+
+    def working(self, task: str | None) -> None:
+        rec = self.tasks.get(task) if task is not None else None
+        if rec is not None and rec.state != "TASK_STATE_WORKING":
+            self.emit_status(task, "TASK_STATE_WORKING")
+
+    def tell(self, line: str) -> None:
+        """A harness error: on every open task, keeping its state; with none open, context-level."""
+        if not self.tasks:
+            self.say(None, line, error=True)
+        for task in sorted(self.tasks):
+            self.say(task, line, error=True)
+
+    def end(self, task: str, state: str, reason: str | None = None) -> None:
+        """The task's terminal state, decided once: noted, and its delivered requests are done
+        (`call_done`) once it is written."""
+        rec = self.tasks.pop(task)
+        message = rec.reply if reason is None else _message(self.inst, self.next_seq, task, reason, error=True)
+        seq = self.emit(_status(self.inst, task, state, message))
+        self.ended[task] = state
+        root = self.inst.root
+        for rid, where in sorted(rec.requests.items()):
+            if where != "queued":
+                self.after_write.append((seq, (root, "call_done", rid)))
+        self.after_write = [(s, send) for s, send in self.after_write
+                            if not (send[1] == "user_message" and send[2].id in rec.requests)]
+
+    def answer(self, rid: int, error: str | None) -> None:
+        task = self.req_task.get(rid)
+        rec = self.tasks.get(task) if task is not None else None
+        if rec is None:  # its task is terminal (or it has none): an error is still told, as a harness error
+            if error is not None:
+                self.tell(f"(harness error: {error})")
+            return
+        if rec.requests.get(rid) == "answered":
+            return  # told once (a record re-stated after a fault repeats it)
+        rec.requests[rid] = "answered"
+        if error is not None:
+            rec.failed = True
+            self.say(task, f"(harness error: {error})", error=True)
+
+    def decide(self, owed: frozenset[str]) -> None:
+        """At a rest of the original: every open task none of whose requests is unanswered is decided."""
+        for task in sorted(self.tasks):
+            rec = self.tasks[task]
+            if any(w != "answered" for w in rec.requests.values()):
+                continue
+            if task in owed:
+                if rec.state != "TASK_STATE_INPUT_REQUIRED":
+                    self.emit_status(task, "TASK_STATE_INPUT_REQUIRED", rec.reply)
+            else:
+                self.end(task, "TASK_STATE_FAILED" if rec.failed else "TASK_STATE_COMPLETED")
+
+    def tasks_of(self, requests) -> list[str]:
+        return sorted({self.req_task[r] for r in requests if r in self.req_task and self.req_task[r] in self.tasks})
 
 
-def s_record(ctx, inst, event) -> None:
-    """A record event changes the session's record; a re-stated one (`resync`) carries the errors
-    no caller was given, which are told."""
-    _apply_session(inst=inst, name=event.name, data=event.data)
-    if event.name == "resync":
-        _tell(inst=inst, errors=list(event.data.errors))
+def s_take(ctx, inst, event) -> None:
+    """The session takes an event: its handler (HANDLERS) works on a copy of the data, committed when
+    it returns, so a step that raises changes nothing."""
+    draft = _Draft(inst)
+    _rule(HANDLERS[event.name])(draft=draft, event=event)
+    _closing_steps(draft)
+    draft.commit()
 
 
-def s_call_began(ctx, inst, event) -> None:
-    """A user's call is in flight (its request id): a line out from now on is in its output."""
-    inst.calls.add(event.data)
+def _closing_steps(draft: _Draft) -> None:
+    """While closing: once every graft's join has reached the original, the original is shut down
+    (an outbox item, once)."""
+    if draft.closing and not draft.root_told and not draft.grafts:
+        draft.root_told = True
+        draft.outbox.append((draft.inst.root, "shutdown", None))
 
 
-def s_call_done(ctx, inst, event) -> None:
-    """A user's call is done (its request id): the errors kept while it was in flight are that
-    call's (their lines are in its output, or, if it raised, in the next call's), so `settle`
-    does not raise them again."""
-    inst.calls.discard(event.data)
-    inst.errors = [(e, calls) for e, calls in inst.errors if event.data not in calls]
-
-
-def s_record_and_answer(ctx, inst, event) -> None:
-    s_record(ctx=ctx, inst=inst, event=event)
-    s_answer(ctx=ctx, inst=inst, event=event)
-
-
-def s_answer(ctx, inst, event) -> None:
-    """Nothing is in flight: every `settle` waiting is answered, with the errors kept since the
-    last answer (each raised once). A settle leaves the session's data only once it is answered,
-    and the errors once the first is given them: a step that fails here leaves them for the
-    recovery's answer (the session's record re-stated, then checked again)."""
-    waiting = [s for s in inst.settles if not s.done()]  # a caller gone is not answered
-    if not waiting:
-        inst.settles = []
+def h_submit(draft: _Draft, event) -> None:
+    sub, reply = event.data
+    if draft.closing:
+        draft.answers.append((reply, "closing"))
         return
-    first, *rest = waiting
-    errors = [e for e, _ in inst.errors]
-    if len(errors) == 1:
-        _fail(reply=first, error=errors[HEAD])
-    elif errors:
-        _fail(reply=first, error=BaseExceptionGroup("background branches failed", errors))
+    if sub.follow_up:
+        rec = draft.tasks.get(sub.task)
+        if rec is None:
+            draft.answers.append((reply, "terminal" if sub.task in draft.ended else "not_found"))
+            return
+        rec.requests[sub.request.id] = "queued"
+        rec.reply = None
+        state = "TASK_STATE_SUBMITTED" if rec.state == "TASK_STATE_INPUT_REQUIRED" else rec.state
+        seq = draft.emit_status(sub.task, state, sub.message)
     else:
-        _resolve(reply=first, value=None)
-    inst.errors = [(e, calls) for e, calls in inst.errors if all(e is not x for x in errors)]
-    for later in rest:
-        _resolve(reply=later, value=None)
-    inst.settles = [s for s in inst.settles if not s.done()]
+        if sub.task in draft.tasks or sub.task in draft.ended:
+            draft.answers.append((reply, "terminal"))
+            return
+        draft.tasks[sub.task] = TaskRecord(state="TASK_STATE_SUBMITTED", requests={sub.request.id: "queued"})
+        seq = draft.emit({"task": {"id": sub.task, "contextId": draft.inst.context_id,
+                                   "status": {"state": "TASK_STATE_SUBMITTED"}, "history": [sub.message]}})
+    draft.req_task[sub.request.id] = sub.task
+    draft.after_write.append((seq, (draft.inst.root, "user_message", sub.request)))
+    draft.answers.append((reply, "accepted"))
 
 
-def s_withdraw(ctx, inst, event) -> None:
-    """A settle whose caller went away: it is no longer waiting (the errors stay kept)."""
-    inst.settles = [s for s in inst.settles if s is not event.data]
+def h_cancel(draft: _Draft, event) -> None:
+    task, reply = event.data
+    rec = draft.tasks.get(task)
+    if draft.closing or rec is None:
+        draft.answers.append((reply, "closing" if draft.closing else "terminal" if task in draft.ended else "not_found"))
+        return
+    for rid, where in sorted(rec.requests.items()):
+        if where != "queued":
+            draft.outbox.append((draft.inst.root, "withdraw", rid))
+    rec.reply = None
+    draft.end(task, "TASK_STATE_CANCELED")
+    draft.answers.append((reply, "accepted"))
 
 
-def s_shut_late(ctx, inst, event) -> None:
-    """Grafts made by a clone call that was in flight when closing began: they are shut down
-    too (one per step, `shutting`), and their joins waited for like the others'."""
-    _apply_session(inst=inst, name=event.name, data=event.data)
-    inst.to_shut = sorted(inst.grafts | inst.held)
-    inst.grafts |= inst.held
-    inst.held = set()
+def h_wait(draft: _Draft, event) -> None:
+    cursor, reply = event.data
+    if draft.inst.written > cursor:
+        draft.answers.append((reply, draft.inst.written))
+    elif draft.lost:
+        draft.failures.append((reply, draft.lost[HEAD]))
+        draft.lost = draft.lost[1:]
+    else:
+        draft.waits.append((cursor, reply))
 
 
-def s_stash_settle(ctx, inst, event) -> None:
-    inst.settles.append(event.data)
+def h_said(draft: _Draft, event) -> None:
+    text, tasks = event.data
+    if not tasks:
+        draft.say(None, text)
+    for task in sorted(set(tasks)):
+        if task in draft.tasks:
+            draft.say(task, text)
 
 
-def s_check(ctx, inst, event) -> None:
-    """A settle asked while nothing is in flight: the original is asked to apply the joins it
-    still has queued; the answer comes when `checking` is entered and checked."""
-    inst.settles.append(event.data)
-    _forward(target=inst.machines.timelines.get(inst.root), name="poke")
+def h_answering(draft: _Draft, event) -> None:
+    _tl, task = event.data
+    draft.working(task)
 
 
-def s_checked(ctx, inst, event) -> None:  # entry of `checking`
-    _self(inst=inst, name="checked")
+def h_grafts_made(draft: _Draft, event) -> None:
+    grafts, held, tasks = event.data
+    (draft.held if held else draft.grafts).update(grafts)
+    draft.graft_tasks.update({g: tuple(t) for g, t in tasks.items()})
+    if draft.closing:  # made by a clone call already past the gate when closing began: shut down too
+        draft.outbox += [(g, "shutdown", None) for g in sorted(set(grafts))]
+        draft.grafts |= draft.held
+        draft.held = set()
 
 
-def s_failure(ctx, inst, event) -> None:
-    """Errors no caller was given: kept for `settle`. Those whose line is out (`shown`) are not,
-    once a user's call that was in flight then is done: its output showed them (see `_keep`)."""
-    for error, shown in event.data:
-        _keep(inst=inst, errors=[error], shown=shown)
+def h_graft_received(draft: _Draft, event) -> None:
+    child = event.data
+    draft.grafts.discard(child)
+    draft.held.discard(child)
+    for task in draft.graft_tasks.pop(child, ()):
+        draft.working(task)
+
+
+def h_grafts_undone(draft: _Draft, event) -> None:
+    for g in event.data:
+        draft.grafts.discard(g)
+        draft.held.discard(g)
+        draft.graft_tasks.pop(g, None)
+
+
+def h_rested(draft: _Draft, event) -> None:
+    rested: Rested = event.data
+    for rid, error in rested.answered:
+        draft.answer(rid, error)
+    if rested.owed is None:
+        for task in draft.tasks_of(rid for rid, _ in rested.answered):
+            rec = draft.tasks[task]
+            if rec.state != "TASK_STATE_INPUT_REQUIRED":
+                draft.emit_status(task, "TASK_STATE_INPUT_REQUIRED", rec.reply)
+    elif rested.tl == draft.inst.root:
+        draft.decide(rested.owed)
+
+
+def h_resync(draft: _Draft, event) -> None:
+    """A timeline's whole record, re-stated after a fault (the records passed on with it first)."""
+    record: Record = event.data
+    for passed_on in record.also:
+        h_resync(draft=draft, event=hsm.Event(name="resync", data=passed_on))
+    for rid, error in record.failed:
+        draft.answer(rid, error)
+    for rid in record.answered:
+        draft.answer(rid, None)
+    if record.grafts is not None:
+        running, held = set(record.grafts), set(record.held)
+        draft.grafts, draft.held = (running | held, set()) if draft.closing else (running, held)
+        draft.graft_tasks.update({g: tuple(t) for g, t in record.graft_tasks})
+    if record.tl == draft.inst.root and record.engaged is False and record.owed is not None and not record.closed:
+        draft.decide(record.owed)
+    elif record.failed:  # a request that failed alone (its call's step): its task, if nothing else of it is out
+        owed = record.owed if record.owed is not None else frozenset(  # a focus graft's: the session's own record
+            t for tasks in draft.graft_tasks.values() for t in tasks)
+        for task in draft.tasks_of(rid for rid, _ in record.failed):
+            rec = draft.tasks[task]
+            if task not in owed and all(w == "answered" for w in rec.requests.values()):
+                draft.end(task, "TASK_STATE_FAILED")
+    errors = list(record.errors)
+    if errors:  # the errors no caller was given: worded by the scribe, then told
+        error = errors[HEAD] if len(errors) == 1 else BaseExceptionGroup("a step failed", errors)
+        draft.outbox.append(("scribe", "note", (("report", dict(kind="machine", src=None, clones=[], error=error,
+                                                                quiet=False, background=False)), None)))
+    if record.tl == draft.inst.root and record.closed:
+        h_root_closed(draft=draft, event=hsm.Event(name="root_closed", data=record.tl))
+
+
+
+def h_report(draft: _Draft, event) -> None:
+    line, fails = event.data
+    for task in fails:
+        if task in draft.tasks:
+            draft.tasks[task].failed = True
+    draft.tell(line)
+
+
+def h_failure(draft: _Draft, event) -> None:
+    """Errors the scribe could not word or write: kept for the next consumer's wait (each once)."""
+    errors = [e for e in event.data if all(e is not k for k in draft.lost)]
+    waiting = [r for _, r in draft.waits if not r.done()]
+    for error in errors:
+        if waiting:
+            draft.failures += [(r, error) for r in waiting]
+            draft.waits, waiting = [], []
+        else:
+            draft.lost.append(error)
+
+
+def h_shutdown(draft: _Draft, event) -> None:
+    if event.data is not None:
+        draft.closers.append(event.data)
+    if draft.closing:
+        return
+    draft.closing = True
+    # undelivered user messages are not delivered: their tasks fail with the rest
+    draft.after_write = [(s, send) for s, send in draft.after_write if send[1] != "user_message"]
+    draft.outbox = [send for send in draft.outbox if send[1] != "user_message"]
+    draft.outbox.append((draft.inst.root, "closing", None))  # nothing is woken from now on
+    draft.grafts |= draft.held
+    draft.held = set()
+    draft.outbox += [(g, "shutdown", None) for g in sorted(draft.grafts)]
+
+
+def h_root_closed(draft: _Draft, event) -> None:
+    if event.data != draft.inst.root or draft.root_closed:
+        return  # a focus graft closed
+    draft.root_closed = True
+    draft.outbox.append(("scribe", "note", (("flush", {}), None)))  # the scribe's notes before it, written first
+    for task in sorted(draft.tasks):
+        draft.end(task, "TASK_STATE_FAILED", reason=CLOSED_TEXT)
+
+
+def h_scribe_flushed(draft: _Draft, event) -> None:
+    draft.scribe_flushed = True
+
+
+HANDLERS = {"submit": h_submit, "cancel_task": h_cancel, "events_wait": h_wait, "said": h_said,
+            "answering": h_answering, "grafts_made": h_grafts_made, "graft_received": h_graft_received,
+            "grafts_undone": h_grafts_undone, "rested": h_rested, "resync": h_resync, "report": h_report,
+            "failure": h_failure, "shutdown": h_shutdown, "root_closed": h_root_closed,
+            "scribe_flushed": h_scribe_flushed}
+TAKEN = tuple(HANDLERS)
+
+
+
+
+# ---- the working part: sending, writing, and the choice every step ends in
+def has_outbox(ctx, inst, event) -> bool:
+    return bool(inst.outbox)
+
+
+def writes_due(ctx, inst, event) -> bool:
+    return bool(inst.pending) and not inst.blocked
+
+
+def stops_now(ctx, inst, event) -> bool:
+    """Closed: the original has closed, and everything decided is written and sent (or a write keeps
+    failing: `close()` raises it)."""
+    return inst.root_closed and inst.scribe_flushed and not inst.outbox and (not inst.pending or inst.blocked)
+
+
+def _send_head(inst: SessionSM) -> None:
+    """The head of the outbox is sent; it leaves the outbox in the same effect, after its send is
+    made, so a step that raises sends nothing and keeps it."""
+    target, name, data = inst.outbox[HEAD]
+    machine = inst.machines.scribe if target == "scribe" else inst.machines.timelines.get(target)
+    _forward(target=machine, name=name, data=data)
+    if name == "user_message":
+        task = inst.req_task.get(data.id)
+        rec = inst.tasks.get(task) if task is not None else None
+        if rec is not None and rec.requests.get(data.id) == "queued":
+            rec.requests[data.id] = "delivered"
+    inst.outbox = inst.outbox[1:]
+
+
+def s_send(ctx, inst, event) -> None:
+    _send_head(inst)
+
+
+def s_tick(ctx, inst, event) -> None:  # entry of `sending`: back to the choice, as its own step
+    _self(inst=inst, name="sent")
+
+
+def _write_events(inst, event):
+    """The decided events, appended at their positions in one SQL transaction (a batch written
+    twice is written once). Returns the last position written."""
+    return inst.machines.host.append_events(events=list(inst.pending))
+
+
+def s_written(ctx, inst, event) -> None:
+    """Written: the events leave `pending`, every consumer whose cursor this passed is answered, and
+    the sends that waited for these positions join the outbox."""
+    written = max(inst.written, event.data)
+    pending = [(s, e) for s, e in inst.pending if s > written]
+    due = [send for s, send in inst.after_write if s <= written]
+    after = [(s, send) for s, send in inst.after_write if s > written]
+    passed = [r for c, r in inst.waits if c < written]
+    inst.written, inst.pending, inst.after_write = written, pending, after
+    inst.outbox = inst.outbox + due
+    inst.waits = [(c, r) for c, r in inst.waits if c >= written and not r.done()]
+    inst.attempts = NONE_YET
+    for reply in passed:
+        _resolve(reply=reply, value=written)
+
+
+def s_write_failed(ctx, inst, event) -> None:
+    """A write failed: `pending` stays as it was; every consumer waiting gets the error. It is tried
+    again at once up to MAX_WRITE_ATTEMPTS times, then at the session's next event."""
+    error = event.data
+    waiting = [r for _, r in inst.waits]
+    attempts = inst.attempts + 1
+    inst.waits = []
+    inst.attempts = attempts if attempts < MAX_WRITE_ATTEMPTS else NONE_YET
+    inst.blocked = attempts >= MAX_WRITE_ATTEMPTS
+    inst.write_error = error
+    for reply in waiting:
+        _fail(reply=reply, error=error)
 
 
 def s_fault(ctx, inst, event) -> None:
-    """A step of the session failed, so its record may be wrong, and so may any answer it was
-    about to give: the caller of its event and every `settle` waiting get the error (once), what
-    the event said of a user's call is kept, and the original is asked to re-state its record
-    (`restate`; suspended, it passes the question on to its focus graft), which comes back with
-    the errors no caller was given, to keep and show. A state that ticks on entry is entered again by its own `fault`
-    transition."""
+    """A step of the session failed (it changed nothing: a step commits only at its end): its
+    event's caller and every consumer waiting get the error (once), and the original is asked to
+    re-state its record (`restate`, an outbox item; suspended, it passes the question on to its
+    focus graft), which comes back with the errors no caller was given, to tell."""
     fault = _take_fault(inst=inst, event=event)
-    if fault.event.name == "call_began":  # a call in flight from now on, whatever the step did
-        inst.calls.add(fault.event.data)
-    elif fault.event.name == "call_done":
-        s_call_done(ctx=ctx, inst=inst, event=fault.event)
-    elif fault.event.name == "failure":  # the errors that step was keeping are kept, whatever the step did
-        s_failure(ctx=ctx, inst=inst, event=fault.event)
-    elif fault.event.name == "shutdown":  # the session closes as without the fault (its caller has the error)
-        _close_session(inst=inst)
-    closing = fault.event.name in CLOSES  # the step that closed the session: `close` waits on it
-    waiting = list(inst.settles) + (list(inst.closers) if closing else [])
-    replies = _caller_of(event=fault.event) + waiting
+    replies = _caller_of(event=fault.event) + [r for _, r in inst.waits]
     told = _told(fault=fault, replies=replies)
     fault.told = _fail_all(replies=replies, error=fault.error) or fault.told
-    _forward(target=inst.machines.timelines.get(inst.root), name="restate",
-             data=Restate(errors=tuple(_errors_for_session(errors=fault.errors, told=told))))
-    inst.settles, inst.closers = [], [] if closing else inst.closers
-
-
-
-
-
-def s_closing(ctx, inst, event) -> None:
-    """Close: the original is told first (nothing is woken from now on); the grafts are shut
-    down one per step (`shutting`), then the original once their joins have reached it."""
-    inst.closers += [event.data] if event.data is not None else []
-    _close_session(inst=inst)
-    _forward(target=inst.machines.timelines.get(inst.root), name="closing")
-
-
-def _close_session(inst: SessionSM) -> None:
-    """Closing: every graft still running is to be shut down (one per step, `shutting`), and its
-    join waited for like the others'."""
-    inst.closing = True
-    inst.to_shut = sorted(inst.grafts | inst.held)
-    inst.grafts |= inst.held
-    inst.held = set()
-
-
-def s_shut_next(ctx, inst, event) -> None:  # entry of `shutting`
-    _self(inst=inst, name="shut_next")
-
-
-def s_shut_one(ctx, inst, event) -> None:
-    _forward(target=inst.machines.timelines.get(inst.to_shut.pop(HEAD)), name="shutdown")
-
-
-def s_wait_joins(ctx, inst, event) -> None:  # entry of `draining`
-    _self(inst=inst, name="joins_check")
-
-
-def s_shut_root(ctx, inst, event) -> None:  # entry of `finishing`
-    """Every graft's join has reached the original: it is shut down (it applies what it can and
-    closes). Entered again if the step fails, so the original is always told."""
-    _forward(target=inst.machines.timelines.get(inst.root), name="shutdown")
-
-
-def s_stash_closer(ctx, inst, event) -> None:
-    inst.closers += [event.data] if event.data is not None else []
+    inst.waits = []
+    if fault.event.name == "shutdown":  # the session closes as without the fault (its caller has the error)
+        draft = _Draft(inst)
+        h_shutdown(draft=draft, event=hsm.Event(name="shutdown", data=None))
+        _closing_steps(draft)
+        draft.commit()
+    inst.outbox = inst.outbox + [(inst.root, "restate", Restate(errors=tuple(_errors_for_session(
+        errors=fault.errors, told=told))))]
 
 
 def s_closed(ctx, inst, event) -> None:
-    """Closed: every close and settle waiting is answered; a machine that could not be stopped
-    is the first close's error (the one error, or an ExceptionGroup of all of them)."""
-    closers, settles, errors = list(inst.closers), list(inst.settles), list(inst.stop_errors)
+    """Closed: every close waiting is answered (a machine that could not be stopped, or a write that
+    kept failing, is the first close's error) and every consumer waiting is answered (the log is
+    final)."""
+    errors = list(inst.stop_errors) + ([inst.write_error] if inst.blocked and inst.write_error else [])
+    closers, waits = list(inst.closers), [r for _, r in inst.waits]
     if closers and errors:
         first, *closers = closers
-        _fail(reply=first, error=errors[0] if len(errors) == 1 else BaseExceptionGroup("stopping machines failed", errors))
-    for reply in closers + settles:
-        _resolve(reply=reply, value=None)
-    # left only once answered: a step that fails here leaves them for its recovery to answer
-    inst.closers, inst.settles, inst.stop_errors = [], [], []
+        _fail(reply=first, error=errors[0] if len(errors) == 1 else BaseExceptionGroup("closing failed", errors))
+    for reply in closers + waits:
+        _resolve(reply=reply, value=inst.written)
+    inst.closers, inst.waits, inst.stop_errors = [], [], []
+
+
+def s_answer_closed(ctx, inst, event) -> None:
+    """After `closed`: a wait is answered at once (the log is final); a submit or cancel is refused."""
+    data = event.data
+    if event.name == "events_wait":
+        _resolve(reply=data[1], value=inst.written)
+    elif event.name in ("submit", "cancel_task"):
+        _resolve(reply=data[1], value="closing")
+    else:
+        _resolve(reply=_reply_of(data), value=None)
 
 
 def s_take_stop_errors(ctx, inst, event) -> None:
@@ -4419,11 +4801,10 @@ def s_stops_clean(ctx, inst, event) -> bool:
 
 
 async def s_stop_machines(ctx, inst: SessionSM, event) -> None:
-    """The original has closed: every timeline's machine and the scribe are stopped (each stop
-    waits for the step it is in), so nothing stays live after `close`. A machine that cannot be
-    stopped does not keep the others live: each failure is collected, the rest are still
-    stopped, and the outcome (`stopped`) carries the failures. Later requests to the stopped
-    machines are refused by the registry."""
+    """The original has closed and everything decided is written: every timeline's machine and the
+    scribe are stopped (each stop waits for the step it is in), so nothing stays live after `close`.
+    A machine that cannot be stopped does not keep the others live: each failure is collected, the
+    rest are still stopped, and the outcome (`stopped`) carries the failures."""
     errors: list[BaseException] = []
     for sm in [*inst.machines.timelines.values(), inst.machines.scribe]:
         if sm is not None and sm.state():
@@ -4435,21 +4816,24 @@ async def s_stop_machines(ctx, inst: SessionSM, event) -> None:
 
 
 def _s_tell(inst, event):
-    """The machines that could not be stopped are told to the user (the scribe is stopped by now,
-    so the session's own activity calls the host), each whatever telling another one raised. The
-    outcome is what the user's callbacks raised meanwhile, which close raises with the rest."""
+    """The machines that could not be stopped are told (the scribe is stopped by now, so the
+    session's own activity has the host word the lines and writes them as context-level errors).
+    The outcome is what telling them raised, which close raises with the rest."""
     failed: list[BaseException] = []
     for error in inst.stop_errors:
         try:
-            inst.machines.host.report(kind="machine", src=None, clones=[], error=error, quiet=False,
-                                      background=False)
+            line, _ = inst.machines.host.report(kind="machine", src=None, clones=[], error=error, quiet=False,
+                                                     background=False)
+            seq = max(inst.next_seq, inst.written + 1)
+            inst.machines.host.append_events(events=[(seq, {"message": _message(inst, seq, None, line, error=True)})])
+            inst.next_seq = seq + 1
+            inst.written = seq
         except Exception as e:  # noqa: BLE001 - the outcome event carries it
             failed.append(e)
     return failed
 
 
 def s_told(ctx, inst, event) -> None:
-    """Every stop failure was told: what telling them raised is added to what close raises."""
     inst.stop_errors += list(event.data)
     s_closed(ctx=ctx, inst=inst, event=event)
 
@@ -4459,117 +4843,65 @@ def s_tell_crashed(ctx, inst, event) -> None:
     s_closed(ctx=ctx, inst=inst, event=event)
 
 
-def s_answer_now(ctx, inst, event) -> None:
-    _resolve(reply=event.data, value=None)
+def s_ignore(ctx, inst, event) -> None:
+    return None
 
-
-def left_to_shut(ctx, inst, event) -> bool:
-    return bool(inst.to_shut)
-
-
-def all_joins_in(ctx, inst, event) -> bool:
-    return not inst.grafts
-
-
-def last_join_in(ctx, inst, event) -> bool:
-    return inst.grafts == {event.data}
-
-
-def is_root_event(ctx, inst, event) -> bool:
-    return event.data == inst.root
-
-
-def root_record_closed(ctx, inst, event) -> bool:
-    """A record re-stated by the original after a fault says it has closed."""
-    return event.data.tl == inst.root and event.data.closed
-
-
-# The session's steps that close it (the machines stopped, or told): a `close` waits on them.
-CLOSES = ("stopped", "told", hsm.ErrorEvent.name)
-RECORDS = ("engaged", "rested", "handed", "suspended", "grafts_made", "graft_received", "grafts_undone", "resync")
 
 SESSION = hsm.Define(
     "Session",
-    hsm.Initial(_S("open/quiet")),
-    _T(_On(*REQUESTS[:-2], "when_queued", "rest_request"), Effect(refuse_request)),
-    _T(_On("failure"), Effect(s_failure)),
-    _T(_On(*RECORDS), Effect(s_record)),
-    _T(_On("settle_request", "shutdown"), Effect(s_answer_now)),
-    _T(_On("settle_withdrawn"), Effect(s_withdraw)),
-    _T(_On("call_began"), Effect(s_call_began)),
-    _T(_On("call_done"), Effect(s_call_done)),
-    _T(_On("checked", "root_closed", "shut_next", "joins_check"), Effect(ignore)),
-    _T(_On(FAULT), Effect(s_fault)),
+    hsm.Initial(_S("live/ready")),
+    _T(_On(*REQUESTS, "when_queued", "rest_request"), Effect(refuse_request)),
     hsm.State(
-        "open",
-        _T(_On(*RECORDS), _S("working"), _G(s_busy_after), Effect(s_record)),
-        _T(_On(*RECORDS), Effect(checked(s_busy_after, effects=(s_record,)))),
-        _T(_On("settle_request"), Effect(s_stash_settle)),
-        _T(_On("shutdown"), _S("../closing"), Effect(s_closing)),
+        "live",
+        # while sending or writing, an event only changes the session's data: the choice after the
+        # send or the write picks up what it added
+        _T(_On(*TAKEN), Effect(s_take)),
+        _T(_On("engaged", "suspended", "handed", "sent", "written", "write_failed"), Effect(s_ignore)),
+        _T(_On(FAULT), Effect(s_fault)),
         hsm.State(
-            "quiet",
-            # a settle left waiting by a step that failed is answered by the next record that leaves
-            # the session quiet (one waiting otherwise goes to `checking`)
-            _T(_On(*RECORDS), _G(s_quiet_after), Effect(s_record_and_answer)),
-            _T(_On(*RECORDS), _S("../working"), _G(s_busy_after), Effect(s_record)),
-            _T(_On(*RECORDS), Effect(checked(s_quiet_after, s_busy_after, effects=(s_record,)))),
-            _T(_On("settle_request"), _S("../checking"), Effect(s_check)),
+            "ready",
+            _T(_On(*TAKEN), _S("../flush"), Effect(s_take)),
+            _T(_On(FAULT), _S("../flush"), Effect(s_fault)),
         ),
-        hsm.State("checking", Entry(s_checked), _T(_On("checked"), _S("../quiet"), Effect(s_answer)),
-                  _T(_On(FAULT), _S("../checking"), Effect(s_fault))),
+        hsm.Choice(
+            "flush",  # every step ends here: sends first, then the write, then (closed) the stop
+            _T(_S("sending"), _G(has_outbox), Effect(s_send)),
+            _T(_S("writing"), _G(writes_due)),
+            _T(_S("../stopping"), _G(stops_now)),
+            _T(_S("ready"), Effect(checked(has_outbox, writes_due, stops_now))),
+        ),
+        hsm.State("sending", Entry(s_tick), _T(_On("sent"), _S("../flush"))),
         hsm.State(
-            "working",
-            _T(_On(*RECORDS), _S("../quiet"), _G(s_quiet_after), Effect(s_record_and_answer)),
-            _T(_On(*RECORDS), _G(s_busy_after), Effect(s_record)),
-            _T(_On(*RECORDS), Effect(checked(s_quiet_after, s_busy_after, effects=(s_record,)))),
+            "writing", io(done="written", work=_write_events),
+            hsm.Defer(FAULT),  # a fault waits for the write's outcome
+            _T(_On("written"), _S("../flush"), Effect(s_written)),
+            _T(_On(_E), _S("../flush"), Effect(s_write_failed)),
         ),
     ),
     hsm.State(
-        "closing",
-        _T(_On("settle_request"), Effect(s_stash_settle)),
-        _T(_On("shutdown"), Effect(s_stash_closer)),
-        _T(_On("root_closed"), _S("stopping"), _G(is_root_event)),
-        _T(_On("root_closed"), Effect(checked(is_root_event, effects=(ignore,)))),  # a focus graft closed
-        # the original closed, but its step failed before it told the session: its record says so
-        _T(_On("resync"), _S("stopping"), _G(root_record_closed), Effect(s_record)),
-        _T(_On("resync"), Effect(checked(root_record_closed, effects=(s_record,)))),
-        _T(_On("grafts_made"), _S("shutting"), Effect(s_shut_late)),
-        hsm.Initial(_S("shutting")),
-        hsm.State(
-            "shutting", Entry(s_shut_next),
-            _T(_On("shut_next"), _S("../shutting"), _G(left_to_shut), Effect(s_shut_one)),
-            _T(_On("shut_next"), _S("../draining"), Effect(checked(left_to_shut))),
-            _T(_On(FAULT), _S("../shutting"), Effect(s_fault)),
-        ),
-        hsm.State(
-            "draining", Entry(s_wait_joins),
-            _T(_On("joins_check"), _S("../finishing"), _G(all_joins_in)),
-            _T(_On("joins_check"), Effect(checked(all_joins_in, effects=(ignore,)))),
-            _T(_On("graft_received"), _S("../finishing"), _G(last_join_in), Effect(s_record)),
-            _T(_On("graft_received"), Effect(checked(last_join_in, effects=(s_record,)))),
-            # a record re-stated after a fault may leave no join to wait for: checked again
-            _T(_On("resync"), _S("../draining"), Effect(s_record)),
-            _T(_On(FAULT), _S("../draining"), Effect(s_fault)),
-        ),
-        hsm.State("finishing", Entry(s_shut_root), _T(_On(FAULT), _S("../finishing"), Effect(s_fault))),
-        hsm.State(
-            "stopping", Activity(work=s_stop_machines, done="stopped"),  # every machine but this one, then closed
-            _T(_On("stopped"), _S("../../closed"), _G(s_stops_clean), Effect(s_closed)),
-            _T(_On("stopped"), _S("../telling"), Effect(checked(s_stops_clean, effects=(s_take_stop_errors,)))),
-            _T(_On(_E), _S("../telling"), Effect(s_stop_crashed)),
-            _T(_On(FAULT), _S("../stopping"), _G(held_back_in(activity="stopped")), Effect(s_fault)),
-            _T(_On(FAULT), Effect(checked(held_back_in(activity="stopped"), effects=(s_fault,), first=True))),
-        ),
-        hsm.State(
-            "telling", io(done="told", work=_s_tell),  # a machine that could not be stopped: reported
-            _T(_On("told"), _S("../../closed"), Effect(s_told)),
-            _T(_On(_E), _S("../../closed"), Effect(s_tell_crashed)),
-            _T(_On(FAULT), _S("../telling"), _G(held_back_in(activity="told")), Effect(s_fault)),
-            _T(_On(FAULT), Effect(checked(held_back_in(activity="told"), effects=(s_fault,), first=True))),
-        ),
+        "stopping", Activity(work=s_stop_machines, done="stopped"),  # every machine but this one, then closed
+        _T(_On("stopped"), _S("../closed"), _G(s_stops_clean), Effect(s_closed)),
+        _T(_On("stopped"), _S("../telling"), Effect(checked(s_stops_clean, effects=(s_take_stop_errors,)))),
+        _T(_On(_E), _S("../telling"), Effect(s_stop_crashed)),
+        _T(_On(*TAKEN), Effect(s_answer_closed)),
+        _T(_On(FAULT), _S("../stopping"), _G(held_back_in(activity="stopped")), Effect(s_fault)),
+        _T(_On(FAULT), Effect(checked(held_back_in(activity="stopped"), effects=(s_fault,), first=True))),
     ),
-    hsm.Final("closed"),
+    hsm.State(
+        "telling", io(done="told", work=_s_tell),  # a machine that could not be stopped: reported
+        _T(_On("told"), _S("../closed"), Effect(s_told)),
+        _T(_On(_E), _S("../closed"), Effect(s_tell_crashed)),
+        _T(_On(*TAKEN), Effect(s_answer_closed)),
+    ),
+    hsm.State("closed", _T(_On(*TAKEN), Effect(s_answer_closed))),
 )
+
+
+def _taken(reply: asyncio.Future) -> None:
+    """A request's answer marker is read once it is set, so an error it holds is never reported as
+    unread: the session has it (`rested`)."""
+    if not reply.cancelled():
+        reply.exception()
 
 
 class Machines:
@@ -4585,12 +4917,12 @@ class Machines:
         self.requests = 0  # user requests made so far: the next one's id
 
     # ------------------------------------------------------------------ making machines
-    async def start_root(self, tl: str) -> None:
+    async def start_root(self, tl: str, context_id: str = "context", position: int = 0) -> None:
         if self.root is not None:
             raise TransitionRefused("root already started")
         self.scribe = ScribeSM(self)
         await hsm.Started(None, self.scribe, SCRIBE, hsm.Config(ID="scribe"))
-        self.session = SessionSM(self)
+        self.session = SessionSM(self, context_id=context_id, position=position)
         self.session.root = tl
         await hsm.Started(None, self.session, SESSION, hsm.Config(ID="session"))
         sm = TimelineSM(machines=self, timeline_id=tl, source_id=None, kind="original")
@@ -4602,10 +4934,14 @@ class Machines:
     def future(self) -> asyncio.Future:
         return asyncio.get_running_loop().create_future()
 
-    def request(self, text: str) -> Request:
-        """A new user request: a fresh id and the future that carries its answer."""
+    def request(self, text: str, task: str | None = None) -> Request:
+        """A new user request of a host task: a fresh id, and the future its answering machine
+        resolves (the machine's own marker of the answer: no caller awaits it, so whatever it holds
+        is taken here, never left unread; the answer reaches the host through the session)."""
         self.requests += 1
-        return Request(id=self.requests, text=text, reply=self.future())
+        reply = self.future()
+        reply.add_done_callback(_taken)
+        return Request(id=self.requests, text=text, reply=reply, task=task)
 
     def _target(self, tl: str, name: str) -> hsm.Instance:
         sm = self.session if tl == "session" else self.timelines.get(tl)

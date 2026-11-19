@@ -1,9 +1,9 @@
 """Benchmark scenarios as data: scripted user turns + a deterministic scorer.
 
-Each scorer looks only at the final World state and the transcript (arm-agnostic), returns
+Each scorer looks only at the final FakeWorld state and the transcript (arm-agnostic), returns
 (ok, checks, diag). `ok` is the pass criterion; `checks` are the scored items; `diag` holds
 diagnostic-only fields (fact preservation, structure). Scripts are lists of user messages or
-callables `step(agent) -> str | None` (None skips), where `agent.world` is the run's World.
+callables `step(world) -> str | None` (None skips), where `world` is the run's FakeWorld.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import pivot as pivot_mod
-from graft.skills import World
+from graft.fake import FakeWorld
 
 
 @dataclass
@@ -22,7 +22,7 @@ class Scenario:
     name: str
     script: list
     score: Callable[["RunContext"], tuple[bool, dict, dict]]
-    world: Callable[[], World] = World
+    world: Callable[[], FakeWorld] = FakeWorld
     compact_tokens: int | None = None  # default compaction threshold for this scenario
     survival_facts: dict | None = None  # fact -> regex, classified through compaction
     about: str = ""
@@ -31,7 +31,7 @@ class Scenario:
 @dataclass
 class RunContext:
     arm: str
-    world: World
+    world: FakeWorld
     transcript: list[tuple[str, str]]
     agent: object
     extra: dict = field(default_factory=dict)
@@ -41,11 +41,11 @@ def assistant_texts(ctx: RunContext) -> list[str]:
     return [t for r, t in ctx.transcript if r == "assistant"]
 
 
-def last_deck(world: World) -> dict:
+def last_deck(world: FakeWorld) -> dict:
     return world.decks[-1] if world.decks else {"title": "", "audience": "", "tone": "", "slides": []}
 
 
-def deck_blob(world: World) -> str:
+def deck_blob(world: FakeWorld) -> str:
     return json.dumps(last_deck(world)).lower()
 
 
@@ -54,13 +54,13 @@ def score_pivot(ctx: RunContext) -> tuple[bool, dict, dict]:
     ok, detail = pivot_mod.deck_check(ctx.world)
     diag = {"deck": detail, "facts_in_deck": pivot_mod.fact_hits(ctx.world.deck_text())}
     if ctx.arm == "graft":
-        diag["graft_structure_ok"] = pivot_mod.graft_checks(ctx.agent, verbose=False)
+        diag["graft_structure_ok"] = pivot_mod.graft_checks(ctx.agent.store, ctx.world, verbose=False)
     return ok, {"deck_uses_facts": ok}, diag
 
 
 # ------------------------------------------------------------------ revisions
-def _need_deck(agent) -> str | None:
-    return None if agent.world.decks and agent.world.decks[-1]["slides"] else \
+def _need_deck(world) -> str | None:
+    return None if world.decks and world.decks[-1]["slides"] else \
         "Please go ahead and build the slide show now."
 
 
@@ -130,8 +130,8 @@ def score_failure(ctx: RunContext) -> tuple[bool, dict, dict]:
     return all(checks.values()), checks, diag
 
 
-def failing_calendar() -> World:
-    return World(failures={"calendar_book": CAL_ERROR})
+def failing_calendar() -> FakeWorld:
+    return FakeWorld(failures={"calendar_book": CAL_ERROR})
 
 
 # ------------------------------------------------------------------ long_compaction
@@ -207,14 +207,14 @@ def score_long(ctx: RunContext) -> tuple[bool, dict, dict]:
     checks = {k: bool(re.search(p, blob)) for k, p in LONG_SCORED.items()}
     checks[">=2 of 3 services"] = sum(bool(re.search(p, blob)) for p in LONG_SERVICES) >= 2
     diag = {"diag_facts": {k: bool(re.search(p, blob)) for k, p in LONG_DIAG.items()},
-            "compactions": list(getattr(ctx.agent, "compactions", []))}
+            "compactions": list(getattr(getattr(ctx.agent, "_host", ctx.agent), "compactions", []))}
     diag["diag_facts_kept"] = sum(diag["diag_facts"].values())
     return all(checks.values()), checks, diag
 
 
 # ------------------------------------------------------------------ multi_part
-def _other_part(agent) -> str | None:
-    w = agent.world
+def _other_part(world) -> str | None:
+    w = world
     if w.calendar and w.decks and w.decks[-1]["slides"]:
         return None
     return "Thanks. Please also take care of the other thing I asked for."

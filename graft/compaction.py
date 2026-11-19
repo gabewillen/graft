@@ -65,7 +65,7 @@ COMPACT_TOOL = {
     "description": "Compact your conversation into an ordered list of items covering every row of "
                    "the index exactly once: keep a row, or compress a contiguous window of rows "
                    "into one message.",
-    "input_schema": {"type": "object", "properties": {
+    "inputSchema": {"type": "object", "properties": {
         "items": {"type": "array", "items": {"anyOf": [
             {"type": "object", "description": "Keep one row unchanged (a pointer).",
              "properties": {"op": {"type": "string", "enum": ["keep"]}, "row_id": {"type": "integer"}},

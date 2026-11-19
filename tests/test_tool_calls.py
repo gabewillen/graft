@@ -4,12 +4,14 @@ shutdown) cancels the tool where it waits, and the call is recorded as run with 
 as not executed: it may have acted, or may still act."""
 
 import asyncio
-from _util import ran, started, woke
 import threading
 
 import pytest
 
-from graft.skills import World
+from _util import ran, started, woke, conversation, chat_of, install_fake
+from graft.agent import HarnessError
+from graft.fake import FakeWorld
+
 from test_parallel import (REQUEST, WAIT_TIMEOUT, clone_entry, clone_use, is_wake, make, text, tool_results,
                            violations)
 
@@ -21,7 +23,7 @@ def use(id, name, **args):
     return {"type": "tool_use", "id": id, "name": name, "input": args}
 
 
-class Meeting(World):
+class Meeting(FakeWorld):
     """site_write (clone A) waits until slides_create (clone B) has run; each call is logged as it
     starts and ends, on the loop. `a_started` is a threading.Event: B's model call waits on it, so
     A's tool is already waiting when B's runs."""
@@ -81,10 +83,10 @@ def test_a_tool_that_awaits_another_clones_tool_lets_both_run_and_finish(tmp_pat
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
         await asyncio.wait_for(asyncio.gather(h.join_queued("c1"), h.join_queued("c2")), WAIT_TIMEOUT)
-        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
@@ -95,7 +97,7 @@ def test_a_tool_that_awaits_another_clones_tool_lets_both_run_and_finish(tmp_pat
     assert h.tools_run("c1") == ["site_write"] and h.tools_run("c2") == ["slides_create"]
 
 
-class Hanging(World):
+class Hanging(FakeWorld):
     """site_write waits for ever; it records that it started and that it was cancelled."""
 
     def __init__(self):
@@ -134,12 +136,12 @@ def test_a_background_graft_cancelled_while_its_tool_awaits_records_the_call_as_
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
 
     async def go():
-        await h.start()
-        assert await h.user_says(REQUEST) == ["Started."]
+        await chat_of(h).start()
+        assert await chat_of(h).say(REQUEST) == ["Started."]
         await asyncio.wait_for(world.started.wait(), WAIT_TIMEOUT)
-        out = await asyncio.wait_for(h.user_says(STOP), WAIT_TIMEOUT)
+        out = await asyncio.wait_for(chat_of(h).say(STOP), WAIT_TIMEOUT)
         assert out[0] == "Stopped."
-        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
@@ -161,16 +163,16 @@ def test_a_focus_graft_whose_request_is_withdrawn_while_its_tool_awaits_records_
     store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=world)
 
     async def go():
-        await h.start()
-        call = asyncio.create_task(h.user_says(REQUEST))
+        await chat_of(h).start()
+        call = asyncio.create_task(chat_of(h).say(REQUEST))
         await asyncio.wait_for(world.started.wait(), WAIT_TIMEOUT)
         call.cancel()  # the user withdraws the request the focus graft's run answers
         try:
             await call
         except asyncio.CancelledError:
             pass
-        assert await asyncio.wait_for(h.until_rest("c1"), WAIT_TIMEOUT) == "ended"
-        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        assert await asyncio.wait_for(h.until_rest("c1"), WAIT_TIMEOUT) == "joined"  # it merged `cancelled`
+        await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
@@ -180,7 +182,7 @@ def test_a_focus_graft_whose_request_is_withdrawn_while_its_tool_awaits_records_
     assert violations(store=store, tl="c1") == []
 
 
-class Slow(World):
+class Slow(FakeWorld):
     """Two awaited tools: the first takes longer. Each logs its start and end."""
 
     def __init__(self):
@@ -210,10 +212,10 @@ def test_a_turns_awaited_tool_calls_run_one_at_a_time_and_are_stored_in_call_ord
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
         await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)
-        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
@@ -229,8 +231,8 @@ def test_close_while_a_background_graft_s_tool_awaits_returns_and_records_the_ca
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
 
     async def go():
-        await h.start()
-        assert await h.user_says(REQUEST) == ["Started."]
+        await chat_of(h).start()
+        assert await chat_of(h).say(REQUEST) == ["Started."]
         await asyncio.wait_for(world.started.wait(), WAIT_TIMEOUT)
         await asyncio.wait_for(h.close(), WAIT_TIMEOUT)  # a tool that never returns does not hold close up
 
@@ -244,7 +246,7 @@ def test_close_while_a_background_graft_s_tool_awaits_returns_and_records_the_ca
 def test_a_synchronous_tool_that_raises_ends_as_run_with_an_error(tmp_path):
     """A tool that was invoked has run, whatever it then raised: its call gets a result marked
     run, with an error naming what was raised, and the run goes on (the model sees it)."""
-    class Raising(World):
+    class Raising(FakeWorld):
         def execute(self, name, args):
             raise RuntimeError("backend down")
 
@@ -252,14 +254,14 @@ def test_a_synchronous_tool_that_raises_ends_as_run_with_an_error(tmp_path):
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=Raising())
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
         await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)
-        await h.settle()
+        await chat_of(h).quiet()
         await h.close()
 
     asyncio.run(go())
-    assert h.graft_errors == [] and store.timeline("c1")["join_reason"] == "done"
+    assert store.timeline("c1")["join_reason"] == "done"
     assert tool_results(store=store, tl="c1") == [
         ("site_write", "raised RuntimeError: backend down; it may have acted", True)]
     assert h.tools_run("c1") == ["site_write (returned an error)"]
@@ -281,10 +283,7 @@ def fail_once(h, name, tl="c1"):
 
 async def settled(h):
     """settle, which raises the injected error once (it was told); then nothing more."""
-    try:
-        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
-    except OSError:
-        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+    await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
 
 
 def test_a_background_graft_whose_close_out_cannot_be_written_carries_it_with_its_join(tmp_path):
@@ -294,8 +293,8 @@ def test_a_background_graft_whose_close_out_cannot_be_written_carries_it_with_it
     fired = fail_once(h=h, name="close_tool_uses")
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
         await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)
         await settled(h)
         await h.close()
@@ -313,11 +312,12 @@ def test_a_cancelled_graft_whose_close_out_cannot_be_written_still_names_the_run
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
         await asyncio.wait_for(world.started.wait(), WAIT_TIMEOUT)
         fail_once(h=h, name="close_tool_uses")
-        await asyncio.wait_for(h.user_says(STOP), WAIT_TIMEOUT)
+        await asyncio.wait_for(chat_of(h).say(STOP), WAIT_TIMEOUT)
+        assert any("recording that failed" in str(e) for e in chat_of(h).raised)  # told on the task, then raised
         await settled(h)
         await h.close()
 
@@ -340,10 +340,10 @@ def test_a_failed_focus_graft_whose_close_out_cannot_be_written_carries_it_with_
     fired = fail_once(h=h, name="close_tool_uses")
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         try:
-            await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT)
-        except OSError:
+            await asyncio.wait_for(chat_of(h).say(REQUEST), WAIT_TIMEOUT)
+        except HarnessError:
             pass
         await settled(h)
         await h.close()
@@ -373,8 +373,8 @@ def test_a_withdrawal_stops_a_background_graft_whose_tool_awaits_at_once(tmp_pat
     store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=world)
 
     async def go():
-        await h.start()
-        call = asyncio.create_task(h.user_says(REQUEST))
+        await chat_of(h).start()
+        call = asyncio.create_task(chat_of(h).say(REQUEST))
         await asyncio.wait_for(world.started.wait(), WAIT_TIMEOUT)
         call.cancel()
         gate.set()
@@ -383,7 +383,7 @@ def test_a_withdrawal_stops_a_background_graft_whose_tool_awaits_at_once(tmp_pat
         except asyncio.CancelledError:
             pass
         await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)  # stopped without close
-        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
@@ -419,15 +419,15 @@ def test_a_withdrawal_after_the_answer_stops_a_background_graft_whose_tool_await
     store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=world)
 
     async def go():
-        await h.start()
-        call = late["task"] = asyncio.create_task(h.user_says(REQUEST))
+        await chat_of(h).start()
+        call = late["task"] = asyncio.create_task(chat_of(h).say(REQUEST))
         try:
             await asyncio.wait_for(call, WAIT_TIMEOUT)
         except asyncio.CancelledError:
             pass
         assert call.cancelled() and world.started.is_set()
         await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)  # stopped without close
-        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
@@ -459,16 +459,16 @@ def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_r
     h.store_result = failing
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         call["id"] = h.machines.requests + 1  # the id the next user request gets
-        call["task"] = asyncio.create_task(h.user_says(REQUEST))
+        call["task"] = asyncio.create_task(chat_of(h).say(REQUEST))
         try:
             await asyncio.wait_for(call["task"], WAIT_TIMEOUT)
         except (asyncio.CancelledError, OSError):
             pass
         await asyncio.wait_for(h.until_rest("c1"), WAIT_TIMEOUT)
         try:
-            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+            await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         except OSError as error:
             raised.append(error)
         await h.close()
@@ -486,7 +486,7 @@ def test_a_tool_whose_row_fails_and_whose_run_is_then_withdrawn_keeps_its_real_r
 CANCELLED_BY_THE_TOOL = "interrupted by the tool: it may have acted"
 
 
-class SelfCancel(World):
+class SelfCancel(FakeWorld):
     """site_write awaits a future the host cancels itself (its own deadline): CancelledError reaches
     the activity while its state is still active."""
 
@@ -503,10 +503,10 @@ def test_a_tool_that_is_cancelled_by_its_host_ends_as_run_with_an_error_and_its_
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=SelfCancel())
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
         await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)  # not wedged in `calling`
-        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
@@ -524,15 +524,15 @@ def test_a_focus_graft_whose_tool_is_cancelled_by_its_host_goes_on(tmp_path):
     store, h, _ = make(tmp_path=tmp_path, policy=graft_writes(original), world=SelfCancel())
 
     async def go():
-        await h.start()
-        assert await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT) == ["done", "Back."]  # main runs once after the merge
+        await chat_of(h).start()
+        assert await asyncio.wait_for(chat_of(h).say(REQUEST), WAIT_TIMEOUT) == ["done", "Back."]  # main runs once after the merge
         await h.close()
 
     asyncio.run(go())
     assert tool_results(store=store, tl="c1") == [("site_write", CANCELLED_BY_THE_TOOL, True)]
 
 
-class SharedWork(World):
+class SharedWork(FakeWorld):
     """slides_create (c1) starts a task and awaits it; site_write (c2) awaits the same task. When c1
     is cancelled its await is cancelled, and so is the shared task c2 awaits: c2's state is not left."""
 
@@ -572,12 +572,12 @@ def test_a_graft_whose_tool_awaits_work_a_cancelled_sibling_shared_goes_on(tmp_p
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
         await asyncio.wait_for(world.both.wait(), WAIT_TIMEOUT)
-        await asyncio.wait_for(h.user_says(STOP), WAIT_TIMEOUT)  # cancels c1
+        await asyncio.wait_for(chat_of(h).say(STOP), WAIT_TIMEOUT)  # cancels c1
         await asyncio.wait_for(h.join_queued("c2"), WAIT_TIMEOUT)  # c2 is not wedged
-        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
@@ -594,18 +594,18 @@ def one_background(world, **kw):
 
 def run_one(h):
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
         await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)
         try:
-            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+            await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         except Exception:  # noqa: BLE001 - a failure told meanwhile is raised once here
             pass
         await h.close()
     asyncio.run(go())
 
 
-class ActsThenRaises(World):
+class ActsThenRaises(FakeWorld):
     """site_write acts, then its own deadline raises."""
 
     def __init__(self):
@@ -627,10 +627,10 @@ def test_a_tool_that_raises_after_it_was_invoked_ends_as_run_with_an_error(tmp_p
     assert tool_results(store=store, tl="c1") == [
         ("site_write", "raised TimeoutError: the host's own deadline passed; it may have acted", True)]
     assert h.tools_run("c1") == ["site_write (returned an error)"]
-    assert store.timeline("c1")["join_reason"] == "done" and h.graft_errors == []  # its run went on
+    assert store.timeline("c1")["join_reason"] == "done"  # its run went on
 
 
-class BadShape(World):
+class BadShape(FakeWorld):
     def __init__(self, value):
         super().__init__()
         self.value = value
@@ -646,7 +646,7 @@ def test_a_tool_that_returns_a_bad_shape_ends_as_run_with_an_error(tmp_path, val
     store, h, _ = one_background(BadShape(value), tmp_path=tmp_path)
     run_one(h)
     assert tool_results(store=store, tl="c1") == [
-        ("site_write", f"returned a {kind}, not (text, is_error); it may have acted", True)]
+        ("site_write", f"returned a {kind}, not a tool result; it may have acted", True)]
     assert h.tools_run("c1") == ["site_write (returned an error)"]
 
 
@@ -655,7 +655,7 @@ def test_a_trace_callback_that_raises_leaves_the_tool_s_result_alone(tmp_path):
         if "] tool site_write" in line:
             raise RuntimeError("trace sink down")
 
-    store, h, _ = one_background(World(), tmp_path=tmp_path, trace=trace)
+    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path, trace=trace)
     run_one(h)
     assert tool_results(store=store, tl="c1") == [("site_write", "wrote page index (2 chars)", False)]
     assert h.tools_run("c1") == ["site_write"]
@@ -673,15 +673,15 @@ def test_a_graft_whose_join_is_abandoned_still_writes_the_close_out_it_carried(t
     h.default_join = never
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
         await asyncio.wait_for(h.join_queued("c1"), WAIT_TIMEOUT)
         for _ in range(MAX_JOIN_ATTEMPTS + 1):
             if store.timeline("c1")["status"] == "abandoned":
                 break
             await asyncio.wait_for(h.drain_and_wake("o"), WAIT_TIMEOUT)
         try:
-            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+            await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         except Exception:  # noqa: BLE001 - the failures told meanwhile
             pass
         await h.close()
@@ -706,15 +706,15 @@ def test_a_join_retried_after_its_write_failed_writes_the_carried_close_out_once
     store.commit_join = failing
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
         await asyncio.wait_for(world.started.wait(), WAIT_TIMEOUT)
         fail_once(h=h, name="close_tool_uses")
-        await asyncio.wait_for(h.user_says(STOP), WAIT_TIMEOUT)  # cancels c1; its join's write fails once
+        await asyncio.wait_for(chat_of(h).say(STOP), WAIT_TIMEOUT)  # cancels c1; its join's write fails once
         if store.timeline("c1")["status"] != "joined":
             await asyncio.wait_for(h.drain_and_wake("o"), WAIT_TIMEOUT)  # the next commit point retries it
         try:
-            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+            await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         except OSError:
             pass
         await h.close()
@@ -725,7 +725,7 @@ def test_a_join_retried_after_its_write_failed_writes_the_carried_close_out_once
     assert violations(store=store, tl="c1") == [] and violations(store=store, tl="o") == []
 
 
-class SeveralWaiting(World):
+class SeveralWaiting(FakeWorld):
     """Every capability tool waits for ever; each records that it started and that it was cancelled."""
 
     def __init__(self):
@@ -764,8 +764,8 @@ def test_a_withdrawal_stops_several_background_grafts_whose_tools_await(tmp_path
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
 
     async def go():
-        await h.start()
-        call = asyncio.create_task(h.user_says(REQUEST))
+        await chat_of(h).start()
+        call = asyncio.create_task(chat_of(h).say(REQUEST))
         for name in ("site_write", "slides_create", "calendar_book"):
             while name not in world.started:
                 await asyncio.sleep(0.01)
@@ -777,7 +777,7 @@ def test_a_withdrawal_stops_several_background_grafts_whose_tools_await(tmp_path
             pass
         for c in ("c1", "c2", "c3"):
             await asyncio.wait_for(h.join_queued(c), WAIT_TIMEOUT)  # each stopped at the withdrawal
-        await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+        await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
@@ -796,9 +796,9 @@ def drive_one(h, store):
     out = {}
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
-        for key, coro in (("joined", lambda: h.join_queued("c1")), ("settled", h.settle), ("closed", h.close)):
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
+        for key, coro in (("joined", lambda: h.join_queued("c1")), ("settled", chat_of(h).quiet), ("closed", h.close)):
             try:
                 await asyncio.wait_for(coro(), WAIT_TIMEOUT)
                 out[key] = True
@@ -811,7 +811,7 @@ def drive_one(h, store):
 
 
 def test_a_harness_tool_call_that_fails_after_the_tool_ran_keeps_the_call_as_run(tmp_path):
-    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
     real = h.call_tool
 
     async def broken(**kw):
@@ -820,7 +820,7 @@ def test_a_harness_tool_call_that_fails_after_the_tool_ran_keeps_the_call_as_run
     h.call_tool = broken
     assert drive_one(h=h, store=store)["joined"] is True
     assert tool_results(store=store, tl="c1") == [("site_write", FAILED_AFTER_INVOKED, True)]
-    assert h.world.site and h.tools_run("c1") == ["site_write (returned an error)"]
+    assert chat_of(h).world.site and h.tools_run("c1") == ["site_write (returned an error)"]
     assert store.timeline("c1")["join_reason"] == "done"  # its run went on
 
 
@@ -829,7 +829,7 @@ class BadStr(Exception):
         raise RuntimeError("no str")
 
 
-class ActsThenBadStr(World):
+class ActsThenBadStr(FakeWorld):
     async def execute(self, name, args):
         if name == "site_write":
             raise BadStr()
@@ -848,7 +848,7 @@ class Abort(BaseException):
     pass
 
 
-class ActsThenAborts(World):
+class ActsThenAborts(FakeWorld):
     async def execute(self, name, args):
         if name == "site_write":
             raise Abort("host abort")
@@ -874,7 +874,7 @@ def test_a_run_whose_model_call_raises_a_base_exception_fails_and_does_not_wedge
     assert store.timeline("c1")["join_reason"] == "failed"
 
 
-class CancelsOwnTask(World):
+class CancelsOwnTask(FakeWorld):
     """The host cancels the task its tool runs in (its own deadline), while the graft still runs."""
 
     async def execute(self, name, args):
@@ -926,8 +926,8 @@ def test_a_withdrawal_stops_every_waiting_graft_even_when_one_stop_fails_once(tm
     store, h, _ = make(tmp_path=tmp_path, policy=policy, world=world)
 
     async def go():
-        await h.start()
-        call = asyncio.create_task(h.user_says(REQUEST))
+        await chat_of(h).start()
+        call = asyncio.create_task(chat_of(h).say(REQUEST))
         for name in ("site_write", "slides_create", "calendar_book"):
             while name not in world.started:
                 await asyncio.sleep(0.01)
@@ -940,7 +940,7 @@ def test_a_withdrawal_stops_every_waiting_graft_even_when_one_stop_fails_once(tm
         for c in ("c1", "c2", "c3"):
             await asyncio.wait_for(h.join_queued(c), WAIT_TIMEOUT)
         try:
-            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+            await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         except RuntimeError:
             pass  # the injected failure, told once
         await h.close()
@@ -949,7 +949,7 @@ def test_a_withdrawal_stops_every_waiting_graft_even_when_one_stop_fails_once(tm
     assert fired == ["o"] and world.cancelled == {"site_write", "slides_create", "calendar_book"}
 
 
-class ActsThenGenExit(World):
+class ActsThenGenExit(FakeWorld):
     async def execute(self, name, args):
         if name == "site_write":
             raise GeneratorExit()
@@ -964,7 +964,7 @@ def test_a_tool_that_raises_generator_exit_ends_as_run_with_an_error(tmp_path):
     assert tool_results(store=store, tl="c1") == [("site_write", "raised GeneratorExit; it may have acted", True)]
 
 
-class ActsThenStop(World):
+class ActsThenStop(FakeWorld):
     async def execute(self, name, args):
         if name == "site_write":
             raise StopAsyncIteration()
@@ -986,7 +986,7 @@ class Hostile(str):
         raise RuntimeError("hostile len")
 
 
-class ReturnsHostile(World):
+class ReturnsHostile(FakeWorld):
     async def execute(self, name, args):
         if name == "site_write":
             return Hostile("ok"), False
@@ -1001,7 +1001,7 @@ def test_a_tool_that_returns_a_hostile_str_subclass_is_stored_as_plain_text(tmp_
 
 # ------------------------------------------------------------------ no activity ends without an outcome
 def test_a_row_write_that_raises_a_base_exception_still_ends_the_call(tmp_path):
-    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
     real = h.store_result
 
     def broken(**kw):
@@ -1015,7 +1015,7 @@ def test_a_row_write_that_raises_a_base_exception_still_ends_the_call(tmp_path):
 
 
 def test_a_join_record_write_that_raises_a_base_exception_still_queues_the_join(tmp_path):
-    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
     real = h.record_join
 
     def broken(**kw):
@@ -1063,8 +1063,8 @@ def withdraw_three(tmp_path, monkeypatch, failing):
     out = {}
 
     async def go():
-        await h.start()
-        call = asyncio.create_task(h.user_says(REQUEST))
+        await chat_of(h).start()
+        call = asyncio.create_task(chat_of(h).say(REQUEST))
         for name in ("site_write", "slides_create", "calendar_book"):
             while name not in world.started:
                 await asyncio.sleep(0.01)
@@ -1110,7 +1110,7 @@ class BadMessage(BaseException):
 
 
 def test_an_io_write_failure_whose_message_raises_still_has_an_outcome(tmp_path):
-    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
     real = h.record_join
 
     def broken(**kw):
@@ -1123,7 +1123,7 @@ def test_an_io_write_failure_whose_message_raises_still_has_an_outcome(tmp_path)
 
 
 def test_a_row_write_failure_whose_message_raises_still_has_an_outcome(tmp_path):
-    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
     real = h.store_result
 
     def broken(**kw):
@@ -1162,9 +1162,9 @@ def test_a_refusal_row_whose_write_error_has_a_bad_message_still_ends_the_run(tm
     out = {}
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         try:
-            out["said"] = await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT)
+            out["said"] = await asyncio.wait_for(chat_of(h).say(REQUEST), WAIT_TIMEOUT)
         except asyncio.TimeoutError:
             out["said"] = "TIMEOUT"
         except BaseException as error:  # noqa: BLE001 - the write's error reaches the caller
@@ -1190,16 +1190,16 @@ def test_an_effect_that_raises_a_base_exception_is_a_fault_the_machine_recovers_
     out = {}
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         try:
-            out["first"] = await asyncio.wait_for(h.user_says("hello"), WAIT_TIMEOUT)
+            out["first"] = await asyncio.wait_for(chat_of(h).say("hello"), WAIT_TIMEOUT)
         except asyncio.TimeoutError:
             out["first"] = "TIMEOUT"
         except BaseException as error:  # noqa: BLE001 - the failed step's caller gets its error
             out["first"] = type(error).__name__
-        out["second"] = await asyncio.wait_for(h.user_says("again"), WAIT_TIMEOUT)
+        out["second"] = await asyncio.wait_for(chat_of(h).say("again"), WAIT_TIMEOUT)
         try:
-            await asyncio.wait_for(h.settle(), WAIT_TIMEOUT)
+            await asyncio.wait_for(chat_of(h).quiet(), WAIT_TIMEOUT)
         except BaseException:  # noqa: BLE001 - told once
             pass
         await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
@@ -1232,8 +1232,7 @@ def test_a_model_call_raising_a_stop_iteration_with_a_bad_message_fails_its_run_
 def test_a_seeder_that_raises_a_base_exception_refuses_the_clone_call_and_leaves_no_audit_open(tmp_path):
     from graft.db import Store
     from graft.providers import FakeProvider
-    from graft.harness import Harness
-    from graft.skills import install
+    from graft.harness import Host
 
     class AbortingSeeder:
         name = "aborting"
@@ -1248,14 +1247,14 @@ def test_a_seeder_that_raises_a_base_exception_refuses_the_clone_call_and_leaves
         return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
     store = Store(str(tmp_path / "p.db"))
-    install(store)
-    h = Harness(store, FakeProvider(policy), seeder=AbortingSeeder())
+    install_fake(store)
+    h = conversation(store, policy, seeder=AbortingSeeder()).h
     out = {}
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         try:
-            out["said"] = await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT)
+            out["said"] = await asyncio.wait_for(chat_of(h).say(REQUEST), WAIT_TIMEOUT)
         except asyncio.TimeoutError:
             out["said"] = "TIMEOUT"
         await asyncio.wait_for(h.close(), WAIT_TIMEOUT)
@@ -1284,9 +1283,9 @@ def say_and_close(h):
     out = {}
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         try:
-            out["said"] = await asyncio.wait_for(h.user_says(REQUEST), WAIT_TIMEOUT)
+            out["said"] = await asyncio.wait_for(chat_of(h).say(REQUEST), WAIT_TIMEOUT)
         except asyncio.TimeoutError:
             out["said"] = "TIMEOUT"
         except BaseException as error:  # noqa: BLE001 - the failure reaches the caller
@@ -1310,7 +1309,7 @@ def test_an_original_model_call_that_raises_cancelled_error_fails_its_run(tmp_pa
 
 
 def test_a_host_write_that_raises_cancelled_error_is_its_state_s_failure(tmp_path):
-    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
     real = h.record_join
 
     def broken(**kw):
@@ -1323,7 +1322,7 @@ def test_a_host_write_that_raises_cancelled_error_is_its_state_s_failure(tmp_pat
 
 
 def test_a_clone_preparation_that_raises_cancelled_error_is_refused(tmp_path):
-    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
 
     async def broken(**kw):
         raise asyncio.CancelledError()
@@ -1335,8 +1334,7 @@ def test_a_clone_preparation_that_raises_cancelled_error_is_refused(tmp_path):
 def test_a_seeder_that_raises_cancelled_error_leaves_no_audit_open(tmp_path):
     from graft.db import Store
     from graft.providers import FakeProvider
-    from graft.harness import Harness
-    from graft.skills import install
+    from graft.harness import Host
 
     class CancellingSeeder:
         name = "cancelling"
@@ -1350,8 +1348,8 @@ def test_a_seeder_that_raises_cancelled_error_leaves_no_audit_open(tmp_path):
         return [clone_use(clone_entry(skills=["website"], focus=False), id="k1") | {"type": "tool_use"}]
 
     store = Store(str(tmp_path / "p.db"))
-    install(store)
-    h = Harness(store, FakeProvider(policy), seeder=CancellingSeeder())
+    install_fake(store)
+    h = conversation(store, policy, seeder=CancellingSeeder()).h
     out = say_and_close(h)
     assert out["said"] != "TIMEOUT" and out["closed"] is True
     assert store.con.execute("SELECT count(*) FROM transactions WHERE status='open'").fetchone()[0] == 0
@@ -1392,13 +1390,13 @@ def test_several_kept_errors_that_are_not_exceptions_are_raised_together(tmp_pat
     def always(ctx, inst, event):
         raise Abort("INJECTED abort")
     monkeypatch.setattr(machine, "tell_given_up", always)  # runs at every rest gate: kept again and again
-    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
     out = {}
 
     async def go():
-        await h.start()
-        for key, coro in (("said", lambda: h.user_says(REQUEST)), ("joined", lambda: h.join_queued("c1")),
-                          ("settled", h.settle), ("settled2", h.settle), ("closed", h.close)):
+        await chat_of(h).start()
+        for key, coro in (("said", lambda: chat_of(h).say(REQUEST)), ("joined", lambda: h.join_queued("c1")),
+                          ("settled", chat_of(h).quiet), ("settled2", chat_of(h).quiet), ("closed", h.close)):
             try:
                 await asyncio.wait_for(coro(), WAIT_TIMEOUT)
                 out[key] = "ok"
@@ -1416,12 +1414,12 @@ def test_an_effect_that_raises_stop_iteration_fails_its_callers_with_an_error_th
     def bad(ctx, inst, event):
         raise StopIteration("a bug")
     monkeypatch.setattr(machine, "take_message", bad)
-    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
     out = {}
 
     async def go():
-        await h.start()
-        for key, coro in (("said", lambda: h.user_says(REQUEST)), ("settled", h.settle), ("closed", h.close)):
+        await chat_of(h).start()
+        for key, coro in (("said", lambda: chat_of(h).send(REQUEST)), ("settled", chat_of(h).quiet), ("closed", h.close)):
             try:
                 await asyncio.wait_for(coro(), WAIT_TIMEOUT)
                 out[key] = "ok"
@@ -1452,12 +1450,12 @@ def test_a_rest_step_that_always_fails_still_answers_the_waiting_call(tmp_path, 
     def always(ctx, inst, event):
         raise RuntimeError("INJECTED come_to_rest")
     monkeypatch.setattr(machine, "come_to_rest", always)
-    store, h, _ = one_background(World(), tmp_path=tmp_path)
+    store, h, _ = one_background(FakeWorld(), tmp_path=tmp_path)
     out = {}
 
     async def go():
-        await h.start()
-        for key, coro in (("said", lambda: h.user_says(REQUEST)), ("settled", h.settle), ("closed", h.close)):
+        await chat_of(h).start()
+        for key, coro in (("said", lambda: chat_of(h).send(REQUEST)), ("settled", chat_of(h).quiet), ("closed", h.close)):
             try:
                 await asyncio.wait_for(coro(), WAIT_TIMEOUT)
                 out[key] = "ok"
@@ -1466,7 +1464,7 @@ def test_a_rest_step_that_always_fails_still_answers_the_waiting_call(tmp_path, 
             except BaseException as error:  # noqa: BLE001 - what each call raised
                 out[key] = type(error).__name__
     asyncio.run(go())
-    assert out["said"] == "RuntimeError" and out["settled"] != "TIMEOUT" and out["closed"] == "ok"
+    assert out["said"] == "HarnessError" and out["settled"] != "TIMEOUT" and out["closed"] == "ok"
 
 
 def test_a_stop_whose_counting_and_stopping_both_always_fail_is_still_given_up(tmp_path, monkeypatch):
@@ -1498,15 +1496,15 @@ def test_a_provider_cancel_reaches_the_caller_as_a_runtime_error_and_withdraws_n
     out = {}
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         try:
-            await asyncio.wait_for(h.user_says("hello"), WAIT_TIMEOUT)
+            await asyncio.wait_for(chat_of(h).send("hello"), WAIT_TIMEOUT)
             out["first"] = "ok"
         except BaseException as error:  # noqa: BLE001 - what the caller got
             out["first"] = type(error).__name__
-        out["second"] = await asyncio.wait_for(h.user_says("hello again"), WAIT_TIMEOUT)
+        out["second"] = await asyncio.wait_for(chat_of(h).say("hello again"), WAIT_TIMEOUT)
         await h.close()
 
     asyncio.run(go())
-    assert out == {"first": "RuntimeError", "second": ["Hello again."]}
+    assert out["first"] == "HarnessError" and out["second"][-1] == "Hello again."
     assert store.con.execute("SELECT count(*) FROM withdrawals").fetchone()[0] == 0  # nothing withdrawn

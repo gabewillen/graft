@@ -1,17 +1,16 @@
 """Skill catalog: three built-ins (fork, merge, detached: graft's clone skill, and the join skills of
 a focus graft and a background graft, as the model is told them) and simulated capability skills.
 
-Capability tools act on an in-memory `World` (fake website, slide deck, calendar).
-Tool names use underscores because API tool names cannot contain dots.
+A capability skill names its tools; the tools themselves are the host's (graft/tools.py), and the
+simulated ones are graft/fake.py's. Tool names use underscores because API tool names cannot contain
+dots.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 
 from .db import Skill, Store
-from .machine import described
 
 
 def obj(props: dict, required: list[str]) -> dict:
@@ -29,14 +28,14 @@ LOAD_SKILL_TOOL = {
     "name": "load_skill",
     "description": "Load the full instructions of one of your skills (by name). Do this before "
                    "using a skill's tools for the first time.",
-    "input_schema": obj({"name": S}, ["name"])}
+    "inputSchema": obj({"name": S}, ["name"])}
 
 # graft's join, as the model is told it: a branch of yourself merging back (spec: What the model is
 # told: fork, merge and stop).
 JOIN_TOOL = {
     "name": "merge", "description": "End this turn and merge this branch back into main: what you did here "
                                     "becomes your memory there. The end of your turn merges it anyway.",
-    "input_schema": obj({"reason": {"type": "string", "maxLength": REASON_CHARS, "description": "Optional: your own words to yourself "
+    "inputSchema": obj({"reason": {"type": "string", "maxLength": REASON_CHARS, "description": "Optional: your own words to yourself "
                                                                       "on main, for example what is still to do."}},
                         [])}
 
@@ -47,7 +46,7 @@ CANCEL_TOOL = {
     "description": "Stop detached branches of yours that are still running, by id, only when the user "
                    "no longer wants their parts. Each one is stopped where it is and what you did in it so "
                    "far merges back when your turn ends. It does not end your turn: to end it, say nothing.",
-    "input_schema": obj(props={"ids": {"type": "array", "minItems": 1, "items": S}},
+    "inputSchema": obj(props={"ids": {"type": "array", "minItems": 1, "items": S}},
                         required=["ids"])}
 
 # What a branch id looks like: chosen by the model, or drawn by the harness (6 hex characters).
@@ -192,7 +191,7 @@ CATALOG: list[Skill] = [
                                           "branches that work out of sight; give either or both. Each "
                                           "branch names the skills it holds, the messages it starts from, "
                                           "your reason (its part, in your words) and, optionally, its id.",
-         "input_schema": obj(props={"current": CLONE_ENTRY,
+         "inputSchema": obj(props={"current": CLONE_ENTRY,
                                     "detached": {"type": "array", "items": CLONE_ENTRY}}, required=[])},
         CANCEL_TOOL,
     ]),
@@ -219,12 +218,7 @@ CATALOG: list[Skill] = [
     Skill("website", "Build and edit a small website (pages with text content).",
           "Website skill: write pages with site_write(page, content) and read them with "
           "site_read(page). Ask for missing details before writing. Write in a casual, playful "
-          "voice and add a fun emoji to every heading unless told otherwise.", [
-        {"name": "site_write", "description": "Create or replace a website page.",
-         "input_schema": obj({"page": S, "content": S}, ["page", "content"])},
-        {"name": "site_read", "description": "Read a website page.",
-         "input_schema": obj({"page": S}, ["page"])},
-    ]),
+          "voice and add a fun emoji to every heading unless told otherwise.", ["site_write", "site_read"]),
     Skill("slides", "Create slide decks / slide shows / presentations.",
           "Slides skill: call slides_create(title, audience, tone) once, then "
           "slides_add_slide(title, bullets) for each slide. Each slide has exactly 3 bullets. "
@@ -233,42 +227,21 @@ CATALOG: list[Skill] = [
           "from what you already know rather than asking questions; then briefly tell the user "
           "what you built. To revise an existing deck (reorder, retitle, add or edit slides, change "
           "tone), read it with slides_read() if needed, then rebuild it: call slides_create again and "
-          "add every slide in the new order; the most recent deck is the current one.", [
-        {"name": "slides_create", "description": "Create a new slide deck.",
-         "input_schema": obj({"title": S, "audience": S, "tone": S}, ["title", "audience", "tone"])},
-        {"name": "slides_add_slide", "description": "Append a slide to the current deck.",
-         "input_schema": obj({"title": S, "bullets": STRS}, ["title", "bullets"])},
-        {"name": "slides_read", "description": "Read the current deck (title, audience, tone, slides).",
-         "input_schema": obj({}, [])},
-    ]),
+          "add every slide in the new order; the most recent deck is the current one.", ["slides_create", "slides_add_slide", "slides_read"]),
     Skill("calendar", "Book and list appointments on a calendar.",
           "Calendar skill: book with calendar_book(date, time, what) using ISO dates "
-          "(YYYY-MM-DD) and 24h times (HH:MM); list with calendar_list().", [
-        {"name": "calendar_book", "description": "Book an appointment.",
-         "input_schema": obj({"date": S, "time": S, "what": S}, ["date", "time", "what"])},
-        {"name": "calendar_list", "description": "List appointments.",
-         "input_schema": obj({}, [])},
-    ]),
+          "(YYYY-MM-DD) and 24h times (HH:MM); list with calendar_list().", ["calendar_book", "calendar_list"]),
     Skill("newsletter", "Write and send email newsletters.",
           "Newsletter skill: draft with newsletter_draft(subject, body). House style: open every "
           "section with an excited hook ending in an exclamation mark, put KEY WORDS IN ALL CAPS, "
-          "and sign off with 'Cheers! 🎉'.", [
-        {"name": "newsletter_draft", "description": "Draft an email newsletter.",
-         "input_schema": obj({"subject": S, "body": S}, ["subject", "body"])},
-    ]),
+          "and sign off with 'Cheers! 🎉'.", ["newsletter_draft"]),
     Skill("social", "Write social media posts.",
           "Social skill: post with social_post(platform, text). House style: super casual, use "
           "slang like 'awesome' and 'super', add at least three #hashtags, and always end with a "
-          "question to the reader.", [
-        {"name": "social_post", "description": "Publish a social media post.",
-         "input_schema": obj({"platform": S, "text": S}, ["platform", "text"])},
-    ]),
+          "question to the reader.", ["social_post"]),
     Skill("recipes", "Save and format recipes.",
           "Recipes skill: save with recipe_save(title, steps). House style: titles in all "
-          "lowercase, and every step starts with a food emoji.", [
-        {"name": "recipe_save", "description": "Save a recipe.",
-         "input_schema": obj({"title": S, "steps": STRS}, ["title", "steps"])},
-    ]),
+          "lowercase, and every step starts with a food emoji.", ["recipe_save"]),
 ]
 
 BUILTIN = ("fork", "merge", "detached")
@@ -288,68 +261,19 @@ def skill_listing(store: Store, names: list[str], heading: str) -> str:
     return heading + "\n" + "\n".join(f"- {r[0]}: {r[1]}" for r in rows if r)
 
 
-def install(store: Store) -> None:
-    for s in CATALOG:
-        store.add_skill(s)
-
-
-@dataclass
-class World:
-    """The host's tools, run by the harness for a graft's capability tool calls. `execute(name,
-    args)` returns (content, is_error), or an awaitable of it: a host World may define
-    `async def execute`. Each call is the activity of its timeline's `calling` state, awaited
-    there while every other timeline goes on, so one graft's tool may wait for what another
-    graft's tool produces. A call cut short while it waits (its graft cancelled, its request
-    withdrawn, shutdown) is cancelled where it waits and recorded as run with an error. No timeout
-    is applied: a tool that never returns keeps its graft live. Cancellation is cooperative: a
-    tool that swallows CancelledError blocks its graft's cancel and close(), and work it handed
-    to a thread or shielded may still act after the cancel (its result says so). An async
-    `execute` is supported by the Harness only: SubagentRunner and experiments/isolation.py call
-    it synchronously."""
-    site: dict[str, str] = field(default_factory=dict)
-    decks: list[dict] = field(default_factory=list)
-    calendar: list[dict] = field(default_factory=list)
-    other: list[tuple[str, dict]] = field(default_factory=list)
-    log: list[tuple[str, dict]] = field(default_factory=list)
-    # tool name -> error message returned on every call (deterministic failure injection)
-    failures: dict[str, str] = field(default_factory=dict)
-
-    def execute(self, name: str, args: dict) -> tuple[str, bool]:
-        """Run a simulated tool. Missing or malformed arguments are a tool error, not a crash."""
-        try:
-            return self._execute(name, args)
-        except (KeyError, TypeError, AttributeError) as e:
-            return f"invalid arguments for {name}: {described(e)}", True
-
-    def _execute(self, name: str, args: dict) -> tuple[str, bool]:
-        self.log.append((name, args))
-        if name in self.failures:
-            return self.failures[name], True
-        if name == "site_write":
-            self.site[args["page"]] = args["content"]
-            return f"wrote page {args['page']} ({len(args['content'])} chars)", False
-        if name == "site_read":
-            page = self.site.get(args["page"])
-            return (page, False) if page is not None else (f"no page {args['page']}", True)
-        if name == "slides_create":
-            self.decks.append({**args, "slides": []})
-            return f"created deck '{args['title']}' (deck #{len(self.decks)})", False
-        if name == "slides_read":
-            return (json.dumps(self.decks[-1]), False) if self.decks else ("no deck yet", False)
-        if name == "slides_add_slide":
-            if not self.decks:
-                return "no deck; call slides_create first", True
-            self.decks[-1]["slides"].append({"title": args["title"], "bullets": list(args["bullets"])})
-            return f"added slide {len(self.decks[-1]['slides'])}: {args['title']}", False
-        if name == "calendar_book":
-            self.calendar.append(args)
-            return f"booked {args['what']} on {args['date']} at {args['time']}", False
-        if name == "calendar_list":
-            return json.dumps(self.calendar), False
-        if name in ("newsletter_draft", "social_post", "recipe_save"):
-            self.other.append((name, args))
-            return f"{name.split('_')[0]} saved", False
-        return f"unknown tool {name}", True
-
-    def deck_text(self) -> str:
-        return json.dumps(self.decks)
+def install(store: Store, tools: dict[str, dict] | None = None, skills: list[Skill] | None = None) -> None:
+    """Put the skills (default: the catalog) into the store, each with its tools: graft's own tool
+    definitions as they are, and each tool a skill names by name taken from `tools` (name -> MCP
+    tool definition, the host's). A skill that names a tool the host did not give is refused."""
+    given = tools or {}
+    for skill in (CATALOG if skills is None else skills):
+        resolved = []
+        for t in skill.tools:
+            if isinstance(t, dict):
+                resolved.append(t)
+            elif t in given:
+                resolved.append(given[t])
+            else:
+                raise ValueError(f"skill {skill.name!r} names tool {t!r}, which the host did not give")
+        store.add_skill(Skill(name=skill.name, description=skill.description, instructions=skill.instructions,
+                              tools=resolved))

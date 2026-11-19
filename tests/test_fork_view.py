@@ -8,10 +8,10 @@ import asyncio
 import json
 import threading
 
+from _util import chat_of, conversation, install_fake
 from graft.db import Store
-from graft.harness import NOT_RUN_BESIDE_CLONE, Harness, clone_entries, fork_result
+from graft.harness import NOT_RUN_BESIDE_CLONE, Host, clone_entries, fork_result
 from graft.providers import FakeProvider
-from graft.skills import install
 
 ASK = "I run a dental practice in Austin."
 SECRET = "My password for the old host is hunter2."
@@ -28,8 +28,8 @@ def fork_use(use_id="f1", **inp):
 
 def make(tmp_path, policy, **kw):
     store = Store(str(tmp_path / "fork.db"))
-    install(store)
-    h = Harness(store, FakeProvider(policy), seeder=kw.pop("seeder", None), **kw)
+    install_fake(store)
+    h = conversation(store, policy, seeder=kw.pop("seeder", None), **kw).h
     return store, h
 
 
@@ -56,10 +56,10 @@ class Main:
 
 def run(h, *says):
     async def go():
-        await h.start()
+        await chat_of(h).start()
         for s in says:
-            await h.user_says(s)
-        await h.settle()
+            await chat_of(h).say(s)
+        await chat_of(h).quiet()
         await h.close()
     asyncio.run(go())
 
@@ -151,7 +151,7 @@ def test_pointers_to_tool_rows_harness_rows_and_withdrawn_messages_are_refused(t
     store, h = make(tmp_path, lambda *a: text("ok"))
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         u = store.add_turn("o", "user", "text", REQUEST)
         tu = store.add_turn("o", "assistant", "tool_use", {"id": "x", "input": {}}, tool_name="load_skill")
         tr = store.add_turn("o", "user", "tool_result", {"tool_use_id": "x", "content": "ok"}, tool_name="load_skill")

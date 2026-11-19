@@ -39,28 +39,28 @@ MAX_OUT = 8000
 
 TOOLS = [
     {"name": "Read", "description": "Read a file (optionally from a line offset, for a number of lines).",
-     "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "offset": {"type": "integer"},
+     "inputSchema": {"type": "object", "properties": {"file_path": {"type": "string"}, "offset": {"type": "integer"},
                                                        "limit": {"type": "integer"}}, "required": ["file_path"]}},
     {"name": "Grep", "description": "Search file contents with a regular expression (ripgrep).",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string"},
+     "inputSchema": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string"},
                                                        "glob": {"type": "string"}}, "required": ["pattern"]}},
     {"name": "Glob", "description": "List files matching a glob pattern such as src/**/*.hpp.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}},
+     "inputSchema": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}},
                       "required": ["pattern"]}},
     {"name": "Bash", "description": "Run one read-only command (no pipes or redirection). Allowed: ls, cat, rg, grep, "
                                     "find, wc, head, tail, git log/show/diff/ls-files.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+     "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
 ]
 
 
 WRITE_TOOLS = [
     {"name": "Edit", "description": "Replace an exact string in a file (old_string must occur once unless replace_all).",
-     "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "old_string": {"type": "string"},
+     "inputSchema": {"type": "object", "properties": {"file_path": {"type": "string"}, "old_string": {"type": "string"},
                                                        "new_string": {"type": "string"},
                                                        "replace_all": {"type": "boolean"}},
                       "required": ["file_path", "old_string", "new_string"]}},
     {"name": "Write", "description": "Create or overwrite a file with the given content.",
-     "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}},
+     "inputSchema": {"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}},
                       "required": ["file_path", "content"]}},
 ]
 NO_NETWORK_PROFILE = ("(version 1)(allow default)(deny network*)"

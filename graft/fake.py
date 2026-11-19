@@ -6,8 +6,16 @@ whole branch -> converse -> merge -> re-branch path (graft's clone and join) run
 
 from __future__ import annotations
 
+import functools
+import inspect
 import itertools
+import json
 import re
+from dataclasses import dataclass, field
+
+from .machine import described
+from .skills import STRS, S, obj
+from .tools import CallToolResult, Tool
 
 _ids = itertools.count(1)
 
@@ -294,3 +302,110 @@ def bench_subagent_policy(system: str, messages: list[dict], tools: list[dict]) 
         if used and used[-1]["name"] != "load_skill":
             return _text("Summary: did the task with " + used[-1]["name"])
     return _holder_policy(names, messages)
+
+
+# ------------------------------------------------------------------ the simulated tools
+
+FAKE_TOOLS: list[dict] = [
+    {"name": "site_write", "description": "Create or replace a website page.",
+     "inputSchema": obj({"page": S, "content": S}, ["page", "content"])},
+    {"name": "site_read", "description": "Read a website page.",
+     "inputSchema": obj({"page": S}, ["page"])},
+    {"name": "slides_create", "description": "Create a new slide deck.",
+     "inputSchema": obj({"title": S, "audience": S, "tone": S}, ["title", "audience", "tone"])},
+    {"name": "slides_add_slide", "description": "Append a slide to the current deck.",
+     "inputSchema": obj({"title": S, "bullets": STRS}, ["title", "bullets"])},
+    {"name": "slides_read", "description": "Read the current deck (title, audience, tone, slides).",
+     "inputSchema": obj({}, [])},
+    {"name": "calendar_book", "description": "Book an appointment.",
+     "inputSchema": obj({"date": S, "time": S, "what": S}, ["date", "time", "what"])},
+    {"name": "calendar_list", "description": "List appointments.",
+     "inputSchema": obj({}, [])},
+    {"name": "newsletter_draft", "description": "Draft an email newsletter.",
+     "inputSchema": obj({"subject": S, "body": S}, ["subject", "body"])},
+    {"name": "social_post", "description": "Publish a social media post.",
+     "inputSchema": obj({"platform": S, "text": S}, ["platform", "text"])},
+    {"name": "recipe_save", "description": "Save a recipe.",
+     "inputSchema": obj({"title": S, "steps": STRS}, ["title", "steps"])}
+]
+
+
+def _result(outcome):
+    """A simulated tool's (content, is_error) as a CallToolResult; anything else as it is."""
+    if type(outcome) is tuple and len(outcome) == 2 and isinstance(outcome[0], str) and isinstance(outcome[1], bool):
+        return CallToolResult(content=[{"type": "text", "text": str.__str__(outcome[0])}], is_error=outcome[1])
+    return outcome
+
+
+async def _finish(awaitable):
+    return _result(await awaitable)
+
+
+@dataclass
+class FakeWorld:
+    """The simulated world behind the simulated skills' tools (a fake website, slide decks, a
+    calendar): `tools()` is the list of Tools a test, the simulator or an experiment gives graft.
+    Each tool's function calls `execute(name, args)`, which returns (content, is_error) or an
+    awaitable of it (a test subclass may define `async def execute`); (content, is_error) becomes a
+    CallToolResult, and anything else is passed on as the tool's return value."""
+    site: dict[str, str] = field(default_factory=dict)
+    decks: list[dict] = field(default_factory=list)
+    calendar: list[dict] = field(default_factory=list)
+    other: list[tuple[str, dict]] = field(default_factory=list)
+    log: list[tuple[str, dict]] = field(default_factory=list)
+    # tool name -> error message returned on every call (deterministic failure injection)
+    failures: dict[str, str] = field(default_factory=dict)
+
+    def execute(self, name: str, args: dict) -> tuple[str, bool]:
+        """Run a simulated tool. Missing or malformed arguments are a tool error, not a crash."""
+        try:
+            return self._execute(name, args)
+        except (KeyError, TypeError, AttributeError) as e:
+            return f"invalid arguments for {name}: {described(e)}", True
+
+    def _execute(self, name: str, args: dict) -> tuple[str, bool]:
+        self.log.append((name, args))
+        if name in self.failures:
+            return self.failures[name], True
+        if name == "site_write":
+            self.site[args["page"]] = args["content"]
+            return f"wrote page {args['page']} ({len(args['content'])} chars)", False
+        if name == "site_read":
+            page = self.site.get(args["page"])
+            return (page, False) if page is not None else (f"no page {args['page']}", True)
+        if name == "slides_create":
+            self.decks.append({**args, "slides": []})
+            return f"created deck '{args['title']}' (deck #{len(self.decks)})", False
+        if name == "slides_read":
+            return (json.dumps(self.decks[-1]), False) if self.decks else ("no deck yet", False)
+        if name == "slides_add_slide":
+            if not self.decks:
+                return "no deck; call slides_create first", True
+            self.decks[-1]["slides"].append({"title": args["title"], "bullets": list(args["bullets"])})
+            return f"added slide {len(self.decks[-1]['slides'])}: {args['title']}", False
+        if name == "calendar_book":
+            self.calendar.append(args)
+            return f"booked {args['what']} on {args['date']} at {args['time']}", False
+        if name == "calendar_list":
+            return json.dumps(self.calendar), False
+        if name in ("newsletter_draft", "social_post", "recipe_save"):
+            self.other.append((name, args))
+            return f"{name.split('_')[0]} saved", False
+        return f"unknown tool {name}", True
+
+    def deck_text(self) -> str:
+        return json.dumps(self.decks)
+
+    def call(self, name: str, args: dict):
+        """A tool's function: `execute`, its outcome as a tool result (awaited if it is awaitable)."""
+        outcome = self.execute(name, args)
+        return _finish(outcome) if inspect.isawaitable(outcome) else _result(outcome)
+
+    def tools(self) -> list[Tool]:
+        """The simulated tools, each bound to this world."""
+        return [Tool(name=d["name"], description=d["description"], input_schema=d["inputSchema"],
+                     fn=functools.partial(self.call, d["name"])) for d in FAKE_TOOLS]
+
+    def definitions(self) -> dict[str, dict]:
+        """name -> MCP tool definition, for `install`."""
+        return {t.name: t.definition() for t in self.tools()}

@@ -46,7 +46,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from graft import cachestats  # noqa: E402
 from graft.db import Store  # noqa: E402
 from graft.fake import pivot_policy, subagent_policy  # noqa: E402
-from graft.harness import Harness  # noqa: E402
+from graft.agent import GraftAgent, GraftConfig  # noqa: E402
+from graft.fake import FakeWorld  # noqa: E402
+from graft.harness import Host  # noqa: E402
 from graft.providers import FakeProvider, add_usage, empty_usage, make_provider  # noqa: E402
 from graft.sim import run_script  # noqa: E402
 from graft.skills import BASE_SYSTEM, LOAD_SKILL_TOOL, install  # noqa: E402
@@ -58,8 +60,8 @@ FACT_SERVICES = "We offer 3 services: teeth cleaning, dental implants, and teeth
 PIVOT = "Instead of a website let's just build a slide show."
 
 
-def nudge(h) -> str | None:
-    return None if h.world.decks and h.world.decks[-1]["slides"] else \
+def nudge(world) -> str | None:
+    return None if world.decks and world.decks[-1]["slides"] else \
         "Please go ahead and build the slide show now with what you know."
 
 
@@ -80,17 +82,18 @@ def user_row(store: Store, text: str) -> int | None:
     return r[0] if r else None
 
 
-def graft_checks(h: Harness, verbose: bool = True) -> bool:
+def graft_checks(store, world, provider=None, verbose: bool = True) -> bool:
     """Structural graft checks. verbose=False returns the verdict without printing (bench.py)."""
-    checks = pivot_structural_checks(h)
+    checks = pivot_structural_checks(store, world)
     if not verbose:
         return all(c[1] for c in checks)
-    s = h.store
+    s = store
     piv = user_row(s, PIVOT)
     print("\n================ PIVOT REPORT: graft ================")
     for name, ok, detail in checks:
         print(f"[{'PASS' if ok else 'FAIL'}] {name}\n        {detail}")
-    print(f"info: provider={h.provider.name}:{h.provider.model} usage={getattr(h.provider, 'usage', {})}")
+    if provider is not None:
+        print(f"info: provider={provider.name}:{provider.model} usage={getattr(provider, 'usage', {})}")
     ok = all(c[1] for c in checks)
     print(f"OVERALL (graft): {'PASS' if ok else 'FAIL'}")
     clones = [r for r in s.con.execute(
@@ -100,8 +103,8 @@ def graft_checks(h: Harness, verbose: bool = True) -> bool:
     return ok
 
 
-def pivot_structural_checks(h: Harness) -> list[tuple[str, bool, str]]:
-    s = h.store
+def pivot_structural_checks(store, world) -> list[tuple[str, bool, str]]:
+    s = store
     checks: list[tuple[str, bool, str]] = []
     web = clones_with(s, "website")
     slides = clones_with(s, "slides")
@@ -130,17 +133,17 @@ def pivot_structural_checks(h: Harness) -> list[tuple[str, bool, str]]:
                    f"services_row={svc} (in seed: {svc in seed}) owners={owners}"))
     paraphrase = [r for r in seed if s.turn(r)["role"] == "assistant" and s.turn(r)["kind"] == "text"
                   and s.turn(r)["owner_timeline"] == s.root()]
-    deck = h.world.deck_text().lower()
+    deck = world.deck_text().lower()
     used_ohio = "ohio" in deck
     used_dent = "dent" in deck
     services = sum(k in deck for k in ("clean", "implant", "whiten"))
-    tone_field = str(h.world.decks[-1].get("tone", "")).lower() if h.world.decks else ""
-    formal = bool(h.world.decks) and any(k in tone_field for k in ("formal", "professional")) \
+    tone_field = str(world.decks[-1].get("tone", "")).lower() if world.decks else ""
+    formal = bool(world.decks) and any(k in tone_field for k in ("formal", "professional")) \
         and not re.search("[\U0001F300-\U0001FAFF\u2600-\u27BF]", deck)
     checks.append(("deck uses the facts (Ohio, dentists, formal tone, >=2 services)",
                    used_ohio and used_dent and formal and services >= 2,
                    f"ohio={used_ohio} dentists={used_dent} formal_tone={formal} services_mentioned={services} "
-                   f"decks={len(h.world.decks)}"))
+                   f"decks={len(world.decks)}"))
     return checks
 
 
@@ -249,12 +252,14 @@ def first_call_line(label: str, call: dict | None) -> str:
 async def run_graft(provider, nonce: str | None, quiet: bool, db_path: str | None) -> dict:
     path = db_path or os.path.join(tempfile.mkdtemp(prefix="graft-pivot-"), "pivot.db")
     store = Store(path)
-    install(store)
-    h = Harness(store, provider, trace=None if quiet else (lambda m: print("  · " + m)), nonce=nonce)
+    world = FakeWorld()
+    agent = GraftAgent(store, provider, tools=world.tools(), config=GraftConfig(
+        trace=None if quiet else (lambda m: print("  · " + m)), nonce=nonce))
+    h = agent._host  # its wording of each timeline's system prompt, for the cache report
     print("\n######## ARM: graft ########")
-    await h.start()
-    await run_script(h, SCRIPT)
-    ok = graft_checks(h)
+    await agent.start()
+    await run_script(agent, SCRIPT, world=world)
+    ok = graft_checks(store, world, provider)
     slides = clones_with(store, "slides")
     sl = slides[0] if slides else None
     seed_rows = [r for r in store.view(sl) if r["owner_timeline"] != sl] if sl else []
@@ -263,7 +268,7 @@ async def run_graft(provider, nonce: str | None, quiet: bool, db_path: str | Non
     for r in seed_rows:
         print(f"  row {r['row_id']} owner={r['owner_timeline']} {r['role']} {r['kind']}: {r['content'][:200]}")
     print("fact preservation (DIAGNOSTIC only, no verdict; handoff = first slides clone's seed):")
-    print("\n".join(fact_table(seed_text, h.world.deck_text())))
+    print("\n".join(fact_table(seed_text, world.deck_text())))
     roles = cache_table("graft", provider, graft_role,
                         [(f"  {t}", u) for t, u in sorted(provider.by_tag.items()) if t.startswith("clone:")])
     print("first call of each clone (does a fresh clone get any cache hit?):")
@@ -276,17 +281,19 @@ async def run_graft(provider, nonce: str | None, quiet: bool, db_path: str | Non
     print(f"db: {path}")
     if not quiet:
         print(store.dump())
-    await h.close()
-    return {"ok": ok, "roles": roles, "deck": h.world.deck_text(), "handoff": seed_text}
+    await agent.close()
+    return {"ok": ok, "roles": roles, "deck": world.deck_text(), "handoff": seed_text}
 
 
 async def run_subagent(provider, nonce: str | None, quiet: bool) -> dict:
     store = Store(":memory:")
-    install(store)
-    r = SubagentRunner(store, provider, nonce=nonce, trace=None if quiet else (lambda m: print("  · " + m)))
+    world = FakeWorld()
+    install(store, tools=world.definitions())
+    r = SubagentRunner(store, provider, tools=world.tools(), nonce=nonce,
+                       trace=None if quiet else (lambda m: print("  · " + m)))
     print("\n######## ARM: subagent ########")
-    await run_script(r, SCRIPT)
-    ok, detail = deck_check(r.world)
+    await run_script(r, SCRIPT, world=world)
+    ok, detail = deck_check(world)
     slides = [d for d in r.delegations if d.skill == "slides"]
     print("\n================ PIVOT REPORT: subagent ================")
     print(f"[{'PASS' if slides else 'FAIL'}] slides delegated after the pivot ({len(slides)} slides delegation(s))")
@@ -302,14 +309,14 @@ async def run_subagent(provider, nonce: str | None, quiet: bool) -> dict:
         print("    facts in handoff: " + (", ".join(k for k, v in fact_hits(d.task_prompt).items() if v) or "none"))
     handoff = slides[-1].task_prompt if slides else ""
     print("fact preservation (DIAGNOSTIC only, no verdict; handoff = last slides delegation prompt):")
-    print("\n".join(fact_table(handoff, r.world.deck_text())))
+    print("\n".join(fact_table(handoff, world.deck_text())))
     roles = cache_table("subagent", provider, subagent_role)
     print("first call of each subagent (does a fresh subagent get any cache hit?):")
     for i, d in enumerate(r.delegations, 1):
         print(first_call_line(f"#{i} {d.skill}", d.first_call))
         print("    static prefix vs parent: " + shared_prefix(
             provider, r.parent_system(), [DELEGATE_TOOL], d.system, d.tools))
-    return {"ok": overall, "roles": roles, "deck": r.world.deck_text(), "handoff": handoff}
+    return {"ok": overall, "roles": roles, "deck": world.deck_text(), "handoff": handoff}
 
 
 def comparison(res: dict, provider) -> None:
@@ -336,9 +343,10 @@ def comparison(res: dict, provider) -> None:
               f"{pricing.effective_input(r['roles']['TOTAL']):.0f}, effective total "
               f"{pricing.effective_total(r['roles']['TOTAL']):.0f}")
     store = Store(":memory:")
-    install(store)
+    world = FakeWorld()
+    install(store, tools=world.definitions())
     store.create_timeline(tl="o", source=None, skills=["fork"])
-    h, sub = Harness(store, provider), SubagentRunner(store, provider)
+    h, sub = Host(store, provider, tools=world.tools()), SubagentRunner(store, provider, tools=world.tools())
     m = cachestats.min_cacheable(provider.name)
     print("static prefix (tools + system) lengths:")
     try:
@@ -347,7 +355,7 @@ def comparison(res: dict, provider) -> None:
         print(cachestats.prefix_line("subagent parent", provider.count_prefix_tokens(
             sub.parent_system(), [DELEGATE_TOOL]), m))
         print(cachestats.prefix_line("slides subagent", provider.count_prefix_tokens(
-            sub.subagent_system("slides"), [LOAD_SKILL_TOOL] + SKILL_TOOLS["slides"]), m))
+            sub.subagent_system("slides"), [LOAD_SKILL_TOOL] + [world.definitions()[n] for n in SKILL_TOOLS["slides"]]), m))
     except Exception as e:  # informational only
         print(f"  prefix token count failed: {type(e).__name__}: {e}")
 

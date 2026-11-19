@@ -19,7 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-NOOP = {"name": "noop", "description": "Does nothing.", "input_schema": {"type": "object", "properties": {}}}
+NOOP = {"name": "noop", "description": "Does nothing.", "inputSchema": {"type": "object", "properties": {}}}
 BINDING_BETA = "thinking-binding-controls-2026-08-01"
 
 

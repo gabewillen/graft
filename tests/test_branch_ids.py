@@ -8,18 +8,17 @@ import re
 
 import pytest
 
-from _util import clone_in_turn, ran, started, woke
+from _util import clone_in_turn, ran, started, woke, conversation, chat_of, install_fake
 from graft.db import Store
-from graft.harness import GRAFT_ID, MAX_NAME_DRAWS, Harness, new_names
+from graft.harness import GRAFT_ID, MAX_NAME_DRAWS, Host, new_names
 from graft.providers import FakeProvider
-from graft.skills import install
 from test_parallel import REQUEST, text
 
 
 def make(tmp_path, names=None, policy=None):
     store = Store(str(tmp_path / "ids.db"))
-    install(store)
-    h = Harness(store=store, provider=FakeProvider(policy or (lambda *a: text("ok"))), seeder=None, names=names)
+    install_fake(store)
+    h = conversation(store, policy or (lambda *a: text("ok")), seeder=None, names=names).h
     return store, h
 
 
@@ -51,7 +50,7 @@ def test_ids_given_and_drawn_name_the_branch_everywhere_and_never_its_timeline_i
     store, h = make(tmp_path, names=lambda: next(drawn))
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         store.add_turn("o", "user", "text", REQUEST)
         (c1, c2), msg = await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]},
                                                                    {"skills": ["slides"]}]))
@@ -78,7 +77,7 @@ def test_an_id_is_never_reused_and_a_colliding_draw_is_drawn_again(tmp_path):
     store, h = make(tmp_path, names=lambda: next(drawn))
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         store.add_turn("o", "user", "text", REQUEST)
         (c1,), _ = await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]}]))
         children, msg = await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["slides"]}]))
@@ -101,7 +100,7 @@ def test_an_id_source_that_cannot_give_an_id_refuses_the_call(tmp_path, source):
     store, h = make(tmp_path, names=(lambda: "site") if source == "collides" else (lambda: "Not An Id"))
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         store.add_turn("o", "user", "text", REQUEST)
         if source == "collides":
             await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]}]))
@@ -137,11 +136,11 @@ def test_stop_takes_branch_ids_and_a_timeline_id_names_nothing(tmp_path):
     store, h = make(tmp_path, policy=policy)
 
     async def go():
-        await h.start()
-        await h.user_says(REQUEST)
-        await h.user_says("Stop it.")
+        await chat_of(h).start()
+        await chat_of(h).say(REQUEST)
+        await chat_of(h).say("Stop it.")
         gate.set()
-        await h.settle()
+        await chat_of(h).quiet()
         await h.close()
 
     asyncio.run(go())
@@ -157,13 +156,13 @@ def test_error_lines_name_a_branch_by_its_id_even_when_another_branchs_timeline_
     """One namespace for every audience: the user's harness error lines name a branch by the id the
     model knows (`site`, timeline c1), never by its timeline id, so an id relayed from an error line
     (here `c1`, the model's name for timeline c2) never names a different branch."""
-    said = []
     store = Store(str(tmp_path / "err.db"))
-    install(store)
-    h = Harness(store=store, provider=FakeProvider(lambda *a: text("ok")), seeder=None, emit=said.append)
+    install_fake(store)
+    h = conversation(store, lambda *a: text("ok"), seeder=None).h
+    said = chat_of(h)
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         store.add_turn("o", "user", "text", REQUEST)
         (site,), _ = await clone_in_turn(h=h, use=fork(detached=[{"id": "site", "skills": ["website"]}]))
         (named_c1,), _ = await clone_in_turn(h=h, use=fork(detached=[{"id": "c1", "skills": ["slides"]}]))
@@ -179,7 +178,7 @@ def test_error_lines_name_a_branch_by_its_id_even_when_another_branchs_timeline_
         store.add_turn(site, "assistant", "text", "Site built.")
         await h.do_join(child=site, reason="done")
         await h.drain_and_wake("o")
-        await h.machines.stop()
+        await h.close()
 
     asyncio.run(go())
     lines = [line for line in said if line.startswith("(harness error: committing the merge")]
@@ -206,8 +205,8 @@ def test_a_request_handed_back_any_number_of_times_may_still_be_forked_for(tmp_p
     store, h = make(tmp_path, policy=policy)
 
     async def go():
-        await h.start()
-        out = await h.user_says(REQUEST)
+        await chat_of(h).start()
+        out = await chat_of(h).say(REQUEST)
         assert out[-1] == "I could not route that."
         await h.close()
 
@@ -220,13 +219,13 @@ def test_a_request_handed_back_any_number_of_times_may_still_be_forked_for(tmp_p
 def test_an_error_line_is_still_told_when_the_store_cannot_name_the_branch(tmp_path):
     """The failure told may be the store's own: a name that cannot be read is left out of the line
     (never the timeline id in its place), and the line is still told."""
-    said = []
     store = Store(str(tmp_path / "err2.db"))
-    install(store)
-    h = Harness(store=store, provider=FakeProvider(lambda *a: text("ok")), seeder=None, emit=said.append)
+    install_fake(store)
+    h = conversation(store, lambda *a: text("ok"), seeder=None).h
+    said = chat_of(h)
 
     def broken(tl):
         raise OSError("store gone")
     store.name_of = broken
-    h._report_failure(kind="commit", src="o", clones=["c1"], error=OSError("disk full"), quiet=False, background=True)
-    assert said and said[-1].startswith("(harness error: committing the merge of a branch failed") and "c1" not in said[-1]
+    line, _ = h.report(kind="commit", src="o", clones=["c1"], error=OSError("disk full"), quiet=False, background=True)
+    assert line.startswith("(harness error: committing the merge of a branch failed") and "c1" not in line

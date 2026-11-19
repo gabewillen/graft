@@ -52,9 +52,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from graft import cachestats  # noqa: E402
 from graft.db import Graft, Store, render  # noqa: E402
-from graft.harness import Harness  # noqa: E402
+from graft.fake import FakeWorld  # noqa: E402
+from graft.harness import Host  # noqa: E402
 from graft.providers import FakeProvider, add_usage, empty_usage, make_provider, prefix_nonce  # noqa: E402
-from graft.skills import (BASE_SYSTEM, LOAD_SKILL_TOOL, World, install, load_skill,  # noqa: E402
+from graft.skills import (BASE_SYSTEM, LOAD_SKILL_TOOL, install, load_skill,  # noqa: E402
                             skill_listing)
 from graft.subagent import DELEGATE_TOOL, SubagentRunner  # noqa: E402
 
@@ -125,7 +126,7 @@ def build_history(store: Store, tl: str) -> None:
 
 def build(path: str, provider):
     store = Store(path)
-    install(store)
+    install(store, tools=FakeWorld().definitions())
     store.create_timeline(tl="o", source=None, skills=["fork"])
     build_history(store, "o")
     task_row = store.add_turn("o", "user", "text", TASK)
@@ -135,7 +136,7 @@ def build(path: str, provider):
     store.create_timeline("shared", None, CAPABILITY)
     for r in store.view("o"):
         store.append("shared", r["row_id"])
-    h = Harness(store, provider)
+    h = Host(store, provider)  # its wording of the clone's system prompt
     arms = {
         "clone": {
             "rows": store.view("c1"), "system": h.system("c1"), "tools": store.tools_for("c1"),
@@ -153,7 +154,7 @@ def build(path: str, provider):
     return store, arms
 
 
-def subagent_run(provider, arm: dict, world: World, nonce: str | None) -> dict:
+def subagent_run(provider, arm: dict, world: FakeWorld, nonce: str | None) -> dict:
     """Parent writes the handoff (one call on the shared history), then the subagent works."""
     with provider.usage_tag("parent"):
         blocks = provider.complete(arm["system"], prefix_nonce(render(arm["rows"]), nonce), arm["tools"])
@@ -162,13 +163,13 @@ def subagent_run(provider, arm: dict, world: World, nonce: str | None) -> dict:
         return {"texts": [b["text"] for b in blocks if b["type"] == "text"], "loaded": [], "handoff": None}
     provider.retag_last("handoff")
     store = Store(":memory:")  # SQLite is per-thread: a private catalog copy for this worker
-    install(store)
-    d = SubagentRunner(store, provider, world=world, nonce=nonce).run_subagent(
+    install(store, tools=world.definitions())
+    d = SubagentRunner(store, provider, tools=world.tools(), nonce=nonce).run_subagent(
         str(use["input"].get("skill", "")), str(use["input"].get("task_prompt", "")))
     return {"texts": [d.summary], "loaded": d.loaded, "handoff": d.task_prompt, "summary": d.summary}
 
 
-def agent_loop(provider, instructions: dict[str, str], arm: dict, world: World, max_steps: int = 8,
+def agent_loop(provider, instructions: dict[str, str], arm: dict, world: FakeWorld, max_steps: int = 8,
                nonce: str | None = None) -> dict:
     msgs = prefix_nonce(render(arm["rows"]), nonce)
     texts, loaded = [], []
@@ -190,7 +191,7 @@ def agent_loop(provider, instructions: dict[str, str], arm: dict, world: World, 
                                 else (f"skill '{want}' is not linked to you; you can load: "
                                       f"{sorted(arm['linked'])}", True))
             else:
-                content, err = world.execute(u["name"], u["input"])
+                content, err = world.execute(u["name"], u["input"])  # the simulated tool, synchronously
             results.append({"type": "tool_result", "tool_use_id": u["id"], "content": content, "is_error": err})
         msgs.append({"role": "user", "content": results})
         if stop:
@@ -204,7 +205,7 @@ def title_case(t: str) -> bool:
     return bool(words) and all(w[0].isupper() for i, w in enumerate(words) if i == 0 or w.lower() not in small)
 
 
-def score(world: World, run: dict) -> dict:
+def score(world: FakeWorld, run: dict) -> dict:
     calls = Counter(name for name, _ in world.log)
     deck = world.decks[-1] if world.decks else {"title": "", "slides": []}
     titles = [deck.get("title", "")] + [s["title"] for s in deck["slides"]]
@@ -334,7 +335,7 @@ def main() -> int:
 
     def job(arm_name: str, i: int) -> tuple[str, int, dict]:
         usage = provider.thread_usage_reset()
-        world = World()
+        world = FakeWorld()
         nonce = uuid.uuid4().hex[:16] if a.cache_scope == "run" else None
         try:
             if arm_name == "subagent":

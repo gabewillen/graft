@@ -5,13 +5,14 @@ from types import SimpleNamespace as NS
 
 import pytest
 
+from _util import conversation, chat_of, install_fake
+
 from graft import cachestats, callsites
 from graft.db import Store
 from graft.fake import pivot_policy
-from graft.harness import Harness
+from graft.harness import Host
 from graft.providers import FakeProvider, OpenAIProvider
 from graft.sim import run_script
-from graft.skills import install
 
 ENV = [f"GRAFT_{w}_{s.upper()}" for w in ("EFFORT", "MODEL") for s in callsites.SITES] + \
       ["GRAFT_REASONING_EFFORT", "GRAFT_MODEL"]
@@ -61,13 +62,13 @@ def test_harness_tags_each_call_with_site_effort_and_model(tmp_path, clean_env):
     clean_env.setenv("GRAFT_EFFORT_CLONE_CALL", "high")
     clean_env.setenv("GRAFT_MODEL_CLONE", "model-b")
     store = Store(str(tmp_path / "s.db"))
-    install(store)
+    install_fake(store)
     fp = FakeProvider(pivot_policy)
-    h = Harness(store, fp)
+    h = conversation(store, provider=fp).h
 
     async def go():
-        await h.start()
-        await run_script(h, ["I need a website.", "It is for dentists in Ohio."], echo=False)
+        await chat_of(h).start()
+        await run_script(chat_of(h).agent, ["I need a website.", "It is for dentists in Ohio."], echo=False)
         await h.machines.stop()
 
     asyncio.run(go())

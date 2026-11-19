@@ -9,6 +9,9 @@ import asyncio
 
 import pytest
 
+from _util import conversation
+
+from graft.harness import _described
 from graft.machine import (CANCELLED, MAX_JOIN_ATTEMPTS, Cancel, CancelCall, Clone, Prepared,
                            Request, RunOutcome, ToolCall,
                            Machines, Mode, QueuedJoin, TransitionRefused)
@@ -33,6 +36,7 @@ class Host:
         self.hold_tl: str | None = None  # set: only that timeline's cancelled run waits for `hold`
         self.tool_gate: asyncio.Future | None = None  # set: a host tool call waits for it
         self.watches: list[tuple[tuple, asyncio.Future]] = []
+        self.events: list[tuple[int, dict]] = []  # the event log the session wrote
 
     def record(self, *entry):
         self.log.append(entry)
@@ -61,7 +65,7 @@ class Host:
                 await self.hold
             raise
 
-    async def run_busy(self, tl, kind, woken=None):
+    async def run_busy(self, tl, kind, woken=None, tasks=()):
         # a wake run is told the joins it is for (`woken`); its view ends on their merge results,
         # so no note is written for it: ("wake", ...) logs that a wake run began
         if woken is not None:
@@ -130,9 +134,17 @@ class Host:
     def cancel_text(self, call, outcomes):
         return repr(sorted(outcomes.items())), not any(v == CANCELLED for v in outcomes.values())
 
-    def report(self, kind, src, clones, error, quiet, background):
+    def report(self, kind, src, clones, error, quiet, background, fails=()):
         self.reports.append((kind, clones, str(error)))
         self.record("report", kind, clones, str(error))
+        return f"(harness error: {_described(error)})", tuple(fails)
+
+    def append_events(self, events):
+        self.events += list(events)
+        return events[-1][0] if events else 0
+
+    def flush(self):
+        return None
 
     def graft_failed(self, tl, error):
         self.record("graft_failed", tl, str(error))
@@ -164,6 +176,20 @@ async def started():
     m = Machines(host)
     await m.start_root("o")
     return host, m
+
+
+async def told(m, host, count=1):
+    """The harness error lines the session wrote to the event log (waiting until `count` are)."""
+    for _ in range(50):
+        lines = [e["message"]["parts"][0]["text"] if "message" in e else e["statusUpdate"]["status"]["message"]["parts"][0]["text"]
+                 for _, e in host.events
+                 if ((e.get("message") or (e.get("statusUpdate") or {}).get("status", {}).get("message") or {})
+                     .get("metadata") or {}).get("graft", {}).get("error")]
+        if len(lines) >= count:
+            return lines
+        await asyncio.wait_for(m.ask(tl="session", name="events_wait", build=lambda r: (
+            host.events[-1][0] if host.events else 0, r)), GUARD)
+    raise AssertionError(f"fewer than {count} error lines told")
 
 
 REQUESTS: dict[asyncio.Future, int] = {}  # a reply future -> the id of its request
@@ -368,7 +394,10 @@ def test_an_interrupt_of_the_users_call_reaches_the_focus_graft_answering_it():
         await withdraw(m=m, reply=reply)  # forwarded by the suspended original
         await closed  # its run ended early: its open calls are closed
         assert ("run_cancelled", "c1") in host.log
-        assert await at_rest(m=m, tl="c1") == "ended"
+        # its turn ends in a merge: it joins `cancelled`, and the conversation comes back to main
+        assert await at_rest(m=m, tl="c1") == "joined"
+        assert await at_rest(m=m) == "ended" and ("apply", "c1", "cancelled") in host.log
+        assert holders(host) == ["o"] and not host.logged(prefix=("run", "o", "wake"))
         await m.stop()
     run(go)
 
@@ -570,24 +599,20 @@ def test_a_run_that_fails_during_a_cancel_step_waits_for_the_step(withdrawn):
 
 
 # ------------------------------------------------------------------ the session
-def test_settle_waits_until_nothing_is_in_flight_and_raises_what_failed_once():
+def test_a_failed_wake_is_told_once_in_the_event_log():
     async def go():
         host, m = await started()
         first = await say(m=m, text="go")
         await clone(m=m, pairs=[("c1", False)])
         host.end("o")
         assert await first == "ended"
-        settling = m.future()
-        await m.send(tl="session", name="settle_request", data=settling)
-        assert not settling.done()  # c1 is still running
         waking = host.next("run", "o", "wake")
         host.end("c1")
         await waking
-        assert not settling.done()  # the wake run is in flight
         host.fail(tl="o", error=ValueError("wake exploded"))
-        with pytest.raises(ValueError, match="wake exploded"):
-            await settling
-        assert await m.ask(tl="session", name="settle_request", build=lambda r: r) is None  # raised once
+        assert await at_rest(m) == "ended"
+        (line,) = await told(m=m, host=host)
+        assert "wake exploded" in line
         await m.stop()
     run(go)
 
@@ -634,8 +659,8 @@ def test_a_failing_write_in_an_activity_is_handled_by_its_state_and_kept_for_set
         assert await asyncio.wait_for(m.ask(tl="o", name="driven_done", build=lambda r: r), timeout=GUARD) == "ended"
         await waking
         host.end("o")  # the wake that reports c1
-        with pytest.raises(RuntimeError, match="host bug"):
-            await m.ask(tl="session", name="settle_request", build=lambda r: r)
+        assert await at_rest(m) == "ended"
+        assert any("host bug" in line for line in await told(m=m, host=host))
         await m.stop()
     run(go)
 
@@ -724,10 +749,8 @@ def test_a_fault_in_the_recovery_s_own_step_is_folded_into_it():
         assert await asyncio.wait_for(reply, GUARD) == "ended"  # answered before the send failed
         assert await at_rest(m) == "ended" and left == []
         assert len(host.logged(prefix=("recover", "o"))) == 1
-        with pytest.raises(ExceptionGroup) as kept:
-            await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
-        assert list(kept.value.exceptions) == [errors["rested"], errors["resync"]]
-        assert await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD) is None
+        (line,) = await told(m=m, host=host)  # the two errors, told together, once
+        assert "cannot send rested" in line and "cannot send resync" in line
         nxt = await say(m=m, text="two")
         host.end("o")
         assert await asyncio.wait_for(nxt, GUARD) == "ended"
@@ -768,7 +791,7 @@ def test_a_message_whose_step_fails_while_a_clone_call_starts_its_grafts_fails_a
         host.end("c1")
         await asyncio.wait_for(woken, GUARD)  # its join is applied, and the original reports it
         host.end("o")
-        await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
+        assert await at_rest(m) == "ended"
         await m.stop()
     run(go)
 
@@ -908,15 +931,14 @@ def test_a_graft_machine_that_cannot_start_undoes_the_whole_clone_call(monkeypat
         assert children is None and "refused" in text
         assert ("abandoned", tuple(g for g, _ in pairs)) in host.log
         if pairs[HEAD][1]:  # a focus graft is started last: one that could not start leaves it unmade
-            assert host.logged(prefix=("run", "c0")) == [] and "c0" not in m.timelines and "c0" not in m.session.engaged
+            assert host.logged(prefix=("run", "c0")) == [] and "c0" not in m.timelines
         for g, _ in pairs:  # forgotten
             with pytest.raises(TransitionRefused, match="no machine"):
                 await m.send(tl=g, name="cancel")
         answer = await cancel(m=m, tl="o", ids=["c1"])
         assert "no such branch" in answer[0][0]
         host.end("o")
-        assert await first == "ended"
-        await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), timeout=GUARD)
+        assert await first == "ended" and await at_rest(m) == "ended"
         await asyncio.wait_for(m.ask(tl="session", name="shutdown", build=lambda r: r), timeout=GUARD)
         await m.stop()
     run(go)
@@ -1087,22 +1109,25 @@ def test_a_request_withdrawn_during_a_focus_clone_never_lets_the_focus_graft_act
     """Withdrawn while the clone call commits (before the graft is made), the focus graft never
     starts a run; withdrawn while its result row is written (after the graft started), the
     withdrawal is forwarded and the graft's run ends. Either way the clone call is carried out
-    whole, the conversation is handed over, and the request's written row is marked in the
-    graft's view and its source's before the graft is at rest."""
+    whole, the conversation is handed over, the request's written row is marked in the graft's
+    view and its source's, and the graft's turn ends in its merge (`cancelled`): the conversation
+    comes back to main, which runs nothing for the withdrawn request."""
     async def go():
         host, m = await started()
         reply = await say(m=m, text="go")
         row = host.log.index(("request", "o", "go")) + 1  # the row the host wrote for it
         _withdraws_inside(host=host, m=m, method=method, reply=reply)
         _, focus, _ = await clone(m=m, pairs=[("c1", True)])
-        assert focus == "c1" and host.status["o"] == "cloned"
-        assert await at_rest(m=m, tl="c1") == "ended"
+        assert focus == "c1"
+        assert await at_rest(m=m, tl="c1") == "joined"
+        assert await at_rest(m) == "ended" and ("apply", "c1", CANCELLED) in host.log and holders(host) == ["o"]
         if method == "commit_clone":
             assert not host.logged(prefix=("run", "c1"))  # it never started a run
-            assert await asyncio.wait_for(reply, GUARD) == "ended"  # and its caller is answered at its rest
         else:
             assert ("run_cancelled", "c1") in host.log  # its run was ended
-        assert host.logged(prefix=("withdrawn",)) == [("withdrawn", ("c1", "o"), [row])]
+        assert await asyncio.wait_for(reply, GUARD) == "ended"  # its caller is answered at main's rest
+        assert host.logged(prefix=("withdrawn",))[HEAD] == ("withdrawn", ("c1", "o"), [row])
+        assert not host.logged(prefix=("run", "o", "wake"))
         await m.stop()
     run(go)
 
@@ -1229,26 +1254,25 @@ def test_a_withdrawal_that_comes_while_the_focus_graft_is_started_ends_its_run_a
         release.set_result(None)
         assert (await asyncio.wait_for(asking, GUARD))[1] == "c1"
         await asyncio.wait_for(ended, GUARD)
-        assert await at_rest(m=m, tl="c1") == "ended"
+        assert await at_rest(m=m, tl="c1") == "joined"  # its turn ended in its merge (`cancelled`)
         await m.stop()
     run(go)
 
 
-def test_a_focus_graft_whose_request_was_withdrawn_still_answers_the_next_message_handed_to_it():
+def test_a_focus_graft_whose_request_was_withdrawn_merges_and_main_answers_the_next_message():
+    """The focus graft's request is withdrawn before it can act: it merges `cancelled` at once,
+    and the message handed to it with the conversation goes back to main, which answers it."""
     async def go():
         host, m = await started()
         first = await say(m=m, text="A")
         second = await say(m=m, text="B")  # waits on the original
         _withdraws_inside(host=host, m=m, method="commit_clone", reply=first)
-        ran = host.next("run", "c1")
+        taken = host.next("request", "o", "B")
         _, focus, _ = await clone(m=m, pairs=[("c1", True)])
         assert focus == "c1"
-        await asyncio.wait_for(ran, GUARD)  # c1 started at rest, then took B
-        assert host.logged(prefix=("request", "c1")) == [("request", "c1", "B")]
-        assert len(host.logged(prefix=("run", "c1"))) == 1
-        waking = host.next("run", "o", "wake")
-        host.end("c1")  # its turn on B ends in its join: the original runs once after it
-        await asyncio.wait_for(waking, GUARD)
+        assert await at_rest(m=m, tl="c1") == "joined" and not host.logged(prefix=("run", "c1"))
+        await asyncio.wait_for(taken, GUARD)  # main takes B
+        assert ("apply", "c1", CANCELLED) in host.log
         host.end("o")
         assert await second == "ended" and await first == "ended"
         await m.stop()
@@ -1352,7 +1376,6 @@ def test_a_background_graft_made_before_a_withdrawal_mid_spawn_stops_and_the_nex
         assert await at_rest(m) == "ended"
         assert ("reason", "c1", CANCELLED) in host.log and ("reason", "c2", CANCELLED) in host.log
         assert host.logged(prefix=("run", "c2")) == [] and host.logged(prefix=("wake",)) == []
-        await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
         await m.stop()
     run(go)
 
@@ -1376,8 +1399,8 @@ def test_a_withdrawal_mid_spawn_reaches_the_focus_graft_made_after_it(monkeypatc
         m.post(tl="o", name="withdraw", data=REQUESTS[reply])
         release.set_result(None)
         _, focus, _ = await asyncio.wait_for(asking, GUARD)
-        assert focus == "c2" and await at_rest(m=m, tl="c2") == "ended"
-        assert host.logged(prefix=("withdrawn",)) == [("withdrawn", ("c2", "o"), [row])]
+        assert focus == "c2" and await at_rest(m=m, tl="c2") == "joined"  # it merged `cancelled`
+        assert host.logged(prefix=("withdrawn",))[HEAD] == ("withdrawn", ("c2", "o"), [row])
         if reply_cancelled:
             assert host.logged(prefix=("run", "c2")) == []  # it never started a run
         else:
@@ -1402,7 +1425,6 @@ def test_a_graft_that_joined_at_once_in_a_clone_call_undone_at_its_start_is_neve
         assert await at_rest(m) == "ended"
         assert host.logged(prefix=("apply",)) == [] and ("abandoned", ("c1", "c2")) in host.log
         assert host.logged(prefix=("run", "c1")) == [] and host.logged(prefix=("wake",)) == []
-        await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
         await m.stop()
     run(go)
 
@@ -1449,16 +1471,15 @@ def test_a_waiting_message_withdrawn_while_a_hand_over_is_made_is_answered_and_s
             return real(**kw)
         host.commit_clone = commit
         c = await say(m=m, text="C")  # waits on o too
-        ran = host.next("run", "c1")
+        taken = host.next("request", "o", "C")
         _, focus, _ = await clone(m=m, pairs=[("c1", True)])
         assert focus == "c1"
-        await asyncio.wait_for(ran, GUARD)
-        assert host.logged(prefix=("request", "c1")) == [("request", "c1", "C")]  # B was dropped, C taken
+        # c1's request was withdrawn before it could act: it merges `cancelled` at once, B is
+        # dropped, and C, handed to it with the conversation, comes back to main, which takes it
+        assert await at_rest(m=m, tl="c1") == "joined" and not host.logged(prefix=("run", "c1"))
+        await asyncio.wait_for(taken, GUARD)
         if by_id_only:
             assert await asyncio.wait_for(b, GUARD) == "ended"
-        waking = host.next("run", "o", "wake")
-        host.end("c1")  # its turn on C ends in its join: the original runs once after it
-        await asyncio.wait_for(waking, GUARD)
         host.end("o")
         assert await asyncio.wait_for(c, GUARD) == "ended"
         assert await at_rest(m) == "ended"
@@ -1466,14 +1487,11 @@ def test_a_waiting_message_withdrawn_while_a_hand_over_is_made_is_answered_and_s
         await clone(m=m, pairs=[("c2", False)])
         host.end("o")
         assert await first == "ended"
-        settling = m.future()
-        await m.send(tl="session", name="settle_request", data=settling)
         waking = host.next("run", "o", "wake")
         host.end("c2")
         await asyncio.wait_for(waking, GUARD)
         host.fail(tl="o", error=ValueError("wake exploded"))
-        with pytest.raises(ValueError, match="wake exploded"):
-            await asyncio.wait_for(settling, GUARD)
+        assert any("wake exploded" in line for line in await told(m=m, host=host))
         await m.stop()
     run(go)
 
@@ -1624,13 +1642,9 @@ def test_a_clone_call_cut_short_in_its_preparation_is_rolled_back_in_its_own_sta
         assert (await asyncio.wait_for(asking, GUARD))[0] is None  # the call is answered: not executed
         assert await at_rest(m) == "ended" and ("roll_back", "o") in host.log
         assert bool(host.logged(prefix=("close", "o"))) == (how == "request withdrawn")  # a driven turn's caller closes its own
-        settling = m.ask(tl="session", name="settle_request", build=lambda r: r)
         if fails:
             assert ("task", [], "rollback failed") in host.reports
-            with pytest.raises(OSError, match="rollback failed"):
-                await asyncio.wait_for(settling, GUARD)
-        else:
-            assert await asyncio.wait_for(settling, GUARD) is None
+            assert any("rollback failed" in line for line in await told(m=m, host=host))
         await m.stop()
     run(go)
 
@@ -1671,9 +1685,10 @@ def test_every_stop_failure_is_told_when_telling_one_raises_and_close_raises_tha
 
     class Reporter(Host):
         def report(self, kind, src, clones, error, quiet, background):
-            super().report(kind=kind, src=src, clones=clones, error=error, quiet=quiet, background=background)
+            line = super().report(kind=kind, src=src, clones=clones, error=error, quiet=quiet, background=background)
             if len(self.reports) == 1:
                 raise callback_error
+            return line
 
     async def go():
         host = Reporter()
@@ -1988,11 +2003,8 @@ def test_a_raising_recovery_guard_is_reported_and_its_fault_handled_again(monkey
         reply = await say(m=m, text="hi")
         host.end("o")
         assert await asyncio.wait_for(reply, GUARD) == "ended"
-        with pytest.raises(ExceptionGroup) as kept:
-            await asyncio.wait_for(m.ask(tl="session", name="settle_request", build=lambda r: r), GUARD)
-        rested, decision = kept.value.exceptions
-        assert rested is errors["rested"] and isinstance(decision, machine_module.DecisionFault)
-        assert "may_recover held" in str(decision)
+        (line,) = await told(m=m, host=host)  # both errors, told together, once
+        assert str(errors["rested"]) in line and "may_recover held" in line
         assert len(host.logged(prefix=("recover", "o"))) == 1  # handled again: closed out once
         nxt = await say(m=m, text="two")
         host.end("o")
@@ -2041,16 +2053,12 @@ def test_a_row_a_focus_graft_could_not_mark_is_marked_before_its_join_is_copied(
         row = host.log.index(("request", "o", "go")) + 1
         await clone(m=m, pairs=[("c1", True)])  # the original is suspended; c1 runs
         failed = _mark_fails_once(host=host)
+        applied = host.next("apply", "c1")
         await withdraw(m=m, reply=first)  # reaches the focus graft: its run ends, the mark fails
-        assert await at_rest(m=m, tl="c1") == "ended" and failed == [[row]]
-        applied, waking = host.next("apply", "c1"), host.next("run", "o", "wake")
-        joining = asyncio.ensure_future(m.ask(tl="c1", name="join", build=lambda r: (
-            QueuedJoin(child="c1", reason="done", trigger=None), r)))
-        await asyncio.wait_for(applied, GUARD)
-        assert host.log.index(("withdrawn", ("o",), [row])) < host.log.index(("apply", "c1", "done"))
-        await asyncio.wait_for(waking, GUARD)  # the original runs once after the merge
-        host.end("o")
-        await asyncio.wait_for(joining, GUARD)
+        await asyncio.wait_for(applied, GUARD)  # its turn ends in its merge (`cancelled`)
+        assert failed == [[row]] and await at_rest(m=m, tl="c1") == "joined"
+        assert host.log.index(("withdrawn", ("o",), [row])) < host.log.index(("apply", "c1", CANCELLED))
+        assert await at_rest(m) == "ended" and not host.logged(prefix=("run", "o", "wake"))
         await m.stop()
     run(go)
 

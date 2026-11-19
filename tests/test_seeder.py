@@ -7,11 +7,10 @@ from types import SimpleNamespace as NS
 import pytest
 
 from graft import seeder as sd
-from _util import clone_in_turn
+from _util import clone_in_turn, conversation, chat_of, install_fake
 from graft.db import Store
-from graft.harness import Harness
+from graft.harness import Host
 from graft.providers import FakeProvider
-from graft.skills import install
 
 
 class FakeJev:
@@ -42,8 +41,8 @@ def seeder(fake, budget=None):
 def setup(tmp_path, fake, monkeypatch, threshold="0.4"):
     monkeypatch.setenv("GRAFT_SEED_THRESHOLD", threshold)
     store = Store(str(tmp_path / "s.db"))
-    install(store)
-    h = Harness(store, FakeProvider(lambda *a: []), seeder=seeder(fake))
+    install_fake(store)
+    h = conversation(store, lambda *a: [], seeder=seeder(fake)).h
     return store, h
 
 
@@ -64,7 +63,7 @@ def test_jev_selects_by_threshold_with_trigger_and_audit(tmp_path, monkeypatch):
     store, h = setup(tmp_path, fake, monkeypatch)
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         r = rows(store)
         # the decisions client picks the seed; the entry names only its skills
         children, text = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
@@ -97,7 +96,7 @@ def test_leading_assistant_row_gets_nearest_earlier_user_row(tmp_path, monkeypat
     store, h = setup(tmp_path, OnlyAssistant(), monkeypatch)
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         r = rows(store)
         (child,), _ = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
             "current": {"skills": ["slides"]}}})
@@ -114,7 +113,7 @@ def test_seeder_failure_falls_back_to_the_entrys_messages_and_is_recorded(tmp_pa
     store, h = setup(tmp_path, FakeJev(fail=True), monkeypatch)
 
     async def go():
-        await h.start()
+        await chat_of(h).start()
         r = rows(store)
         (child,), text = await clone_in_turn(h=h, use={"id": "t", "name": "fork", "input": {
             "current": {"skills": ["slides"]}}})

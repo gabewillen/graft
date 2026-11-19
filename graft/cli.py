@@ -8,10 +8,13 @@ import os
 import sys
 import tempfile
 
+from . import a2a
+from .agent import GraftAgent, GraftConfig, HarnessError
 from .db import Store
-from .harness import Harness, in_daemon_thread
+from .fake import FakeWorld
+from .harness import in_daemon_thread
 from .providers import make_provider
-from .skills import install
+from .sim import user_message
 
 
 def _read_line() -> str | None:
@@ -26,20 +29,41 @@ def _prompt() -> None:
     print("\nyou> ", end="", flush=True)
 
 
+def _show(message: a2a.Message | None, seen: set[str]) -> None:
+    """An agent message, once: replies to stdout, harness errors to stderr."""
+    if message is None or message.role != a2a.ROLE_AGENT or message.message_id in seen:
+        return
+    seen.add(message.message_id)
+    if (message.metadata or {}).get("graft", {}).get("error"):
+        print(message.text, file=sys.stderr)
+    else:
+        print(f"assistant> {message.text}")
+
+
+async def _follow(agent: GraftAgent, stream, seen: set[str]) -> None:
+    """Print a task's messages as they are told, until it is terminal."""
+    try:
+        async for event in stream:
+            if event.status_update is not None:
+                _show(event.status_update.status.message, seen)
+    except HarnessError:
+        pass  # its line was printed as it was told
+
+
 async def chat(db_path: str, trace: bool) -> None:
     store = Store(db_path)
-    install(store)
-    # Replies are printed as they are said: a background clone's result arrives between turns.
-    h = Harness(store, make_provider(), trace=print if trace else None,
-                emit=lambda reply: print(f"assistant> {reply}"))
-    await h.start()
-    print(f"graft chat ({h.provider.name}:{h.provider.model}); db={db_path}. "
-          "Commands: /dump, /quit")
+    world = FakeWorld()  # the simulated skills' tools
+    provider = make_provider()
+    agent = GraftAgent(store, provider, tools=world.tools(), config=GraftConfig(trace=print if trace else None))
+    await agent.start()
+    print(f"graft chat ({provider.name}:{provider.model}); db={db_path}. Commands: /dump, /quit")
+    seen: set[str] = set()
+    followers: list[asyncio.Task] = []
     try:
         while True:
-            # The prompt is shown once the machine has answered the last call. Each line is read
-            # off the event loop, one read per request, in a daemon thread whose result comes back
-            # by the same hop as a model call's; background clones keep running meanwhile.
+            # Each message is a task, streamed: its replies print as they are said, and a task whose
+            # branches still work stays followed in the background (their reports print as they
+            # come). The prompt comes back when main's turn ends.
             _prompt()
             line = await in_daemon_thread(_read_line)
             if line is None:
@@ -52,18 +76,26 @@ async def chat(db_path: str, trace: bool) -> None:
             if text == "/dump":
                 print(store.dump())
                 continue
-            await h.user_says(text)
-        # Status and errors are diagnostics: stderr. stdout carries the conversation.
-        # The store's copy of each graft's state says which are still running.
-        if store.con.execute("SELECT 1 FROM timelines WHERE status = 'background' LIMIT 1").fetchone():
+            stream = agent.stream(user_message(text))
+            turn_over = False
+            async for event in stream:
+                if event.task is not None:
+                    seen |= {m.message_id for m in event.task.history if m.role == a2a.ROLE_AGENT}
+                    continue
+                _show(event.status_update.status.message, seen)
+                if event.status_update.status.state in a2a.INTERRUPTED:
+                    turn_over = True
+                    break
+            if turn_over:
+                followers.append(asyncio.create_task(_follow(agent, stream, seen)))
+        if any(not f.done() for f in followers):
             print("waiting for background branches to merge...", file=sys.stderr)
-        try:
-            await h.settle()
-        except Exception as e:  # already shown when it happened; do not end on a traceback
-            print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+        await asyncio.gather(*followers, return_exceptions=True)
     finally:
-        # Also on Ctrl-C (the task is cancelled): running clones are cancelled and joined failed.
-        await h.close()
+        # Also on Ctrl-C (the task is cancelled): running branches stop, open tasks fail.
+        for f in followers:
+            f.cancel()
+        await agent.close()
 
 
 def main() -> None:

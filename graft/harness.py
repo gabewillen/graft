@@ -74,8 +74,8 @@ from .db import Graft, Store, render, validate
 from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, Cancel, CancelCall, Clone, Machines, Mode,
                       Prepared, QueuedJoin, RunOutcome, ToolCall, TransitionRefused, Unwritten, described)
 from .providers import Provider, prefix_nonce, window_tokens_for
-from .skills import (BASE_SYSTEM, BRANCH_ID_PATTERN, BUILTIN, MAX_MESSAGES, REASON_CHARS, World, load_skill,
-                     skill_listing)
+from .skills import BASE_SYSTEM, BRANCH_ID_PATTERN, BUILTIN, MAX_MESSAGES, REASON_CHARS, load_skill, skill_listing
+from .tools import CallToolResult, Tool, by_name
 
 # Seconds one model call may take before it is abandoned as a mechanical failure (the harness's
 # `call_timeout`; None disables it). Without it a hung call keeps a graft live for ever.
@@ -460,12 +460,16 @@ def _described(error: BaseException) -> str:
     return described(error)  # guarded: a message that raises shows the type alone
 
 
-class Harness:
-    def __init__(self, store: Store, provider: Provider, world: World | None = None,
+class Host:
+    """The machines' host (internal: the host's interface is `graft.agent.GraftAgent`). It does the
+    I/O the machines ask for: model calls, store reads and writes, tool calls, the event log's
+    writes, and the wording of what the model and the user read."""
+
+    def __init__(self, store: Store, provider: Provider, tools: Sequence[Tool] = (),
                  trace: Callable[[str], None] | None = None, max_steps: int = 10,
                  persona: str = BASE_SYSTEM, nonce: str | None = None,
                  compact_tokens: int | None = None, compaction_mode: str = "turns", seeder=...,
-                 window_tokens: int | None = ..., emit: Callable[[str], None] | None = None,
+                 window_tokens: int | None = ...,
                  call_timeout: float | None = MODEL_CALL_TIMEOUT,
                  names: Callable[[], str] | None = None):
         self.store = store
@@ -473,8 +477,9 @@ class Harness:
         self.names = names or new_names()
         self.persona = persona  # user-provided; identical, verbatim, on every timeline
         self.provider = provider
-        self.world = world or World()
+        self.tools = by_name(list(tools))  # the host's tools, by name (graft/tools.py)
         self.machines = Machines(self)
+        # A debug hook: internal trace lines (never the host's channel: that is the event log).
         self.trace = trace or (lambda s: None)
         self.max_steps = max_steps
         # Seconds a model call may take (None: no limit). A call that exceeds it raises
@@ -485,18 +490,8 @@ class Harness:
         # Decisions client (graft/seeder.py) that picks a graft's seed; None: the messages its fork entry points at
         self.seeder = seeder_mod.make_seeder() if seeder is ... else seeder
         self.seeder_log: list[dict] = []  # per clone: Jev latency, tokens, scores, selection, fallback
-        self.out: list[str] = []  # user-facing texts: only the conversation holder's
-        self.emit = emit or (lambda s: None)  # called with each user-facing text as it is said
-        self._mark = 0  # self.out[:_mark] was already returned by user_says / settle
-        # per wake run: {source, joined: [(clone, reason)]}
+        # per wake run: {source, joined: [(clone, reason)]} (a record for the experiments)
         self.wakes: list[dict] = []
-        # Records of what failed, for the experiments and tests (the session machine keeps the
-        # errors `settle` raises): (source, clones, error) per failed wake run, failed join commit,
-        # and other harness failure; (clone, error) per graft whose run raised and joined failed.
-        self.wake_errors: list[tuple[str, list[str], str]] = []
-        self.commit_errors: list[tuple[str, list[str], str]] = []
-        self.task_errors: list[tuple[str, list[str], str]] = []
-        self.graft_errors: list[tuple[str, str]] = []
         # Per-run conversation nonce, prefixed to the first message of every request at render
         # time (never stored). None = no nonce (cache experiments: --cache-scope global).
         self.nonce = nonce
@@ -549,18 +544,18 @@ class Harness:
 
 
     # ------------------------------------------------------------ setup
-    async def start(self, root: str = "o") -> None:
+    async def start(self, root: str = "o", context_id: str = "context", position: int = 0) -> None:
+        """Make the original's timeline and start the machines (`context_id`: the host's context;
+        `position`: the event log's last position)."""
         self.store.create_timeline(tl=root, source=None, skills=["fork"])
-        await self.machines.start_root(root)
+        await self.machines.start_root(root, context_id=context_id, position=position)
 
-    def _report_failure(self, *, kind: str, src: str | None, clones: list[str], error: BaseException,
-                        quiet: bool, background: bool) -> None:
-        """The one place a failure is recorded and shown (it is user-facing output and goes
-        through `emit`). The errors `settle` raises are the session machine's; this is the line
-        the user sees at once, and the record kept for the experiments. `background`: the clones
-        are all background grafts (the machine says so: it made them)."""
+    def report(self, kind: str, src: str | None, clones: list[str], error: BaseException, quiet: bool,
+               background: bool, fails: tuple[str, ...] = ()) -> tuple[str | None, tuple[str, ...]]:
+        """The one place a harness error line is worded (the scribe's activity asks; the session
+        tells it, as an event). Returns (line, fails): None for a repeat the user was already told.
+        `background`: the clones are all background grafts (the machine says so: it made them)."""
         err = _described(error)
-        record = (src, clones, err)
         # the user knows a graft by the id the model gave or drew, never by its timeline id; the
         # failure told may be the store's own, so a name that cannot be read is left out
         try:
@@ -569,12 +564,10 @@ class Harness:
             shown = []
         names = self._names(clones=shown, background=background)
         if kind == "wake":
-            self.wake_errors.append(record)
             line = f"(harness error: {names} merged, but reporting the result failed: {err})"
             if not clones:
                 line = f"(harness error: a wake run failed: {err})"
         elif kind == "commit":
-            self.commit_errors.append(record)
             line = (f"(harness error: committing the merge of {names} failed: {err}; "
                     "the result is kept and the merge will be retried)")
         elif kind == "abandon":
@@ -582,91 +575,33 @@ class Harness:
                     f"({err}); it is abandoned. What was done there stays in its frozen timeline and is not part of the "
                     "conversation's memory.)")
         elif kind == "cancel":
-            self.task_errors.append(record)
             line = (f"(harness error: {names} was cancelled and stopped, but recording that failed: {err}; "
                     "its merge is queued and will still be applied)")
         elif kind == "cancel_result":
-            self.task_errors.append(record)
             what = (f"{names} was cancelled and stopped by that call" if clones
                     else "no branch was stopped by that call")
             line = f"(harness error: writing the result of a cancel call failed: {err}; {what})"
-        else:  # task, machine, mirror
-            self.task_errors.append(record)
+        else:  # task, machine, mirror, request
             line = (f"(harness error: {names} stopped with an error: {err})" if clones
                     else f"(harness error: {err})")
-        if quiet:  # a repeat of something the user was already told
-            line = None
-        if line is not None:
-            self.out.append(line)
-        # The caller's callbacks: each is called whatever the other raised (the line is kept in
-        # `out` either way); what they raise is the scribe's, which keeps it for `settle`.
-        failed: list[Exception] = []
-        for callback, text in ((self.trace, f"[{src}] {kind.upper()} FAILED for {clones}: {err}"),
-                               (self.emit, line)):
-            if text is None:
-                continue
-            try:
-                callback(text)
-            except Exception as e:  # noqa: BLE001 - raised below, after the other callback ran
-                failed.append(e)
-        if failed:
-            raise failed[0]
+        self.trace(f"[{src}] {kind.upper()} FAILED for {clones}: {err}")
+        return (None if quiet else line), tuple(fails)
 
-    # ------------------------------------------------------------ entry points
-    async def user_says(self, text: str) -> list[str]:
-        """One user message, put to the original's machine as a request (an id, the text and the
-        reply future): the machine answers it, forwards it to its focus graft, or keeps it until
-        the run in progress and the joins waiting are done. Returns the user-facing texts emitted
-        since the last return, once the conversation is at rest. A wake or join-commit failure
-        after the turn is part of that output (a harness error line), not an exception.
+    def flush(self) -> None:
+        """The scribe's last note before the session stops: nothing to write (its outcome says every
+        note before it was written)."""
+        return None
 
-        The request is put on the machine without waiting, so the call's only await is its reply:
-        a cancel, wherever the request is in its lifecycle, cancels that reply at once and the
-        caller withdraws the request by id. The machine then never starts a run, writes a row or
-        lets a graft act for it; a run already answering it is ended by its machine before
-        its next step, and a row already written for it is marked withdrawn. A cancel that lands
-        after the machine answered but before this call took the answer wins too: CancelledError
-        is raised, and the withdrawal stops the background grafts made for the request and marks
-        its row (the machine honours it until it hears the call is done, `call_done`). If a step
-        the message sets off fails, the machine answers the reply with that error, raised here."""
-        root = self.machines.root
-        request = self.machines.request(text)
-        self.machines.post(tl="session", name="call_began", data=request.id)
-        try:
-            self.machines.post(tl=root, name="user_message", data=request)
-            try:
-                await request.reply
-            except asyncio.CancelledError:  # the reply it awaited is cancelled with it
-                with contextlib.suppress(TransitionRefused):  # closed meanwhile: nothing left to withdraw from
-                    self.machines.post(tl=root, name="withdraw", data=request.id)
-                raise
-            return self._take()
-        finally:  # a failure told while this call was in flight is this call's: settle does not raise it
-            with contextlib.suppress(TransitionRefused):  # its answer is taken, or it was withdrawn
-                self.machines.post(tl=root, name="call_done", data=request.id)
-            with contextlib.suppress(TransitionRefused):  # closed meanwhile: nothing is kept any more
-                self.machines.post(tl="session", name="call_done", data=request.id)
-
-    async def settle(self) -> list[str]:
-        """Wait until nothing is in flight: no background graft running, no join waiting that can
-        be applied (joins queued on a suspended original wait for its focus graft), no wake run.
-        Returns the user-facing texts emitted since the last return. Raises what failed meanwhile
-        (in background grafts, wakes, join commits): the one error, or an exception group (a BaseExceptionGroup if one is not an Exception) of all of
-        them; each is raised once."""
-        reply = self.machines.future()
-        await self.machines.send(tl="session", name="settle_request", data=reply)
-        try:
-            await reply
-        except asyncio.CancelledError:  # the caller went away: the session stops waiting to answer it
-            await self.machines.send(tl="session", name="settle_withdrawn", data=reply)
-            raise
-        return self._take()
+    def append_events(self, events: list[tuple[int, dict]]) -> int:
+        """The session's decided events, appended at their positions (the activity of its `writing`
+        state). Returns the last position written."""
+        return self.store.append_events(events)
 
     async def close(self) -> None:
-        """Shut down: the session machine shuts every running background graft down (its run ends,
-        and it joins `failed`), the original applies the joins it can without running anything,
-        and closes; every later request is refused by the closed machines. No model call is
-        started here; a second `close` is answered when the first is done."""
+        """Shut down (the session's `shutdown`): every running background graft is shut down (it
+        joins `failed`), the original applies the joins it can without running anything and
+        closes, every task still open fails, and every machine stops. A second close is answered
+        when the first is done."""
         await self.machines.ask(tl="session", name="shutdown", build=lambda reply: reply)
 
     async def run(self, tl: str) -> str:
@@ -712,13 +647,15 @@ class Harness:
         await self.machines.ask(tl=child, name="join", build=lambda reply: (join, reply))
 
     # ------------------------------------------------------------ host: I/O for the machines
-    async def run_busy(self, tl: str, kind: str, woken: list[tuple[str, str]] | None = None) -> RunOutcome:
-        """A run of tl (the activity of its `busy` state). `woken`: the joins a wake run is for
-        (its machine says so), recorded in `wakes`."""
+    async def run_busy(self, tl: str, kind: str, woken: list[tuple[str, str]] | None = None,
+                       tasks: tuple[str, ...] = ()) -> RunOutcome:
+        """A run of tl (the activity of its `busy` state). `woken`: the joins a wake run is for (its
+        machine says so), recorded in `wakes`; `tasks`: the host tasks the run is for, whose
+        statuses carry what it says."""
         if woken is not None:
             self.wakes.append({"source": tl, "joined": list(woken)})
             self.trace(f"[{tl}] WAKE for joins: {', '.join(f'{self.shown(c)} ({r})' for c, r in woken)}")
-        return await self._loop(tl=tl, kind=kind)
+        return await self._loop(tl=tl, kind=kind, tasks=tasks)
 
     async def run_background(self, tl: str) -> RunOutcome:
         return await self._loop(tl=tl, kind="background")
@@ -756,26 +693,28 @@ class Harness:
         self._store_results(tl=tl, results=[ToolResult(use=use, content=content, is_error=is_error)])
 
     async def call_tool(self, tl: str, use: dict) -> tuple[Ran, bool]:
-        """A host tool call (the activity of tl's machine's `calling` state). A World whose
-        `execute` returns an awaitable (an `async def execute`) is awaited here, so other
-        timelines go on while it waits; a cancel of the activity reaches the tool where it waits.
-        A synchronous result is used as it is. Once the tool is invoked it has run, whatever
-        follows: a tool that raises, or returns anything but (text, is_error), gets a result
-        marked run, with an error naming what happened (it may have acted), never a failure of
-        the run. Its trace line is the machine's (through the scribe), off this result's path."""
+        """A host tool call (the activity of tl's machine's `calling` state): the tool's function is
+        called with the call's arguments; an awaitable it returns is awaited here, so other
+        timelines go on while it waits, and a cancel of the activity reaches the tool where it
+        waits. Its result is MCP's CallToolResult (a str is one text block); once the tool is
+        invoked it has run, whatever follows: a tool that raises, or returns anything but a result,
+        gets a result marked run, with an error naming what happened (it may have acted), never a
+        failure of the run. Its trace line is the machine's (through the scribe)."""
+        tool = self.tools.get(use["name"])
+        if tool is None:  # a skill's tool the host no longer gives: not run
+            return Ran(f"tool '{use['name']}' is not available"), True
         try:
-            outcome = self.world.execute(use["name"], use["input"])
+            outcome = tool.fn(use["input"])
             if inspect.isawaitable(outcome):
                 outcome = await outcome
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise  # a cancel is the activity's to tell apart (it has the state's context)
         except BaseException as error:  # noqa: BLE001 - it was invoked: it ran, with an error
             return Ran(f"raised {type(error).__name__}{_shown(error)}; it may have acted"), True
-        if not (type(outcome) is tuple and tuple.__len__(outcome) == 2 and isinstance(outcome[0], str)
-                and isinstance(outcome[1], bool)):
-            return Ran(f"returned a {type(outcome).__name__}, not (text, is_error); it may have acted"), True
-        content, err = outcome
-        return Ran(str.__str__(content)), err
+        result = CallToolResult.from_value(outcome)
+        if result is None:
+            return Ran(f"returned a {type(outcome).__name__}, not a tool result; it may have acted"), True
+        return Ran(result.text()), result.is_error
 
     def close_tool_uses(self, tl: str, known: dict[str, tuple[str, bool]]) -> None:
         self._close_tool_uses(tl=tl, known=known)
@@ -793,12 +732,7 @@ class Harness:
                                       running=running, closing=join.closing)
         return committed, self._ends_on_user_message(src)
 
-    def report(self, kind: str, src: str | None, clones: list[str], error: BaseException, quiet: bool,
-               background: bool) -> None:
-        self._report_failure(kind=kind, src=src, clones=clones, error=error, quiet=quiet, background=background)
-
     def graft_failed(self, tl: str, error: BaseException) -> None:
-        self.graft_errors.append((tl, _described(error)))
         self.trace(f"[{tl}] run failed -> join failed: {_described(error)}")
 
     def abandon_clone(self, src: str, grafts: list[str]) -> None:
@@ -880,19 +814,15 @@ class Harness:
     def load(self, tl: str, name: str) -> tuple[str, bool]:
         return load_skill(self.store, {s["name"] for s in self.store.skills_for(tl)}, name)
 
-    def say(self, tl: str, text: str, background: bool) -> None:
-        """Only the branch holding the conversation speaks to the user; a background graft's text
-        stays in its timeline."""
+    def say(self, tl: str, text: str, background: bool, tasks: tuple[str, ...]) -> None:
+        """Only the branch holding the conversation speaks to the user: its text goes to the
+        session, which tells it on the tasks the run is for. A background graft's text stays in its
+        timeline."""
         if background:
             self.trace(f"[{tl}] (background, not shown to the user) assistant: {text}")
             return
-        self.out.append(text)
-        self.emit(text)
+        self.machines.post(tl="session", name="said", data=(text, tuple(tasks)))
         self.trace(f"[{tl}] assistant: {text}")
-
-    def _take(self) -> list[str]:
-        texts, self._mark = self.out[self._mark:], len(self.out)
-        return texts
 
     @staticmethod
     def _names(clones: list[str], background: bool) -> str:
@@ -1080,7 +1010,7 @@ class Harness:
         the machine leaves the run's state, which ends this run where it waits."""
         await self.machines.ask(tl=tl, name="may_continue", build=lambda reply: reply)
 
-    async def _loop(self, tl: str, kind: str) -> RunOutcome:
+    async def _loop(self, tl: str, kind: str, tasks: tuple[str, ...] = ()) -> RunOutcome:
         """The model loop for tl: the activity of its machine's `busy` (or `background`) state.
         Returns how it ended, and nothing more: a reply with no tool call, an empty response, a
         join (with its reason), or a spent step budget. What follows is the machine's to decide
@@ -1126,7 +1056,7 @@ class Harness:
             self._store_blocks(tl, blocks)
             for b in blocks:
                 if b["type"] == "text":
-                    self.say(tl=tl, text=b["text"], background=background)
+                    self.say(tl=tl, text=b["text"], background=background, tasks=tasks)
                     await self.may_continue(tl)
             uses = [b for b in blocks if b["type"] == "tool_use"]
             if not uses:

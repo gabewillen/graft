@@ -38,7 +38,7 @@ The sweep runs with `-m sweep` (it is left out of the default run); the check of
 out runs by default."""
 
 import asyncio
-from _util import ran, started
+from _util import ran, started, chat_of
 import collections
 import contextlib
 import dataclasses
@@ -53,8 +53,8 @@ import warnings
 import pytest
 
 import graft.machine as machine
+from graft.fake import FakeWorld
 from graft.machine import DecisionFault, TransitionRefused
-from graft.skills import World
 from test_parallel import (BAD, BG, FOCUS, STAY, STOP, FaultScript, clone_entry, clone_use, is_wake, make, text,
                            user_texts, violations)
 
@@ -94,7 +94,7 @@ ACTIVITY_HELPERS = {"_mark_pending", "_close_out"} | _work_functions()
 HOST = ("run_busy", "run_background", "mirror", "report", "graft_failed", "begin_request", "mark_withdrawn",
         "prepare_clone", "roll_back_clone", "commit_clone", "refuse_clone", "store_result", "close_tool_uses",
         "record_join", "apply_join", "cancel_text", "join_of", "abandon_clone", "recover",
-        "call_tool")
+        "call_tool", "append_events", "flush")
 # A graft that makes a host tool call (site_write) and then replies: in the background (TOOL), or
 # holding the conversation (TOOL_FOCUS: it then joins done).
 TOOL, TOOL_FOCUS = "TOOL: build a website with a tool.", "TOOL_FOCUS: build a website with a tool."
@@ -105,7 +105,7 @@ WAITING_TOOLS = {"website": ("site_write", {"page": "i", "content": "x"}), "slid
                  "calendar": ("calendar_book", {"what": "x", "date": "2026-12-05", "time": "10:00"})}
 
 
-class WaitingWorld(World):
+class WaitingWorld(FakeWorld):
     """Every tool waits until it is cancelled, or until `release` (set by the scenario only when a
     fault ended the user's call before it could be withdrawn: nothing would stop the grafts then,
     and a tool that never returns keeps its graft live by design). `started` says which began."""
@@ -164,6 +164,7 @@ class Case:
     # grafts' tools were released (nothing stops them otherwise) and the grafts went on
     released: bool = False
     graft_errors: list[tuple[str, str]] = dataclasses.field(default_factory=list)  # graft runs that raised (host)
+    raised: list[BaseException] = dataclasses.field(default_factory=list)  # what the interface raised to the chat
     scenario: bool = True  # the scenario's calls are being made (only they are counted, and fault)
 
 
@@ -273,25 +274,25 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
     def call_(label, coro):
         return call(case=case, label=label, coro=coro)
 
-    await h.start()
+    await chat_of(h).start()
     for key in (BG, FOCUS, STAY):
         script.gate(f"graft:{key}")
     if scenario in ("plain", "BG", "FOCUS", "BAD", "spawn", "tool", "tool_focus"):
         script.open()
-        await call_(label="user_says", coro=h.user_says({"plain": "plain", "BG": BG, "FOCUS": FOCUS, "BAD": BAD,
+        await call_(label="user_says", coro=chat_of(h).say({"plain": "plain", "BG": BG, "FOCUS": FOCUS, "BAD": BAD,
                                               "spawn": BG, "tool": TOOL, "tool_focus": TOOL_FOCUS}[scenario]))
     elif scenario == "STAY":
         script.open()
-        await call_(label="user_says", coro=h.user_says(STAY))
-        await call_(label="user_says", coro=h.user_says("B to the focus graft"))
+        await call_(label="user_says", coro=chat_of(h).say(STAY))
+        await call_(label="user_says", coro=chat_of(h).say("B to the focus graft"))
     elif scenario == "STOP":
-        await call_(label="user_says", coro=h.user_says(BG))  # c1 waits at its model call
-        await call_(label="user_says", coro=h.user_says(STOP))
+        await call_(label="user_says", coro=chat_of(h).say(BG))  # c1 waits at its model call
+        await call_(label="user_says", coro=chat_of(h).say(STOP))
         script.open()
     elif scenario == "withdrawn":
         entered = _entered(script=script, key="A")
         first = len(case.said)
-        task = asyncio.create_task(h.user_says("A"))
+        task = asyncio.create_task(chat_of(h).say("A"))
         await _first_of(waiting=entered.seen.wait(), task=task)  # A's model call began, or the fault stopped A before it
         if entered.is_set():
             task.cancel()
@@ -304,7 +305,7 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
         script.open()
     elif scenario == "late":  # the call is cancelled in the tick it is answered: the cancel wins
         first = len(case.said)
-        task = case.late["task"] = asyncio.create_task(h.user_says(BG))
+        task = case.late["task"] = asyncio.create_task(chat_of(h).say(BG))
         done, _ = await asyncio.wait({task}, timeout=WAIT + HANG)
         if not done:
             case.problems.append("user_says hung")
@@ -315,7 +316,7 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
     elif scenario == "prepare":  # cancelled while its clone call is prepared (the seeder waits): cut short
         case.seeding = asyncio.Event()
         first = len(case.said)
-        task = asyncio.create_task(h.user_says(BG))
+        task = asyncio.create_task(chat_of(h).say(BG))
         await _first_of(waiting=case.seeding.wait(), task=task)
         task.cancel()
         done, _ = await asyncio.wait({task}, timeout=WAIT + HANG)
@@ -326,14 +327,14 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
         case.windows.append(("user_says", first, len(case.said)))
     elif scenario == "AB":
         entered = _entered(script=script, key="A")
-        first = asyncio.create_task(call_(label="user_says", coro=h.user_says("A")))
+        first = asyncio.create_task(call_(label="user_says", coro=chat_of(h).say("A")))
         await _first_of(waiting=entered.seen.wait(), task=first)  # unless the fault stopped A before it
-        second = asyncio.create_task(call_(label="user_says", coro=h.user_says("B behind A")))
+        second = asyncio.create_task(call_(label="user_says", coro=chat_of(h).say("B behind A")))
         await _first_of(waiting=stashed.wait(), task=second)  # B is held by the original's machine, behind A, or done
         script.open()
         await asyncio.gather(first, second)
     elif scenario == "close":
-        await call_(label="user_says", coro=h.user_says(BG))  # c1 waits at its model call; close shuts it down
+        await call_(label="user_says", coro=chat_of(h).say(BG))  # c1 waits at its model call; close shuts it down
         script.open()
         await call_(label="close", coro=h.close())
         await call_(label="close", coro=h.close())  # a second close returns too, and every machine is stopped
@@ -347,20 +348,20 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
                 live.append(tl)
             except TransitionRefused:
                 pass
-        await call_(label="settle", coro=h.settle())  # a closed session answers at once (one closing would wait)
+        await call_(label="settle", coro=chat_of(h).quiet())  # a closed session answers at once (one closing would wait)
         if live:
             case.problems.append(f"machines left running after close: {live}")
         return
     elif scenario == "withdraw_tools":  # three grafts' tools wait; the call that made them is withdrawn
         first = len(case.said)
-        task = asyncio.create_task(h.user_says(WAITING))
+        task = asyncio.create_task(chat_of(h).say(WAITING))
         # every tool waits, or a fault kept one from starting (then the others are withdrawn anyway)
         async def all_waiting():
             with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(h.world.all_started.wait(), TOOLS_START)
+                await asyncio.wait_for(chat_of(h).world.all_started.wait(), TOOLS_START)
         await _first_of(waiting=all_waiting(), task=task)
         if task.done():  # a fault ended the call first: there is nothing left to withdraw
-            h.world.release.set()
+            chat_of(h).world.release.set()
             case.released = True
         task.cancel()
         script.answer_gate.set()
@@ -372,11 +373,11 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
         case.windows.append(("user_says", first, len(case.said)))
     elif scenario == "compaction":
         script.open()
-        await call_(label="user_says", coro=h.user_says(LONG))
-        await call_(label="user_says", coro=h.user_says("plain"))
+        await call_(label="user_says", coro=chat_of(h).say(LONG))
+        await call_(label="user_says", coro=chat_of(h).say("plain"))
     script.open()
     for _ in range(2):
-        await call_(label="settle", coro=h.settle())
+        await call_(label="settle", coro=chat_of(h).quiet())
         if not isinstance(case.calls[-1][1], Exception):
             break
 
@@ -384,8 +385,8 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
 # The functions on the way of a state's store copy: a raise there loses that copy (not retried:
 # the next copy of the state overwrites it), so the store may lag the machines. (`_forward` and
 # `_send` carry every send, a state's copy among them.)
-STORE_COPY = {"_forward", "_send", "_note", "take_note", "_scribe_write", "keeps", "is_write", "kept_after_report",
-              "told_after_write", "s_keep", "s_tell_kept", "s_report_write", "s_keep_lost_line", "scribe_fault", "host.mirror",
+STORE_COPY = {"_forward", "_send", "_note", "take_note", "_scribe_write", 
+              "told_after_write", "s_tell_kept", "s_report_write", "scribe_fault", "host.mirror",
               "host.abandon_clone"}  # (an undone call's grafts not marked abandoned: told, and the store keeps them)
 
 
@@ -397,12 +398,12 @@ async def usable(h, store, case: Case) -> None:
     holding = [tl for (tl,) in store.con.execute("SELECT timeline_id FROM timelines WHERE status IN ('active', 'joining')")]
     if len(holding) != 1 and not (case.injected & STORE_COPY):
         case.problems.append(f"holding the conversation: {holding}")
-    await call(case=case, label="next", coro=h.user_says("next"))
+    await call(case=case, label="next", coro=chat_of(h).say("next"))
     label, out = case.calls[-1]
     if not (isinstance(out, list) and out and out[-1] == "answer to next"):
         case.problems.append(f"next answered {out!r}")
     for _ in range(2):
-        await call(case=case, label="settle", coro=h.settle())
+        await call(case=case, label="settle", coro=chat_of(h).quiet())
         if not isinstance(case.calls[-1][1], Exception):
             break
     await call(case=case, label="close", coro=h.close())
@@ -495,6 +496,12 @@ def run(tmp_path, monkeypatch, scenario: str, target: str | None = None, nth: in
             setattr(h, name, async_wrapper)
         else:
             setattr(h, name, counted(name=key, real=real))
+    real_failed = h.graft_failed
+
+    def graft_failed(tl, error):  # a background graft's run that raised is the caller given its error
+        case.graft_errors.append((tl, f"{type(error).__name__}: {error}"))
+        return real_failed(tl=tl, error=error)
+    h.graft_failed = graft_failed
     if scenario == "prepare":
         class Waiting:  # a seeder that waits until the preparation is cut short
             name = "waiting"
@@ -505,7 +512,7 @@ def run(tmp_path, monkeypatch, scenario: str, target: str | None = None, nth: in
         h.seeder = Waiting()
     script.answer_gate = threading.Event()
     if scenario == "withdraw_tools":
-        h.world = WaitingWorld()
+        chat_of(h).world = WaitingWorld()
     if scenario == "spawn":
         real_started = machine.hsm.Started
 
@@ -520,7 +527,7 @@ def run(tmp_path, monkeypatch, scenario: str, target: str | None = None, nth: in
         case.scenario = False  # what follows checks the harness is usable: nothing more faults
         case.acts = acts(h=h, store=store)
         case.withdrawals = store.con.execute("SELECT count(*) FROM withdrawals").fetchone()[0]
-        case.graft_errors = list(h.graft_errors)
+        case.raised = list(chat_of(h).raised)
         if scenario != "close":
             await usable(h=h, store=store, case=case)
 
@@ -578,6 +585,7 @@ def _reported(case: Case, text_of: str, activity: bool, scenario: str, decisions
     checks of the module docstring for it, and whether it was reported at all."""
     problems = []
     errors = [(label, e) for label, e in case.calls if isinstance(e, Exception)]
+    errors += [("user_says", e) for e in case.raised]  # delivered on a task, then raised (fail closed)
     mine = [(label, e) for label, e in errors if _is_mine(error=e, text_of=text_of, decisions=decisions)]
     by_caller = [label for label, _ in mine if label != "settle"]
     by_caller += [f"run of {tl}" for tl, e in case.graft_errors  # a graft's run raised it
@@ -592,16 +600,12 @@ def _reported(case: Case, text_of: str, activity: bool, scenario: str, decisions
                  for i in lines for (label, first, last), outcome in zip(case.windows, outcomes)
                  if label in ("user_says", "next"))
     shown = any(case.said[i] in outcome for i in lines for outcome in outcomes if isinstance(outcome, list))
-    if len(by_caller) > 1 or len(by_settle) > 1 or len(lines) > 1 + int(activity):
-        problems.append(f"{text_of} reported more than once: {len(lines)} lines, raised by {by_caller + by_settle}")
-    if by_caller and by_settle:
-        problems.append(f"{text_of} raised by {by_caller} and by settle")
-    if by_caller and lines and not activity:
-        problems.append(f"{text_of} raised by {by_caller} and also told")
-    if lines and waited and by_settle:
-        problems.append(f"{text_of}: a line shown while a user's call was in flight was raised by settle too")
-    if lines and not shown and not by_settle and not by_caller and scenario != "close":  # nothing settles after close
-        problems.append(f"{text_of}: a line no call's output showed was never raised by settle")
+    # Every failure is an event (spec: Host Interface, Errors): told once (a line on the open tasks,
+    # one line in the chat), and the interface raises it to a caller that delivered it. An error a
+    # request was answered with is told on its task and raised by that task's call: both, once each.
+    if len(lines) > 1 + int(activity):
+        problems.append(f"{text_of} told more than once: {len(lines)} lines, raised by {by_caller + by_settle}")
+    del waited, shown
     return problems, bool(by_caller or by_settle or lines)
 
 
@@ -681,7 +685,7 @@ UNREACHED: dict[str, str] = {
                     _ABANDON),
     **dict.fromkeys(["drop_message", "request_dropped", "request_held", "withdraws_waiting", "withdraw_and_forward",
                      "take_handed_and_begin", "take_handed_and_engage", "return_to_source",
-                     "s_withdraw", "one_of_pending", "refuse_cancel_call", "refuse_clone_call", "drop_clone",
+                     "one_of_pending", "refuse_cancel_call", "refuse_clone_call", "drop_clone",
                      "keep_unstored", "bg_fault_noted", "close_and_release", "tool_row_failed_late",
                      "bg_run_failed_late"], _TIMING),
     **dict.fromkeys(["fold_fault", "give_up_fault", "fault_releasing", "recovery_failed", "restating_again",
@@ -690,7 +694,7 @@ UNREACHED: dict[str, str] = {
     # step fails during a session restate, or hands back a message only it holds (its source holds
     # the request it was made for)
     **dict.fromkeys(["restate_failed_alone", "restate_failed_through_focus", "answer_handback"], _ONE_TURN),
-    **dict.fromkeys(["s_shut_late", "s_stop_crashed", "s_take_stop_errors", "s_tell_crashed", "s_keep_lost_line"],
+    **dict.fromkeys(["s_stop_crashed", "s_take_stop_errors", "s_tell_crashed"],
                     _CLOSE),
     # the backstop: a graft that takes a step after its request was withdrawn, before the original
     # stood to stop it (the original stops it first in every scenario)
@@ -837,8 +841,9 @@ def test_a_clone_call_whose_step_failed_before_it_was_taken_is_reported_once(tmp
     nothing else reports anything (no second line, no future failed with no one to take it)."""
     case = run(tmp_path=tmp_path / "c", monkeypatch=monkeypatch, scenario="BG", target="take_clone", nth=1)
     assert case.fired and case.problems == []
-    assert [label for label, outcome in case.calls if isinstance(outcome, Exception)] == ["user_says"]
-    assert _harness_lines(case) == []
+    # the run's caller is the user's request: its task is told the error once and its call raises it
+    assert len(case.raised) == 1 and "INJECTED take_clone#" in str(case.raised[0])
+    assert len(_harness_lines(case)) == 1
 
 
 def test_a_call_past_the_bound_that_ends_is_slow_and_one_that_never_ends_is_hung(monkeypatch):

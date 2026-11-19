@@ -86,6 +86,15 @@ CREATE TABLE IF NOT EXISTS withdrawals(
   timeline_id TEXT NOT NULL REFERENCES timelines, row_id INTEGER NOT NULL REFERENCES turns,
   ts REAL NOT NULL, PRIMARY KEY(timeline_id, row_id));
 
+-- The host's event log (spec: Host Interface, Delivery): one A2A StreamResponse per row, at the
+-- position the session gave it; append-only. `task_id` is the task it is about (NULL: context-level).
+CREATE TABLE IF NOT EXISTS a2a_events(
+  seq INTEGER PRIMARY KEY, task_id TEXT, body TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS a2a_events_no_update BEFORE UPDATE ON a2a_events
+BEGIN SELECT RAISE(ABORT, 'a2a_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS a2a_events_no_delete BEFORE DELETE ON a2a_events
+BEGIN SELECT RAISE(ABORT, 'a2a_events is append-only'); END;
+
 CREATE TRIGGER IF NOT EXISTS turns_no_update BEFORE UPDATE ON turns
   BEGIN SELECT RAISE(ABORT, 'turns is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS turns_no_delete BEFORE DELETE ON turns
@@ -109,7 +118,7 @@ class Skill:
     name: str
     description: str
     instructions: str
-    tools: list[dict]  # {"name", "description", "input_schema"}
+    tools: list  # graft's own tool definitions {"name", "description", "inputSchema"}, or host tool names
 
 
 @dataclass
@@ -150,7 +159,7 @@ class Store:
         )
         sid = cur.lastrowid
         for t in skill.tools:
-            schema = dict(t["input_schema"])
+            schema = dict(t["inputSchema"])
             schema["description"] = t["description"]
             existing = self.con.execute("SELECT tool_id FROM tools WHERE name=?", (t["name"],)).fetchone()
             tid = existing[0] if existing else self.con.execute(
@@ -179,7 +188,7 @@ class Store:
         ):
             schema = json.loads(r["input_schema"])
             desc = schema.pop("description", "")
-            out.append({"name": r["name"], "description": desc, "input_schema": schema})
+            out.append({"name": r["name"], "description": desc, "inputSchema": schema})
         return out
 
     # ---------- timelines ----------
@@ -267,6 +276,48 @@ class Store:
         return [dict(r) for r in self.con.execute(
             f"SELECT c.pos, t.{TURN_COLS.replace(', ', ', t.')}, {WITHDRAWN_COL} FROM context c "
             "JOIN turns t USING(row_id) WHERE c.timeline_id=? ORDER BY c.pos", (tl,))]
+
+    # ---------- the host's event log ----------
+    def append_events(self, events: Sequence[tuple[int, dict]]) -> int:
+        """Append events at their positions, in one transaction: a position already written is
+        left as it is (a batch written twice is written once). Returns the last position written."""
+        self.con.execute("BEGIN")
+        try:
+            for seq, event in events:
+                body = event.get("task") or event.get("statusUpdate") or {}
+                task = body.get("id") if "task" in event else body.get("taskId")
+                self.con.execute("INSERT OR IGNORE INTO a2a_events(seq, task_id, body) VALUES (?,?,?)",
+                                 (seq, task, json.dumps(event)))
+            self.con.execute("COMMIT")
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
+        return self.event_position()
+
+    def event_position(self) -> int:
+        """The last position written (0: none)."""
+        return self.con.execute("SELECT COALESCE(MAX(seq), 0) FROM a2a_events").fetchone()[0]
+
+    def events_after(self, cursor: int, task: str | None = None, limit: int = 1000) -> list[tuple[int, dict]]:
+        """The events after `cursor`, in order (of one task, if given)."""
+        if task is None:
+            rows = self.con.execute("SELECT seq, body FROM a2a_events WHERE seq > ? ORDER BY seq LIMIT ?",
+                                    (cursor, limit))
+        else:
+            rows = self.con.execute("SELECT seq, body FROM a2a_events WHERE seq > ? AND task_id = ? ORDER BY seq "
+                                    "LIMIT ?", (cursor, task, limit))
+        return [(r[0], json.loads(r[1])) for r in rows]
+
+    def task_events(self, task: str, upto: int | None = None) -> list[tuple[int, dict]]:
+        """Every event of one task, in order (up to a position, if given)."""
+        rows = self.con.execute("SELECT seq, body FROM a2a_events WHERE task_id = ? AND seq <= ? ORDER BY seq",
+                                (task, upto if upto is not None else 2 ** 62))
+        return [(r[0], json.loads(r[1])) for r in rows]
+
+    def task_ids(self) -> list[str]:
+        """Every task in the log, in the order they were made."""
+        return [r[0] for r in self.con.execute(
+            "SELECT task_id FROM a2a_events WHERE task_id IS NOT NULL GROUP BY task_id ORDER BY MIN(seq)")]
 
     def mark_withdrawn(self, timelines: list[str], rows: list[int]) -> None:
         """Mark user messages whose callers withdrew them, in the views of `timelines` (append-only,

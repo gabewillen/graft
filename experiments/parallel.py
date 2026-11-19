@@ -43,9 +43,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from graft.db import Store, validate  # noqa: E402
 from graft.fake import bench_graft_policy, parallel_graft_policy  # noqa: E402
-from graft.harness import Harness  # noqa: E402
+from graft.agent import GraftAgent, GraftConfig, HarnessError  # noqa: E402
+from graft.fake import FakeWorld  # noqa: E402
 from graft.providers import FakeProvider, make_provider  # noqa: E402
-from graft.skills import World, install  # noqa: E402
+from graft.sim import ask  # noqa: E402
 
 FACTS = ("We are Okafor Dental in Columbus, Ohio. Our services: cleaning, implants, whitening. "
          "The open house is on 2026-12-05 at 10:00.")
@@ -65,7 +66,7 @@ FOLLOW_UP = "No other details; use what I gave you and finish."
 MAX_FOLLOW_UPS = 3  # per arm
 
 
-def checks(world: World) -> dict[str, bool]:
+def checks(world: FakeWorld) -> dict[str, bool]:
     site = " ".join(world.site.values()).lower()
     deck = world.decks[-1] if world.decks else {}
     booked = [(b.get("date"), b.get("time")) for b in world.calendar]
@@ -87,7 +88,7 @@ def slowed(policy: Policy, latency: float) -> Policy:
     return call
 
 
-async def converse(h: Harness, script: list[str], world: World) -> tuple[list[tuple[str, str]], int]:
+async def converse(agent: GraftAgent, script: list[str], world: FakeWorld) -> tuple[list[tuple[str, str]], int]:
     """Send the script. After each message, let background clones join, then apply the follow-up
     rule: while the last reply is a question and the checks are not met, answer it with
     FOLLOW_UP, at most MAX_FOLLOW_UPS times in all. Returns (transcript, follow-ups used)."""
@@ -97,7 +98,10 @@ async def converse(h: Harness, script: list[str], world: World) -> tuple[list[tu
     async def say(text: str) -> list[str]:
         print(f"\nUSER: {text}")
         transcript.append(("user", text))
-        replies = await h.user_says(text) + await h.settle()
+        try:  # each message is followed until its task is terminal: background work reported too
+            replies = await ask(agent, text)
+        except HarnessError as error:
+            replies = [error.message]
         for reply in replies:
             print(f"ASSISTANT: {reply}")
             transcript.append(("assistant", reply))
@@ -120,17 +124,16 @@ async def run_arm(arm: str, live: bool, latency: float, trace: bool, policy: Pol
     provider = make_provider() if live else FakeProvider(slowed(policy, latency))
     path = os.path.join(tempfile.mkdtemp(prefix=f"graft-parallel-{arm}-", dir=workdir), "m.db")
     store = Store(path)
-    install(store)
-    world = World()
+    world = FakeWorld()
     # Offline means offline: no seeder call either, even with a TypeSafe key exported.
     seeder = {} if live else {"seeder": None}
-    h = Harness(store, provider, world=world, trace=(lambda m: print("  · " + m)) if trace else None,
-                **seeder)
-    await h.start()
+    agent = GraftAgent(store, provider, tools=world.tools(), config=GraftConfig(
+        trace=(lambda m: print("  · " + m)) if trace else None, **seeder))
+    await agent.start()
     script = SEQUENTIAL if arm == "sequential" else PARALLEL
     print(f"\n######## ARM: {arm} ########")
     t0 = time.perf_counter()
-    transcript, follow_ups = await converse(h, script, world)
+    transcript, follow_ups = await converse(agent, script, world)
     wall = time.perf_counter() - t0
     # One branch holds the conversation: the store's copy of each machine's state says which.
     holders = [r[0] for r in store.con.execute("SELECT timeline_id FROM timelines WHERE status IN ('active', 'joining')")]
@@ -141,11 +144,11 @@ async def run_arm(arm: str, live: bool, latency: float, trace: bool, policy: Pol
         "SELECT scratch FROM transactions WHERE kind='clone' AND status='committed' ORDER BY tx_id")]
     res = {"arm": arm, "checks": checks(world), "user_turns": len(script), "follow_ups": follow_ups,
            "model_calls": provider.usage["calls"], "wall_s": wall, "clones": clones,
-           "background": modes.count(False), "focus": modes.count(True), "wakes": len(h.wakes),
+           "background": modes.count(False), "focus": modes.count(True), "wakes": len(agent._host.wakes),
            "clone_calls": provider.by_tag.get("original:clone_tx", {}).get("calls", 0),
            "view_violations": validate(store.view("o"), "o", require_user_end=False),
            "replies": [t for who, t in transcript if who == "assistant"], "db": path}
-    await h.close()
+    await agent.close()
     return res
 
 
