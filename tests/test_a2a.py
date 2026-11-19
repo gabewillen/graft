@@ -198,7 +198,7 @@ def test_a_turn_with_detached_work_out_returns_input_required_and_completes_when
     task, events = asyncio.run(go())
     states = [e.status_update.status.state for e in events[1:]]
     assert states[-1] == a2a.COMPLETED and a2a.WORKING in states
-    final = fold([e for _, e in store.task_events(task.id)])
+    final = fold(events=[e for _, e in store.task_events(task.id)])
     assert [m.text for m in final.history if m.role == a2a.ROLE_AGENT] == ["Started.", "Report: done."]
     assert store.timeline("c1")["join_reason"] == "done"
     every_event_is_a2a(store)
@@ -221,7 +221,7 @@ def test_a_new_message_while_a_task_is_input_required_is_a_new_task(tmp_path):
             return first
 
     first = asyncio.run(go())
-    assert fold([e for _, e in store.task_events(first.id)]).status.state == a2a.COMPLETED
+    assert fold(events=[e for _, e in store.task_events(first.id)]).status.state == a2a.COMPLETED
 
 
 def test_a_follow_up_with_the_task_id_continues_the_task(tmp_path):
@@ -296,7 +296,7 @@ def test_cancel_stops_a_detached_branch_which_merges_cancelled_and_wakes_nothing
     task, again = asyncio.run(go())
     assert store.timeline("c1")["join_reason"] == "cancelled"
     events = store.task_events(task.id)
-    assert fold([e for _, e in events]).status.state == a2a.CANCELED
+    assert fold(events=[e for _, e in events]).status.state == a2a.CANCELED
     assert sum(1 for _, e in events if "statusUpdate" in e and e["statusUpdate"]["status"]["state"] in a2a.TERMINAL) == 1
     assert again.status.state == a2a.COMPLETED
     every_event_is_a2a(store)
@@ -367,6 +367,6 @@ def test_close_fails_every_open_task_and_refuses_later_requests(tmp_path):
         return task
 
     task = asyncio.run(go())
-    final = fold([e for _, e in store.task_events(task.id)])
+    final = fold(events=[e for _, e in store.task_events(task.id)])
     assert final.status.state == a2a.FAILED and "closed" in final.status.message.text
     every_event_is_a2a(store)

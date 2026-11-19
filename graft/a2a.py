@@ -12,6 +12,7 @@ the message and the A2A name; `InvalidParams` (-32602) is a request that is not 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +43,10 @@ MAX_ID_CHARS = 256  # a messageId, taskId, contextId or tenant
 MAX_METADATA_CHARS = 16_000  # metadata, as JSON
 MAX_PAGE_SIZE = 100
 MAX_HISTORY = 10_000
+RESERVED_METADATA = "graft"  # the metadata key graft marks its own messages with (a harness error)
+
+
+_DECIMAL = re.compile(r"-?[0-9]{1,10}")
 
 
 # ------------------------------------------------------------------ errors
@@ -111,8 +116,8 @@ def _int(d: dict, key: str, where: str, *, low: int, high: int) -> int | None:
     value = d.get(key)
     if value is None:
         return None
-    if isinstance(value, str) and value.lstrip("-").isdigit() and len(value) <= 12:
-        value = int(value)  # ProtoJSON may carry an int32 as a string
+    if isinstance(value, str) and _DECIMAL.fullmatch(value):
+        value = int(value)  # ProtoJSON may carry an int32 as a string (ASCII digits only)
     if not isinstance(value, int) or isinstance(value, bool):
         raise InvalidParams(f"{where}.{key} must be an integer")
     if not low <= value <= high:
@@ -359,6 +364,8 @@ class SendMessageRequest:
         message = Message.from_dict(d["message"], f"{where}.message")
         if message.role != ROLE_USER:
             raise InvalidParams(f"{where}.message.role must be {ROLE_USER}")
+        if message.metadata is not None and RESERVED_METADATA in message.metadata:
+            raise InvalidParams(f"{where}.message.metadata: the key {RESERVED_METADATA!r} is graft's own")
         configuration = d.get("configuration")
         return cls(message=message,
                    configuration=SendMessageConfiguration.from_dict(configuration, f"{where}.configuration")

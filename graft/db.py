@@ -314,6 +314,28 @@ class Store:
                                 (task, upto if upto is not None else 2 ** 62))
         return [(r[0], json.loads(r[1])) for r in rows]
 
+    def task_index(self) -> list[tuple[str, int, str]]:
+        """Every task in the log, most recently updated first: (task id, its last position, its
+        state there)."""
+        rows = self.con.execute(
+            "SELECT e.task_id, e.seq, e.body FROM a2a_events e JOIN (SELECT task_id, MAX(seq) AS last FROM a2a_events "
+            "WHERE task_id IS NOT NULL GROUP BY task_id) m ON e.task_id = m.task_id AND e.seq = m.last "
+            "ORDER BY e.seq DESC")
+        out = []
+        for task, seq, body in rows:
+            event = json.loads(body)
+            out.append((task, seq, (event.get("task") or event.get("statusUpdate"))["status"]["state"]))
+        return out
+
+    def context_id(self) -> str | None:
+        """The conversation this store's log is of (None: no event yet)."""
+        row = self.con.execute("SELECT body FROM a2a_events ORDER BY seq LIMIT 1").fetchone()
+        if row is None:
+            return None
+        event = json.loads(row[0])
+        body = event.get("task") or event.get("statusUpdate") or event.get("message")
+        return body["contextId"]
+
     def task_ids(self) -> list[str]:
         """Every task in the log, in the order they were made."""
         return [r[0] for r in self.con.execute(

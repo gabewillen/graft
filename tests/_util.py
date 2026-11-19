@@ -322,7 +322,7 @@ class Chat:
 
     def open_tasks(self) -> list[str]:
         return [t for t in self.store.task_ids()
-                if fold([e for _, e in self.store.task_events(t)]).status.state not in a2a.TERMINAL]
+                if fold(events=[e for _, e in self.store.task_events(t)]).status.state not in a2a.TERMINAL]
 
     async def quiet(self) -> list[str]:
         """Follow every open task until it is terminal (a HarnessError is kept in `raised`); the

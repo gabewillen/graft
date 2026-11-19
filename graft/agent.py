@@ -20,6 +20,7 @@ terminal. A harness error delivered on the task is raised (`HarnessError`) once 
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Sequence
@@ -31,10 +32,10 @@ from .a2a import (A2AError, AgentCard, AgentInterface, AgentSkill, CancelTaskReq
                   UnsupportedOperation)
 from .db import Store
 from .harness import MODEL_CALL_TIMEOUT, Host
-from .machine import Submission
+from .machine import Submission, TransitionRefused, described
 from .providers import Provider
 from .skills import BASE_SYSTEM, BUILTIN, CATALOG, install
-from .tools import Tool
+from .tools import Tool, by_name
 
 DEFAULT_PAGE_SIZE = 50
 IN_PROCESS_URL = "urn:graft:in-process"
@@ -72,26 +73,31 @@ class GraftConfig:
 
 
 def _parse(cls, request):
+    """A request validated whole: its JSON form, or a dataclass taken through its JSON form (so a
+    dataclass built by hand is checked the same way)."""
     if isinstance(request, cls):
-        return request
+        try:
+            request = request.to_dict()
+        except Exception as error:  # noqa: BLE001 - a dataclass that cannot be put in JSON form is not a request
+            raise InvalidParams(f"not a valid {cls.__name__}: {type(error).__name__}") from None
     if isinstance(request, dict):
         return cls.from_dict(request)
     raise InvalidParams(f"expected a {cls.__name__} or its JSON object")
 
 
-def fold(events: list[dict], history_length: int | None = None) -> Task:
+def fold(*, events: list[dict], history_length: int | None = None) -> Task:
     """A task's state from its events: its `task` event, then each `statusUpdate` (whose message
     joins its history once)."""
     first = events[0]["task"]
     task = {"id": first["id"], "contextId": first["contextId"], "status": dict(first["status"]),
             "history": list(first.get("history", []))}
-    seen = {m["messageId"] for m in task["history"]}
+    seen = {(m["role"], m["messageId"]) for m in task["history"]}
     for event in events[1:]:
         status = event["statusUpdate"]["status"]
         task["status"] = status
         message = status.get("message")
-        if message is not None and message["messageId"] not in seen:
-            seen.add(message["messageId"])
+        if message is not None and (message["role"], message["messageId"]) not in seen:
+            seen.add((message["role"], message["messageId"]))
             task["history"].append(message)
     if history_length is not None:
         task["history"] = task["history"][-history_length:] if history_length else []
@@ -101,9 +107,9 @@ def fold(events: list[dict], history_length: int | None = None) -> Task:
 
 
 def _is_error(event: dict) -> str | None:
-    """The harness error line an event carries, if it does."""
+    """The harness error line an event carries, if it does (an agent message marked as one)."""
     body = event.get("statusUpdate", {}).get("status", {}).get("message") or event.get("message") or {}
-    if (body.get("metadata") or {}).get("graft", {}).get("error"):
+    if body.get("role") == a2a.ROLE_AGENT and (body.get("metadata") or {}).get("graft", {}).get("error"):
         return "".join(p.get("text", "") for p in body.get("parts", []))
     return None
 
@@ -116,10 +122,14 @@ class GraftAgent:
         self.config = config or GraftConfig()
         self.store = store
         self._ids = self.config.ids or (lambda: str(uuid.uuid4()))
-        self.context_id = self.config.context_id or self._ids()
+        known = store.context_id()  # one store is one conversation: a reopened store keeps its context
+        if known is not None and self.config.context_id not in (None, known):
+            raise ValueError(f"the store holds context {known!r}, not {self.config.context_id!r}")
+        self.context_id = known or self.config.context_id or self._ids()
         tools = list(tools)
+        given = by_name(tools)  # checked before anything is written (a refused set writes nothing)
         if not store.skill_names():
-            install(store, tools={t.name: t.definition() for t in tools}, skills=self.config.skills)
+            install(store, tools={name: t.definition() for name, t in given.items()}, skills=self.config.skills)
         self._host = Host(store, provider, tools=tools, trace=self.config.trace, max_steps=self.config.max_steps,
                           persona=self.config.persona, nonce=self.config.nonce,
                           compact_tokens=self.config.compact_tokens, compaction_mode=self.config.compaction_mode,
@@ -151,49 +161,50 @@ class GraftAgent:
                          supported_interfaces=list(self.config.interfaces), skills=skills)
 
     # ------------------------------------------------------------ reading the log
-    def _task_events(self, task_id: str, upto: int | None = None) -> list[dict]:
+    def _task_events(self, *, task_id: str, upto: int | None = None) -> list[dict]:
         return [e for _, e in self.store.task_events(task_id, upto=upto)]
 
     def get_task(self, request: GetTaskRequest | dict) -> Task:
         """GetTask: the task as its events say."""
         req = _parse(GetTaskRequest, request)
-        events = self._task_events(req.id)
+        events = self._task_events(task_id=req.id)
         if not events:
             raise TaskNotFound(f"task {req.id[:64]!r} not found")
-        return fold(events, history_length=req.history_length)
+        return fold(events=events, history_length=req.history_length)
 
     def list_tasks(self, request: ListTasksRequest | dict | None = None) -> ListTasksResponse:
-        """ListTasks: the context's tasks, most recently updated first, a page at a time."""
+        """ListTasks: the context's tasks, most recently updated first, a page at a time (only the
+        page's tasks are folded). Raises InvalidParams for a pageToken this agent did not give."""
         req = _parse(ListTasksRequest, request if request is not None else {})
-        if req.context_id is not None and req.context_id != self.context_id:
-            tasks: list[tuple[int, Task]] = []
-        else:
-            tasks = []
-            for tid in self.store.task_ids():
-                events = self.store.task_events(tid)
-                task = fold([e for _, e in events], history_length=req.history_length)
-                if req.status is None or task.status.state == req.status:
-                    tasks.append((events[-1][0], task))
-        tasks.sort(key=lambda x: -x[0])
+        rows = [] if req.context_id not in (None, self.context_id) else [
+            (tid, last) for tid, last, state in self.store.task_index() if req.status in (None, state)]
         size = req.page_size or DEFAULT_PAGE_SIZE
-        try:
-            start = int(req.page_token) if req.page_token else 0
-        except ValueError:
-            raise InvalidParams("pageToken is not one this agent gave") from None
-        if start < 0 or start > len(tasks):
+        token = req.page_token or "0"
+        if not token.isascii() or not token.isdigit() or len(token) > 12 or int(token) > len(rows):
             raise InvalidParams("pageToken is not one this agent gave")
-        page = [t for _, t in tasks[start:start + size]]
+        start = int(token)
+        page = [fold(events=self._task_events(task_id=tid), history_length=req.history_length)
+                for tid, _ in rows[start:start + size]]
         end = start + len(page)
-        return ListTasksResponse(tasks=page, next_page_token=str(end) if end < len(tasks) else "",
-                                 page_size=size, total_size=len(tasks))
+        return ListTasksResponse(tasks=page, next_page_token=str(end) if end < len(rows) else "",
+                                 page_size=size, total_size=len(rows))
 
-    async def _wait(self, cursor: int) -> int:
+    async def _wait(self, cursor: int) -> tuple[int, bool]:
         """Wait for events past `cursor` (a request to the session, which answers when they are
-        written). Returns the position written."""
-        return await self._host.machines.ask(tl="session", name="events_wait", build=lambda reply: (cursor, reply))
+        written). Returns (the position written, whether the log is final: the agent is closed). A
+        write the session could not make is raised as a HarnessError."""
+        try:
+            return await self._host.machines.ask(tl="session", name="events_wait", build=lambda reply: (cursor, reply))
+        except (A2AError, asyncio.CancelledError):
+            raise
+        except TransitionRefused:
+            return self.store.event_position(), True
+        except Exception as error:
+            raise HarnessError(f"(harness error: the event log could not be written: {described(error)})") from error
 
-    async def _events(self, cursor: int, task_id: str) -> AsyncIterator[tuple[int, dict]]:
-        """The task's events after `cursor`, as they are written."""
+    async def _events(self, *, cursor: int, task_id: str) -> AsyncIterator[tuple[int, dict]]:
+        """The task's events after `cursor`, as they are written. Raises UnsupportedOperation if the
+        agent closes with the task not terminal (the log is final and has nothing more for it)."""
         while True:
             rows = self.store.events_after(cursor)
             for seq, event in rows:
@@ -202,7 +213,9 @@ class GraftAgent:
                 if body is not None and (body.get("id") if "task" in event else body.get("taskId")) == task_id:
                     yield seq, event
             if not rows:
-                await self._wait(cursor)
+                _position, final = await self._wait(cursor)
+                if final and not self.store.events_after(cursor, limit=1):
+                    raise UnsupportedOperation("the agent closed before the task ended")
 
     # ------------------------------------------------------------ messages
     async def _submit(self, req: SendMessageRequest) -> tuple[str, str, int]:
@@ -228,12 +241,12 @@ class GraftAgent:
             raise UnsupportedOperation("the agent is closed")
         return task_id, message.message_id, cursor
 
-    async def _updates(self, task_id: str, message_id: str, cursor: int,
+    async def _updates(self, *, task_id: str, message_id: str, cursor: int,
                        until: frozenset[str]) -> AsyncIterator[tuple[int, dict, bool]]:
         """The task's events from its message on, until a state in `until` after it (each with
         whether it is the last). An error event is delivered, then raised at the end."""
         mine, error = False, None
-        async for seq, event in self._events(cursor, task_id):
+        async for seq, event in self._events(cursor=cursor, task_id=task_id):
             if not mine:
                 carried = event.get("task", {}).get("history", [{}])[-1] if "task" in event else \
                     event["statusUpdate"]["status"].get("message") or {}
@@ -253,42 +266,50 @@ class GraftAgent:
     async def send(self, request: SendMessageRequest | dict) -> SendMessageResponse:
         """SendMessage: always a Task. Blocking (the default) returns at the task's next
         `TASK_STATE_INPUT_REQUIRED` or terminal state after this message; with
-        `configuration.returnImmediately`, once its message is in the log."""
+        `configuration.returnImmediately`, once its message is in the log. Raises InvalidParams,
+        ContentTypeNotSupported or PushNotificationNotSupported for a request that is not valid,
+        TaskNotFound for an unknown taskId, UnsupportedOperation for a terminal task or a closed
+        agent, and HarnessError once it has delivered a harness error of its task."""
         req = _parse(SendMessageRequest, request)
         task_id, message_id, cursor = await self._submit(req)
         until = frozenset() if req.configuration.return_immediately else a2a.INTERRUPTED | a2a.TERMINAL
         upto = cursor
-        async for seq, _event, _last in self._updates(task_id, message_id, cursor, until):
+        async for seq, _event, _last in self._updates(task_id=task_id, message_id=message_id, cursor=cursor,
+                                                      until=until):
             upto = seq
             if req.configuration.return_immediately:
                 break
-        return SendMessageResponse(task=fold(self._task_events(task_id, upto=upto),
+        return SendMessageResponse(task=fold(events=self._task_events(task_id=task_id, upto=upto),
                                              history_length=req.configuration.history_length))
 
     async def stream(self, request: SendMessageRequest | dict) -> AsyncIterator[StreamResponse]:
-        """SendStreamingMessage: the task, then its status updates until it is terminal."""
+        """SendStreamingMessage: the task, then its status updates until it is terminal. Raises as
+        `send`; a harness error is yielded, then raised (HarnessError)."""
         req = _parse(SendMessageRequest, request)
         task_id, message_id, cursor = await self._submit(req)
         first = True
-        async for seq, event, _last in self._updates(task_id, message_id, cursor, a2a.TERMINAL):
+        async for seq, event, _last in self._updates(task_id=task_id, message_id=message_id, cursor=cursor,
+                                                     until=a2a.TERMINAL):
             if first:  # the task as its message left it, then each update after it
                 first = False
-                yield StreamResponse(task=fold(self._task_events(task_id, upto=seq)))
+                yield StreamResponse(task=fold(events=self._task_events(task_id=task_id, upto=seq)))
                 continue
             yield StreamResponse.from_dict(event)
 
     async def subscribe(self, request: SubscribeToTaskRequest | dict) -> AsyncIterator[StreamResponse]:
-        """SubscribeToTask: the task as it is now, then its status updates until it is terminal."""
+        """SubscribeToTask: the task as it is now, then its status updates until it is terminal.
+        Raises TaskNotFound, UnsupportedOperation (a terminal task, or the agent closed before it
+        ended), and HarnessError after yielding a harness error."""
         req = _parse(SubscribeToTaskRequest, request)
         events = self.store.task_events(req.id)
         if not events:
             raise TaskNotFound(f"task {req.id[:64]!r} not found")
-        task = fold([e for _, e in events])
+        task = fold(events=[e for _, e in events])
         if task.status.state in a2a.TERMINAL:
             raise UnsupportedOperation(f"task {req.id[:64]!r} is in a terminal state")
         yield StreamResponse(task=task)
         error = None
-        async for _seq, event in self._events(events[-1][0], req.id):
+        async for _seq, event in self._events(cursor=events[-1][0], task_id=req.id):
             error = error or _is_error(event)
             yield StreamResponse.from_dict(event)
             if event["statusUpdate"]["status"]["state"] in a2a.TERMINAL:
@@ -299,8 +320,10 @@ class GraftAgent:
     async def cancel_task(self, request: CancelTaskRequest | dict) -> Task:
         """CancelTask: Stop. The task is CANCELED, its request withdrawn: its runs end, its
         branches stop and merge cancelled, a current branch holding the conversation for it merges
-        too. Returns the task once CANCELED is in the log."""
+        too. Returns the task once CANCELED is in the log. Raises TaskNotFound, TaskNotCancelable
+        (a terminal task) or UnsupportedOperation (a closed agent)."""
         req = _parse(CancelTaskRequest, request)
+        cursor = self.store.event_position()  # CANCELED is written after this
         answer = await self._host.machines.ask(tl="session", name="cancel_task", build=lambda reply: (req.id, reply))
         if answer == "not_found":
             raise TaskNotFound(f"task {req.id[:64]!r} not found")
@@ -308,9 +331,8 @@ class GraftAgent:
             raise TaskNotCancelable(f"task {req.id[:64]!r} is in a terminal state")
         if answer != "accepted":
             raise UnsupportedOperation("the agent is closed")
-        cursor = 0
-        async for seq, event in self._events(cursor, req.id):
+        async for seq, event in self._events(cursor=cursor, task_id=req.id):
             body = event.get("statusUpdate")
             if body is not None and body["status"]["state"] == a2a.CANCELED:
-                return fold(self._task_events(req.id, upto=seq))
+                return fold(events=self._task_events(task_id=req.id, upto=seq))
         raise AssertionError("unreachable")  # _events never ends
