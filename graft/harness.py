@@ -74,7 +74,9 @@ from .db import Graft, Store, render, validate
 from .machine import (CANCELLED, MAX_JOIN_ATTEMPTS, Cancel, CancelCall, Branch, Machines, Mode,
                       Prepared, QueuedJoin, RunOutcome, ToolCall, TransitionRefused, Unwritten, described)
 from .providers import Provider, prefix_nonce, window_tokens_for
-from .skills import BASE_SYSTEM, BRANCH_ID_PATTERN, BUILTIN, MAX_MESSAGES, REASON_CHARS, skill_instructions, skill_listing
+from .skills import (BASE_SYSTEM, BRANCH_ID_PATTERN, BUILTIN, MAX_MESSAGES, MIN_CHILDREN_TO_FORK,
+                     REASON_CHARS, SUB_BRANCH_INSTRUCTIONS, SUB_DETACHED_BRANCH_INSTRUCTIONS,
+                     skill_instructions, skill_listing)
 from .tools import CallToolResult, Tool, ToolContext, by_name, invoke_tool
 
 # Seconds one model call may take before it is abandoned as a mechanical failure (the harness's
@@ -204,11 +206,13 @@ SKIPPED_NOTE = ("(harness note: your branch {name} merged, but its messages were
                 "make a valid conversation here); they stay in that branch's frozen timeline. {running})")
 
 
-def fork_result(*, name: str, focus: bool, skills: list[str], reason: str | None) -> str:
+def fork_result(*, name: str, focus: bool, skills: list[str], reason: str | None,
+                parent_name: str | None = None) -> str:
     """A graft's own result of its source's `fork` call, the last row of its first view (the one
     place it is worded): which branch it is, current or detached, what it holds, and where its
     part is said."""
-    where = ("current: you are talking with the user, and when this turn ends you merge back into main"
+    target = parent_name or MAIN
+    where = (f"current: you are talking with the user, and when this turn ends you merge back into {target}"
              if focus else "detached: nothing you write here reaches the user, and your final reply is "
                            "what you will remember of this work")
     part = (f"Your part: the reason you wrote for {name} above." if reason
@@ -216,12 +220,29 @@ def fork_result(*, name: str, focus: bool, skills: list[str], reason: str | None
     return f"You are now on branch {name} ({where}), holding: {', '.join(skills)}. {part}"
 
 
+def allowed_fork_skills(store: Store, source: str) -> list[str]:
+    """The skill catalog `source` is allowed to fork into: top-level skills for main, or the
+    unlinked child skills of `source`'s held skills (plus `search` if `source` holds it)."""
+    tl = store.timeline(source)
+    if tl is None or tl["source_id"] is None:
+        return store.top_level_skills(exclude=BUILTIN)
+    linked = [s["name"] for s in store.skills_for(source)]
+    linked_set = set(linked)
+    caps = [n for n in linked if n not in BUILTIN and n != "search"]
+    children = store.children_of(caps, exclude=linked_set | set(BUILTIN))
+    if "search" in linked_set and "search" not in children:
+        children.append("search")
+    return children
+
+
 def check_skill_link(store: Store, source: str, skills: list[str]) -> list[str]:
-    """The one place skill linking is checked. Grafts are one level deep: only the original
-    branches, so the `fork` skill (graft's branch skill, as the model is told it) is never linked
-    to a graft."""
+    """The one place skill linking is checked. `source` may only fork into skills in its allowed
+    catalog (top-level skills on main; child skills of held skills on a non-leaf branch)."""
     v = []
     known = set(store.skill_names())
+    allowed = set(allowed_fork_skills(store, source))
+    tl = store.timeline(source)
+    is_root = tl is None or tl["source_id"] is None
     if not skills:
         v.append("select at least one skill")
     for s in skills:
@@ -231,7 +252,14 @@ def check_skill_link(store: Store, source: str, skills: list[str]) -> list[str]:
             v.append(f"'{s}' is linked by the harness (merge to a current branch, detached to a "
                      "detached branch); do not select it")
         elif s == "fork":
-            v.append("'fork' cannot be held by a branch (you fork only from main)")
+            v.append("'fork' cannot be held by a branch directly (the harness links it when a "
+                     "branch holds child skills)")
+        elif s not in allowed:
+            if is_root:
+                parent = store.parent_of(s)
+                v.append(f"skill {_echo(s)} is nested under {parent!r}; fork {parent!r} first")
+            else:
+                v.append(f"skill {_echo(s)} is not in this branch's child skill catalog")
     return v
 
 
@@ -498,12 +526,16 @@ class Host:
                  window_tokens: int | None = ...,
                  call_timeout: float | None = MODEL_CALL_TIMEOUT,
                  names: Callable[[], str] | None = None,
-                 before_fork: Callable[[ForkContext], Any] | None = None):
+                 before_fork: Callable[[ForkContext], Any] | None = None,
+                 min_children_to_fork: int = MIN_CHILDREN_TO_FORK):
         self.store = store
         # The source of the ids a fork call leaves out (seeded in tests).
         self.names = names or new_names()
         # Optional host policy hook called before a fork commits (returns None to allow, or refusal string(s)).
         self.before_fork = before_fork
+        if min_children_to_fork < 1:
+            raise ValueError(f"min_children_to_fork must be >= 1, got {min_children_to_fork!r}")
+        self.min_children_to_fork = min_children_to_fork
         self.persona = persona  # user-provided; identical, verbatim, on every timeline
         self.provider = provider
         self.tools = by_name(list(tools))  # the host's tools, by name (graft/tools.py)
@@ -879,17 +911,26 @@ class Host:
 
     def system(self, tl: str) -> str:
         """Persona (same on every timeline) + full instructions of every linked skill (loaded
-        automatically). On main, also lists the unlinked skill catalog (name and description only)."""
+        automatically). On main and any non-leaf branch holding `fork`, also lists the unlinked
+        skill catalog that timeline may fork into (name and description only)."""
         names = [s["name"] for s in self.store.skills_for(tl)]
-        parts = [self.persona, skill_instructions(self.store, names)]
+        tl_row = self.store.timeline(tl)
+        is_root = tl_row is None or tl_row["source_id"] is None
+        if is_root or "fork" not in names:
+            instr = skill_instructions(self.store, names)
+        else:
+            other = [n for n in names if n != "fork"]
+            sub_fork = SUB_DETACHED_BRANCH_INSTRUCTIONS if "detached" in names else SUB_BRANCH_INSTRUCTIONS
+            instr = "\n\n".join(p for p in (skill_instructions(self.store, other), f"## fork\n{sub_fork}") if p)
+        parts = [self.persona, instr]
         name = self.store.name_of(tl)
         if name is not None:
             parts.append(f"This branch of yours has the id {name}.")
         if "fork" in names:
-            catalog = [r[0] for r in self.store.con.execute(
-                "SELECT name FROM skills ORDER BY skill_id") if r[0] not in BUILTIN]
-            parts.append(skill_listing(store=self.store, names=catalog,
-                                       heading="Skill catalog (the skills a branch of yours can hold):"))
+            catalog = allowed_fork_skills(self.store, tl)
+            heading = ("Skill catalog (the skills a branch of yours can hold):" if is_root
+                       else "Child skill catalog (the skills a child branch of yours can hold):")
+            parts.append(skill_listing(store=self.store, names=catalog, heading=heading))
         return "\n\n".join(p for p in parts if p)
 
     def search(self, tl: str, raw_input: Any) -> tuple[str, bool]:
@@ -1307,14 +1348,14 @@ class Host:
 
     # ------------------------------------------------------------ join event
     def replied(self, tl: str) -> bool:
-        """Has tl produced user-facing assistant text since the last user message in its working
-        view? A harness note is not a user message."""
+        """Has tl (or a child branch merged into tl) produced user-facing assistant text since the
+        last user message in its working view? A harness note is not a user message."""
         answered = False
         for r in self.store.working_view(tl):
             if r["role"] == "user" and seeder_mod.is_candidate(r):
                 answered = False
-            elif r["role"] == "assistant" and r["kind"] == "text" and r["owner_timeline"] == tl:
-                answered = True  # its own text: its source's fork turn, in its view, is no reply of its
+            elif r["role"] == "assistant" and r["kind"] == "text" and self.store.is_descendant_or_self(r["owner_timeline"], tl):
+                answered = True  # its own (or a merged child's) text; its parent's fork turn is no reply of its
         return answered
 
     def compute_trigger(self, child: str, reason: str) -> int | None:
@@ -1327,7 +1368,7 @@ class Host:
         for r in rows:
             if r["role"] == "user" and seeder_mod.is_candidate(r):
                 last_user, answered = r["row_id"], False
-            elif r["role"] == "assistant" and r["kind"] == "text" and r["owner_timeline"] == child:
+            elif r["role"] == "assistant" and r["kind"] == "text" and self.store.is_descendant_or_self(r["owner_timeline"], child):
                 answered = True
         if last_user is None:
             return None
@@ -1657,8 +1698,8 @@ class Host:
             return f"fork refused; no branch was started: internal error ({err}).\nCall fork once more."
         if isinstance(prepared, str):
             return prepared
-        batch, pairs, names, wake = prepared
-        return Prepared(pairs=pairs, data=batch, names=names, wake=wake)
+        batch, pairs, names, wake, can_fork = prepared
+        return Prepared(pairs=pairs, data=batch, names=names, wake=wake, can_fork=can_fork)
 
     def roll_back_branch(self, src: str) -> None:
         """A branch call whose preparation was cut short (the run was ended while it was being
@@ -1684,8 +1725,35 @@ class Host:
         self.trace(f"[{src}] branch refused: {detail}")
         return f"fork refused; no branch was started: {detail}.\nCall fork once more."
 
+    def _resolve_branch_skills(self, requested: list[str], focus: bool) -> tuple[list[str], bool]:
+        """Resolve full linked skills for a new branch and whether it gains `fork`.
+
+        - If held skills own >= `min_children_to_fork` child skills: link `fork` (children stay
+          in the branch's child catalog and are forked on demand).
+        - If held skills own 1 .. min_children_to_fork-1 child skills: auto-link those children
+          directly (avoiding a single-child fork hop) and re-check the next level.
+        - Always append `merge` (current) or `detached` (background)."""
+        linked = list(requested)
+        seen = set(linked)
+        can_fork = False
+        while True:
+            caps = [s for s in linked if s not in BUILTIN and s != "search"]
+            children = self.store.children_of(caps, exclude=seen | set(BUILTIN))
+            if not children:
+                break
+            if len(children) >= self.min_children_to_fork:
+                can_fork = True
+                break
+            for c in children:
+                linked.append(c)
+                seen.add(c)
+        if can_fork:
+            linked.append("fork")
+        linked.append("merge" if focus else "detached")
+        return linked, can_fork
+
     async def _prepare_branch(self, src: str, use: dict, *, txs: list[int]
-                             ) -> str | tuple[BranchBatch, list[tuple[str, bool]], dict[str, str]]:
+                             ) -> str | tuple[BranchBatch, list[tuple[str, bool]], dict[str, str], dict[str, bool], dict[str, bool]]:
         args = use["input"]
         entries, shape = branch_entries(args)
         ids = self.store.next_branch_ids(len(entries))  # distinct before anything commits
@@ -1772,16 +1840,22 @@ class Host:
         for sc, name in zip(scratch, names):
             sc["name"] = name
         turn_ids = [r["row_id"] for r in turn_rows + other_results]
-        grafts = [Graft(child=child, seed=seed, skills=e.skills + ["merge" if e.focus else "detached"],
+        parent_name = self.store.name_of(src)
+        resolved_skills = [self._resolve_branch_skills(e.skills, e.focus) for e in entries]
+        grafts = [Graft(child=child, seed=seed, skills=linked,
                         focus=e.focus, name=name, turn=turn_ids if turn is not None else [],
                         result=None if turn is None else {
                             "tool_use_id": use.get("id"), "is_error": False,
-                            "content": fork_result(name=name, focus=e.focus, skills=e.skills, reason=e.reason)})
-                  for child, e, seed, name in zip(ids, entries, seeds, names)]
+                            "content": fork_result(
+                                name=name, focus=e.focus,
+                                skills=[s for s in linked if s not in BUILTIN],
+                                reason=e.reason, parent_name=parent_name)})
+                  for child, e, seed, name, (linked, _) in zip(ids, entries, seeds, names, resolved_skills)]
         parts, audits = [], []
         for tx, sc, g in zip(txs, scratch, grafts):
             mode = "FOCUS" if g.focus else "BACKGROUND"
             audits.append((tx, f"BRANCH {g.child} NAME {g.name} {mode} SEED {g.seed} TURN {g.turn} SKILLS {g.skills}", sc))
             parts.append(f"{g.name} ({'current' if g.focus else 'detached, running'}; skills {g.skills})")
         batch = BranchBatch(grafts=grafts, audits=audits, text="forked -> " + ", ".join(parts), txs=list(txs))
-        return batch, pairs, dict(zip(ids, names)), dict(zip(ids, (e.wake for e in entries)))
+        can_forks = dict(zip(ids, (cf for _, cf in resolved_skills)))
+        return batch, pairs, dict(zip(ids, names)), dict(zip(ids, (e.wake for e in entries))), can_forks

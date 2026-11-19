@@ -411,7 +411,7 @@ PRODUCERS = {
                      "SUMMARY_HEADER", "COMPACT_INSTRUCTION", "summary_turn"],
     seeder_mod: ["NOUL_TRUE", "NOUL_FALSE", "reduced_state", "reduced_question", "jev_request"],
     skills_mod: ["LOAD_SKILL_TOOL", "JOIN_TOOL", "CANCEL_TOOL", "SEARCH_TOOL", "MESSAGES", "REASON", "WAKE", "BRANCH_INSTRUCTIONS", "JOIN_INSTRUCTIONS",
-                 "BACKGROUND_INSTRUCTIONS", "SEARCH_INSTRUCTIONS", "load_skill", "skill_listing", "skill_instructions"],
+                 "BACKGROUND_INSTRUCTIONS", "SUB_BRANCH_INSTRUCTIONS", "SUB_DETACHED_BRANCH_INSTRUCTIONS", "SEARCH_INSTRUCTIONS", "load_skill", "skill_listing", "skill_instructions"],
 }
 # graft's own identifiers (store and transaction kinds, a graft's kind, its reason, the keys of the
 # harness's logs) and its audit records: compared and stored, never shown to a model.

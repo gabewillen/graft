@@ -76,6 +76,7 @@ class Prepared(NamedTuple):
     data: Any
     names: Any = None
     wake: Any = None
+    can_fork: Any = None
 
 
 @dataclass(eq=False)
@@ -97,6 +98,7 @@ class GraftPlan(NamedTuple):
     waiters: list["Waiter"]
     answering: "Request | None"
     made_for: "tuple[Request, ...]"
+    can_fork: bool = False
 
 
 @dataclass
@@ -119,6 +121,7 @@ class Branch:
     data: Any = None
     names: dict[str, str] = field(default_factory=dict)
     wake: dict[str, bool] = field(default_factory=dict)
+    can_fork: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass
@@ -208,6 +211,7 @@ class JoinState:
     ends_on_request: bool = False
     join_reason: str = "done"  # focus graft: decided on entry of handing_back
     replied_cleanly: bool = False  # focus graft: ended via plain reply (no explicit merge())
+    quiet_handback: bool = False  # focus graft: handing back quietly after a clean child reply with wake=False
     reason: str = ""  # background graft: join reason while recording
     close_first: bool = False  # background graft: close open calls before recording join
     forced: asyncio.Future | None = None

@@ -39,7 +39,7 @@ class Machines:
         self.session = Session(self, context_id=context_id, position=position)
         self.session.root = tl
         await hsm.Started(None, self.session, SESSION, hsm.Config(ID="session"))
-        sm = Timeline(machines=self, timeline_id=tl, source_id=None, kind="original")
+        sm = Timeline(machines=self, timeline_id=tl, source_id=None, kind="original", can_fork=True)
         self.timelines[tl] = sm
         self.root = tl
         await hsm.Started(None, sm, TIMELINE, hsm.Config(ID=tl))

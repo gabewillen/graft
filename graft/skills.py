@@ -9,8 +9,12 @@ dots.
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any, Sequence
 
 from .db import Skill, Store
+
+MIN_CHILDREN_TO_FORK = 2  # minimum child skills a branch must own to gain `fork` ability
 
 
 def obj(props: dict, required: list[str]) -> dict:
@@ -187,6 +191,41 @@ branch's.
 - If you could not do your part, say why in your final reply.
 """
 
+# Instructions given to a non-leaf current branch that holds `fork` for its child skill catalog.
+SUB_BRANCH_INSTRUCTIONS = """\
+You hold `fork` and `stop` for your child skill catalog below. You may use your own linked skills
+directly, and fork child branches for any part covered by a child skill in your catalog:
+- `fork(current={...}, detached=[{...}, ...])` starts child branches in one call, using the same
+  `{id?, skills, messages, reason?}` shape (`current` also accepts `wake?`, default `true`). Select
+  only skill names from your child skill catalog below (and `"search"` if you hold it). Never
+  select `fork`, `merge`, or `detached`.
+- Point `messages` at the integer `[#id]` row ids from your view that each child branch needs.
+- Use `current` when a child branch should talk with the user directly for one turn, and `detached`
+  when one or more child branches should work out of sight in parallel and report back to you here.
+- Every child branch merges back into this branch when it finishes, and you resume here with its
+  result before merging back into your parent. If you fork detached child branches and have nothing
+  else to do until they finish, end your step without calling `merge`; you will resume automatically
+  once they merge back here.
+- Anything a detached child branch wrote has NOT been shown to the user. Before this branch ends or
+  calls `merge`, always tell the user in your own reply what your detached child branches found
+  (never put user-facing findings only inside `merge(reason)` — the user never sees it).
+- `stop(ids=[...])` stops detached child branches of yours that are still running.
+"""
+
+# Instructions given to a non-leaf detached branch that holds `fork` for its child skill catalog.
+SUB_DETACHED_BRANCH_INSTRUCTIONS = """\
+You hold `fork` and `stop` for your child skill catalog below. Because this is a detached branch
+with no line to the user, you can only fork `detached` child branches (never `current`):
+- `fork(detached=[{id?, skills, messages, reason?}, ...])` starts one or more detached child
+  branches in parallel. Select only skill names from your child skill catalog below (and `"search"`
+  if you hold it). Never select `fork`, `merge`, or `detached`.
+- Point `messages` at the integer `[#id]` row ids from your view that each child branch needs.
+- After forking detached child branches, end your step without calling `merge`; you will resume
+  here once they finish and merge back, so you can synthesize your final reply before this branch
+  merges into its parent.
+- `stop(ids=[...])` stops detached child branches of yours that are still running.
+"""
+
 SEARCH_TOOL = {
     "name": "search",
     "description": "Full-text search over out-of-view committed messages and merged branches' tool "
@@ -299,14 +338,251 @@ def skill_instructions(store: Store, names: list[str]) -> str:
     return "\n\n".join(blocks)
 
 
-def install(store: Store, tools: dict[str, dict] | None = None, skills: list[Skill] | None = None) -> None:
+def _unquote(raw: str) -> str:
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def _parse_frontmatter_fallback(text: str) -> dict[str, Any]:
+    """Minimal YAML-subset parser for SKILL.md frontmatter (zero external dependencies)."""
+    data: dict[str, Any] = {}
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        if line[0].isspace():
+            raise ValueError(f"unexpected indentation in frontmatter: {line!r}")
+        if ":" not in line:
+            raise ValueError(f"invalid frontmatter line: {line!r}")
+        key, rest = line.split(":", 1)
+        key = key.strip()
+        val = rest.strip()
+        i += 1
+        if val in ("|", ">", "|-", ">-"):
+            block: list[str] = []
+            while i < len(lines) and (not lines[i].strip() or lines[i][0].isspace()):
+                block.append(lines[i].strip())
+                i += 1
+            joiner = "\n" if val.startswith("|") else " "
+            data[key] = joiner.join(block).strip()
+        elif val.startswith("[") and val.endswith("]"):
+            inner = val[1:-1].strip()
+            data[key] = [_unquote(x) for x in inner.split(",") if x.strip()] if inner else []
+        elif val:
+            data[key] = _unquote(val)
+        else:
+            # Nested list or mapping
+            items: list[str] = []
+            mapping: dict[str, str] = {}
+            kind: str | None = None
+            while i < len(lines):
+                nxt = lines[i]
+                if not nxt.strip() or nxt.strip().startswith("#"):
+                    i += 1
+                    continue
+                if not nxt[0].isspace():
+                    break
+                sub = nxt.strip()
+                if sub.startswith("- "):
+                    if kind == "map":
+                        raise ValueError(f"mixed list and mapping under {key!r}")
+                    kind = "list"
+                    items.append(_unquote(sub[2:]))
+                elif ":" in sub:
+                    if kind == "list":
+                        raise ValueError(f"mixed list and mapping under {key!r}")
+                    kind = "map"
+                    mk, mv = sub.split(":", 1)
+                    mapping[mk.strip()] = _unquote(mv)
+                else:
+                    raise ValueError(f"invalid nested frontmatter line under {key!r}: {nxt!r}")
+                i += 1
+            data[key] = items if kind == "list" else mapping if kind == "map" else ""
+    return data
+
+
+def _parse_skill_md(md_path: Path) -> tuple[dict[str, Any], str]:
+    """Parse a SKILL.md file into (frontmatter dict, markdown body)."""
+    raw = md_path.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError(f"{md_path}: missing YAML frontmatter opening '---'")
+    end = next((idx for idx in range(1, len(lines)) if lines[idx].strip() == "---"), None)
+    if end is None:
+        raise ValueError(f"{md_path}: missing YAML frontmatter closing '---'")
+    fm_text = "\n".join(lines[1:end])
+    body = "\n".join(lines[end + 1:]).strip()
+    try:
+        import yaml  # type: ignore[import-not-found]
+        parsed = yaml.safe_load(fm_text)
+    except ImportError:
+        parsed = _parse_frontmatter_fallback(fm_text)
+    except Exception as e:
+        raise ValueError(f"{md_path}: invalid YAML frontmatter: {e}") from None
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{md_path}: frontmatter must be a mapping")
+    return parsed, body
+
+
+def validate_skill_tree(skills: Sequence[Skill]) -> None:
+    """Validate skill uniqueness and parent-tree integrity (fail closed at startup).
+
+    Refuses: duplicate names, built-ins with a parent, skills whose parent is a built-in,
+    unknown parents, and parent cycles."""
+    by_name: dict[str, Skill] = {}
+    reserved = set(BUILTIN) | {"search"}
+    for s in skills:
+        if not isinstance(s.name, str) or not s.name.strip():
+            raise ValueError(f"skill name must be a non-empty string, got {s.name!r}")
+        if s.name in by_name:
+            raise ValueError(f"duplicate skill name {s.name!r}")
+        by_name[s.name] = s
+    for s in skills:
+        if s.parent is None:
+            continue
+        if s.name in reserved:
+            raise ValueError(f"built-in skill {s.name!r} cannot have a parent ({s.parent!r})")
+        if s.parent in reserved:
+            raise ValueError(f"skill {s.name!r} cannot have built-in skill {s.parent!r} as its parent")
+        if s.parent not in by_name:
+            raise ValueError(f"skill {s.name!r} names unknown parent {s.parent!r}")
+    for s in skills:
+        seen: set[str] = set()
+        cur: str | None = s.name
+        while cur is not None:
+            if cur in seen:
+                raise ValueError(f"skill parent cycle involving {s.name!r}")
+            seen.add(cur)
+            cur = by_name[cur].parent
+
+
+def load_skills(path: str | Path) -> list[Skill]:
+    """Load a skill catalog from an explicit directory path (never assumes a default directory).
+
+    Follows the Agent Skills directory layout:
+    - Top-level skills live at `<path>/<skill-name>/SKILL.md`.
+    - Child skills may be nested at `<parent-dir>/skills/<child-name>/SKILL.md` (recursively) OR
+      placed flat under `<path>/<child-name>/SKILL.md` with `metadata.parent: <parent-name>`.
+    - Extra files/directories inside a skill folder (scripts/, references/, assets/) are ignored.
+
+    Refuses the whole catalog (raises ValueError) if:
+    - `path` does not exist or is not a directory,
+    - a skill's frontmatter `name` does not match its directory name,
+    - a nested skill's directory parent disagrees with `metadata.parent`,
+    - a parent name is unknown, a cycle exists, or skill names collide."""
+    root = Path(path)
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"skills directory does not exist or is not a directory: {root}")
+
+    found: list[Skill] = []
+    seen_names: set[str] = set()
+
+    def scan(container: Path, dir_parent: str | None) -> None:
+        for entry in sorted(container.iterdir(), key=lambda p: p.name):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            md = entry / "SKILL.md"
+            if not md.is_file():
+                continue
+            fm, body = _parse_skill_md(md)
+            name = fm.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"{md}: missing required 'name'")
+            name = name.strip()
+            if name != entry.name:
+                raise ValueError(f"{md}: skill name {name!r} does not match directory name {entry.name!r}")
+            if name in seen_names:
+                raise ValueError(f"duplicate skill name {name!r} (at {md})")
+            seen_names.add(name)
+
+            desc = fm.get("description")
+            if not isinstance(desc, str) or not desc.strip():
+                raise ValueError(f"{md}: missing required 'description'")
+            desc = desc.strip()
+
+            meta = fm.get("metadata") or {}
+            if not isinstance(meta, dict):
+                raise ValueError(f"{md}: 'metadata' must be a mapping")
+            meta_parent = meta.get("parent")
+            if meta_parent is not None:
+                if not isinstance(meta_parent, str) or not meta_parent.strip():
+                    raise ValueError(f"{md}: 'metadata.parent' must be a non-empty string")
+                meta_parent = meta_parent.strip()
+
+            top_parent = fm.get("parent")
+            if top_parent is not None:
+                if not isinstance(top_parent, str) or not top_parent.strip():
+                    raise ValueError(f"{md}: 'parent' must be a non-empty string")
+                top_parent = top_parent.strip()
+                if meta_parent is not None and top_parent != meta_parent:
+                    raise ValueError(f"{md}: 'parent' ({top_parent!r}) disagrees with 'metadata.parent' ({meta_parent!r})")
+                meta_parent = top_parent
+
+            if dir_parent is not None and meta_parent is not None and dir_parent != meta_parent:
+                raise ValueError(
+                    f"{md}: skill {name!r} directory parent {dir_parent!r} disagrees with "
+                    f"metadata.parent {meta_parent!r}"
+                )
+            parent = dir_parent if dir_parent is not None else meta_parent
+
+            raw_tools = fm.get("tools")
+            if raw_tools is None and "tools" in meta:
+                raw_tools = meta["tools"]
+            if raw_tools is None:
+                tool_names: list[str] = []
+            elif isinstance(raw_tools, str):
+                tool_names = [t.strip() for t in raw_tools.split(",") if t.strip()]
+            elif isinstance(raw_tools, list) and all(isinstance(t, str) and t.strip() for t in raw_tools):
+                tool_names = [t.strip() for t in raw_tools]
+            else:
+                raise ValueError(f"{md}: 'tools' must be a list of tool name strings")
+
+            found.append(Skill(name=name, description=desc, instructions=body, tools=tool_names, parent=parent))
+
+            nested = entry / "skills"
+            if nested.is_dir():
+                scan(nested, dir_parent=name)
+
+    scan(root, dir_parent=None)
+    validate_skill_tree(found)
+
+    # Order parents before children while preserving alphabetical order within each depth.
+    by_name = {s.name: s for s in found}
+
+    def depth(s: Skill) -> int:
+        d, cur = 0, s.parent
+        while cur is not None:
+            d += 1
+            cur = by_name[cur].parent
+        return d
+
+    return sorted(found, key=lambda s: (depth(s), s.name))
+
+
+def install(store: Store, tools: dict[str, dict] | None = None, skills: Sequence[Skill] | None = None) -> None:
     """Put the skills (default: the catalog) into the store, each with its tools: graft's own tool
     definitions as they are, and each tool a skill names by name taken from `tools` (name -> MCP
-    tool definition, the host's). A skill that names a tool the host did not give is refused."""
+    tool definition, the host's). Built-in skills (`fork`, `merge`, `detached`) and `search` are
+    included automatically when custom skills are given. Refuses atomically if any skill names an
+    unknown tool, or if the skill parent tree has duplicates, unknown parents, or cycles."""
     given = tools or {}
-    chosen = list(CATALOG if skills is None else skills)
+    if skills is None:
+        chosen = list(CATALOG)
+    else:
+        custom = list(skills)
+        custom_names = {s.name for s in custom}
+        builtins = [s for s in CATALOG if s.name in BUILTIN and s.name not in custom_names]
+        chosen = builtins + custom
     if any(s.name == "fork" for s in chosen) and not any(s.name == "search" for s in chosen):
         chosen.append(SEARCH_SKILL)
+    validate_skill_tree(chosen)
+    prepared: list[Skill] = []
     for skill in chosen:
         resolved = []
         for t in skill.tools:
@@ -316,5 +592,7 @@ def install(store: Store, tools: dict[str, dict] | None = None, skills: list[Ski
                 resolved.append(given[t])
             else:
                 raise ValueError(f"skill {skill.name!r} names tool {t!r}, which the host did not give")
-        store.add_skill(Skill(name=skill.name, description=skill.description, instructions=skill.instructions,
-                              tools=resolved))
+        prepared.append(Skill(name=skill.name, description=skill.description, instructions=skill.instructions,
+                              tools=resolved, parent=skill.parent))
+    for skill in prepared:
+        store.add_skill(skill)

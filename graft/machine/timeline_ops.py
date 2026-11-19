@@ -21,13 +21,14 @@ class Timeline(hsm.Instance):
     def __init__(self, machines, timeline_id: str, source_id: str | None, kind: str,
                  held: bool = False, waiters: list[Waiter] | None = None,
                  answering: Request | None = None, made_for: tuple[Request, ...] = (),
-                 withdrawn: set[int] | None = None):
+                 withdrawn: set[int] | None = None, can_fork: bool = False):
         super().__init__()
         self.machines = machines
         self.host = machines.host
         self.timeline_id = timeline_id
         self.source_id = source_id
         self.kind = kind  # original | focus | background
+        self.can_fork = can_fork
         self.held = held
         self.mode = TURN
         self.made_for: tuple[Request, ...] = tuple(made_for)
@@ -64,6 +65,8 @@ def branch_refusal(inst: Timeline, grafts: list[tuple[str, bool]]) -> str | None
     focus = [g for g, f in grafts if f]
     if len(focus) > 1:
         return f"at most one branch may carry the conversation, got {focus}"
+    if inst.kind == "background" and focus:
+        return "a detached branch can only fork detached branches"
     return None
 
 
@@ -72,8 +75,8 @@ def decline_why(inst: Timeline, branch: Branch | None = None) -> str | None:
         return "the harness is closing; answer the user instead"
     if _run_withdrawn(inst):
         return "the user's call this turn answers was withdrawn"
-    if inst.source_id is not None:
-        return "you fork only from main (branches are one level deep)"
+    if not inst.can_fork:
+        return "you fork only from main (or a branch with child skills)"
     return None
 
 
@@ -87,15 +90,15 @@ def branch_why(inst: Timeline, branch: Branch) -> str | None:
 
 
 def may_cancel(inst: Timeline, child: str) -> bool:
-    return (inst.source_id is None and inst.grafts.live.get(child) is False
+    return (inst.can_fork and inst.grafts.live.get(child) is False
             and all(q.child != child for q in inst.joins.queue))
 
 
 def cancel_refusal(inst: Timeline, child: str) -> str:
-    if inst.source_id is not None:
+    if not inst.can_fork:
         return "you stop branches only from main; a branch never stops another branch"
     if child == inst.timeline_id:
-        return "main cannot be stopped"
+        return "main cannot be stopped" if inst.source_id is None else "this branch cannot stop itself"
     if child not in inst.grafts.made:
         return "no such branch"
     if inst.grafts.made[child]:
@@ -147,7 +150,8 @@ def _unwanted(inst: Timeline, child: str) -> bool:
 
 def _owners(inst: Timeline) -> tuple[Request, ...]:
     runs_for: list[Request] = []
-    for r in ([inst.req.answering] if inst.req.answering is not None else []) + list(inst.req.woken_for):
+    sources = ([inst.req.answering] if inst.req.answering is not None else []) + list(inst.req.woken_for) + list(inst.made_for)
+    for r in sources:
         if all(r is not o for o in runs_for):
             runs_for.append(r)
     live = [r for r in runs_for if not _withdrawn(inst, r)]
@@ -178,7 +182,12 @@ def _still_running(inst: Timeline) -> list[str]:
 
 
 def _viewers(inst: Timeline) -> list[str]:
-    return [inst.timeline_id] + ([inst.source_id] if inst.kind == "focus" else [])
+    out = [inst.timeline_id]
+    cur: Timeline | None = inst
+    while cur is not None and cur.kind == "focus" and cur.source_id is not None:
+        out.append(cur.source_id)
+        cur = inst.machines.timelines.get(cur.source_id)
+    return out
 
 
 def _withdrawn_rows(inst: Timeline) -> list[int]:
@@ -813,7 +822,7 @@ def refuse_branch_call(ctx, inst: Timeline, event) -> None:
 
 def refuse_cancel_call(ctx, inst: Timeline, event) -> None:
     cancel: Cancel = event.data
-    why = ("you stop branches only from main; a branch never stops another branch" if inst.source_id is not None
+    why = ("you stop branches only from main; a branch never stops another branch" if not inst.can_fork
            else "you can stop branches only during your own turn, while you hold the conversation")
     _resolve(cancel.reply, why)
 
@@ -999,6 +1008,7 @@ def take_prepared(ctx, inst: Timeline, event) -> None:
         inst.step.branch.data = event.data.data
         inst.step.branch.names = dict(event.data.names or {})
         inst.step.branch.wake = dict(event.data.wake or {})
+        inst.step.branch.can_fork = dict(event.data.can_fork or {})
 
 
 def preparation_crashed(ctx, inst: Timeline, event) -> None:
@@ -1028,7 +1038,8 @@ def committed(ctx, inst: Timeline, event) -> None:
     users = [w for w in inst.req.waiters if w.user]
     inst.step.spawn_plan = [GraftPlan(child=child, focus=f, waiters=users if f else [],
                                       answering=inst.req.answering if f else None,
-                                      made_for=() if f else _owners(inst))
+                                      made_for=() if f else _owners(inst),
+                                      can_fork=inst.step.branch.can_fork.get(child, False))
                             for child, f in inst.step.branch.pairs]
 
 
@@ -1267,6 +1278,9 @@ def wake_run(ctx, inst: Timeline, event) -> None:
 
 # ------------------------------------------------------------------ effects: focus & background join
 def decide_join_reason(ctx, inst: Timeline, event) -> None:
+    if inst.joins.quiet_handback:
+        inst.joins.quiet_handback = False
+        return
     outcome = event.data if isinstance(event.data, RunOutcome) else None
     reason = "done" if outcome is not None and outcome.kind in ("join", "replied", "empty") else "failed"
     inst.joins.join_reason = CANCELLED if _focus_withdrawn(inst) else reason
@@ -1377,3 +1391,71 @@ def report_one(ctx, inst: Timeline, event) -> None:
 
 def add_watcher(ctx, inst: Timeline, event) -> None:
     inst.joins.watchers.append(event.data)
+
+
+# ------------------------------------------------------------------ depth-N child orchestration
+def can_fork_guard(ctx, inst: Timeline, event) -> bool:
+    return inst.can_fork
+
+
+def has_running_children(ctx, inst: Timeline, event) -> bool:
+    return bool(_still_running(inst))
+
+
+def no_running_children(ctx, inst: Timeline, event) -> bool:
+    return not _still_running(inst)
+
+
+def has_queued_only(ctx, inst: Timeline, event) -> bool:
+    return not _still_running(inst) and bool(inst.joins.queue)
+
+
+def all_children_queued(ctx, inst: Timeline, event) -> bool:
+    return own_graft(ctx, inst, event) and _still_running(inst) == [event.data.child]
+
+
+def focus_runs_children(ctx, inst: Timeline, event) -> bool:
+    return inst.kind == "focus" and bool(_still_running(inst))
+
+
+def focus_drains_children(ctx, inst: Timeline, event) -> bool:
+    return inst.kind == "focus" and not _still_running(inst) and bool(inst.joins.queue)
+
+
+def focus_waits_after(ctx, inst: Timeline, event) -> bool:
+    return inst.kind == "focus" and not inst.final and bool(_still_running(inst)) and not _focus_withdrawn(inst)
+
+
+def focus_quiet_handback(ctx, inst: Timeline, event) -> bool:
+    return inst.kind == "focus" and quiet_after(ctx, inst, event) and not _still_running(inst)
+
+
+def focus_cancelled_with_children(ctx, inst: Timeline, event) -> bool:
+    return _focus_withdrawn(inst) and bool(_still_running(inst))
+
+
+def set_quiet_handback(ctx, inst: Timeline, event) -> None:
+    inst.joins.join_reason = "done"
+    inst.joins.replied_cleanly = bool(inst.joins.news) and not inst.joins.needs_wake
+    inst.joins.quiet_handback = True
+
+
+def set_closing_and_forward(ctx, inst: Timeline, event) -> None:
+    inst.closing = True
+    if inst.grafts.focus:
+        _forward(inst.machines.timelines.get(inst.grafts.focus), "closing")
+
+
+def stop_live_children(ctx, inst: Timeline, event) -> None:
+    for c in list(_still_running(inst)):
+        _forward(inst.machines.timelines.get(c), "cancel")
+    _self(inst, "check")
+
+
+def abandon_queued_children(ctx, inst: Timeline, event) -> None:
+    while inst.joins.queue:
+        join = inst.joins.queue.pop(HEAD)
+        inst.grafts.live.pop(join.child, None)
+        inst.grafts.wake.pop(join.child, None)
+        inst.grafts.requests.pop(join.child, None)
+        _forward(inst.machines.timelines.get(join.child), "join_abandon")

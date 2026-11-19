@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Sequence
 
 from . import a2a
@@ -34,7 +35,7 @@ from .db import Store
 from .harness import MODEL_CALL_TIMEOUT, ForkContext, Host
 from .machine import Submission, TransitionRefused, described
 from .providers import Provider
-from .skills import BASE_SYSTEM, BUILTIN, CATALOG, install
+from .skills import BASE_SYSTEM, BUILTIN, CATALOG, MIN_CHILDREN_TO_FORK, install, load_skills
 from .tools import Tool, by_name
 
 DEFAULT_PAGE_SIZE = 50
@@ -64,6 +65,8 @@ class GraftConfig:
     trace: Callable[[str], None] | None = None  # a debug hook for internal trace lines, not a channel
     before_fork: Callable[[ForkContext], Any] | None = None  # host policy hook to allow or refuse a fork
     skills: Sequence | None = None  # the skill catalog (default: graft.skills.CATALOG)
+    skills_dir: str | Path | None = None  # explicit directory of SKILL.md files (loaded via load_skills)
+    min_children_to_fork: int = MIN_CHILDREN_TO_FORK  # minimum child skills for a branch to gain `fork`
     ids: Callable[[], str] | None = None  # the source of context and task ids (default: uuid4)
     context_id: str | None = None
     name: str = "graft"
@@ -130,13 +133,18 @@ class GraftAgent:
         tools = list(tools)
         given = by_name(tools)  # checked before anything is written (a refused set writes nothing)
         if not store.skill_names():
-            install(store, tools={name: t.definition() for name, t in given.items()}, skills=self.config.skills)
+            skills = self.config.skills
+            if self.config.skills_dir is not None:
+                disk_skills = load_skills(self.config.skills_dir)
+                skills = disk_skills if skills is None else list(disk_skills) + list(skills)
+            install(store, tools={name: t.definition() for name, t in given.items()}, skills=skills)
         self._host = Host(store, provider, tools=tools, trace=self.config.trace, max_steps=self.config.max_steps,
                           persona=self.config.persona, nonce=self.config.nonce,
                           compact_tokens=self.config.compact_tokens, compaction_mode=self.config.compaction_mode,
                           seeder=self.config.seeder, window_tokens=self.config.window_tokens,
                           call_timeout=self.config.call_timeout, names=self.config.names,
-                          before_fork=self.config.before_fork)
+                          before_fork=self.config.before_fork,
+                          min_children_to_fork=self.config.min_children_to_fork)
 
     # ------------------------------------------------------------ lifetime
     async def start(self) -> None:
@@ -156,8 +164,9 @@ class GraftAgent:
 
     # ------------------------------------------------------------ discovery
     def card(self) -> AgentCard:
-        """The Agent Card: its skills are the capability skills main can fork a branch to hold."""
-        rows = self.store.con.execute("SELECT name, description FROM skills ORDER BY skill_id").fetchall()
+        """The Agent Card: its skills are the top-level capability skills main can fork a branch to hold."""
+        rows = self.store.con.execute(
+            "SELECT name, description FROM skills WHERE parent IS NULL ORDER BY skill_id").fetchall()
         skills = [AgentSkill(id=r[0], name=r[0], description=r[1], tags=[r[0]]) for r in rows if r[0] not in BUILTIN]
         return AgentCard(name=self.config.name, description=self.config.description, version=self.config.version,
                          supported_interfaces=list(self.config.interfaces), skills=skills)

@@ -55,7 +55,8 @@ def _fts_query(raw: str, *, use_or: bool = False) -> str:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS skills(
   skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,
-  description TEXT NOT NULL, instructions TEXT NOT NULL);
+  description TEXT NOT NULL, instructions TEXT NOT NULL,
+  parent TEXT);
 CREATE TABLE IF NOT EXISTS tools(
   tool_id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, input_schema TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS skill_tools(
@@ -154,6 +155,7 @@ class Skill:
     description: str
     instructions: str
     tools: list  # graft's own tool definitions {"name", "description", "inputSchema"}, or host tool names
+    parent: str | None = None
 
 
 @dataclass
@@ -185,12 +187,15 @@ class Store:
             raise RuntimeError(f"{path} was written by an older graft: its turns carry no harness mark, so "
                                "harness notes cannot be told from user messages. Re-run to produce a new store.")
         self.con.executescript(SCHEMA)
+        skill_cols = [r[1] for r in self.con.execute("PRAGMA table_info(skills)")]
+        if skill_cols and "parent" not in skill_cols:
+            self.con.execute("ALTER TABLE skills ADD COLUMN parent TEXT")
 
     # ---------- skills ----------
     def add_skill(self, skill: Skill) -> int:
         cur = self.con.execute(
-            "INSERT INTO skills(name, description, instructions) VALUES (?,?,?)",
-            (skill.name, skill.description, skill.instructions),
+            "INSERT INTO skills(name, description, instructions, parent) VALUES (?,?,?,?)",
+            (skill.name, skill.description, skill.instructions, skill.parent),
         )
         sid = cur.lastrowid
         for t in skill.tools:
@@ -206,6 +211,25 @@ class Store:
 
     def skill_names(self) -> list[str]:
         return [r[0] for r in self.con.execute("SELECT name FROM skills ORDER BY skill_id")]
+
+    def parent_of(self, name: str) -> str | None:
+        row = self.con.execute("SELECT parent FROM skills WHERE name=?", (name,)).fetchone()
+        return row[0] if row else None
+
+    def top_level_skills(self, exclude: Iterable[str] = ()) -> list[str]:
+        excluded = set(exclude)
+        return [r[0] for r in self.con.execute(
+            "SELECT name FROM skills WHERE parent IS NULL ORDER BY skill_id") if r[0] not in excluded]
+
+    def children_of(self, parents: Iterable[str], exclude: Iterable[str] = ()) -> list[str]:
+        parent_list = list(dict.fromkeys(parents))
+        if not parent_list:
+            return []
+        excluded = set(exclude)
+        placeholders = ",".join("?" * len(parent_list))
+        return [r[0] for r in self.con.execute(
+            f"SELECT name FROM skills WHERE parent IN ({placeholders}) ORDER BY skill_id",
+            parent_list) if r[0] not in excluded]
 
     def skills_for(self, tl: str) -> list[sqlite3.Row]:
         return self.con.execute(
@@ -274,6 +298,18 @@ class Store:
         return self.con.execute(
             "SELECT timeline_id FROM timelines WHERE source_id IS NULL ORDER BY created_at"
         ).fetchone()[0]
+
+    def is_descendant_or_self(self, candidate: str, ancestor: str) -> bool:
+        """True if `candidate` is `ancestor` or a descendant timeline of `ancestor`."""
+        cur: str | None = candidate
+        seen: set[str] = set()
+        while cur is not None and cur not in seen:
+            if cur == ancestor:
+                return True
+            seen.add(cur)
+            row = self.con.execute("SELECT source_id FROM timelines WHERE timeline_id=?", (cur,)).fetchone()
+            cur = row[0] if row else None
+        return False
 
     # ---------- turns & context ----------
     def insert_turn(self, owner: str, role: str, kind: str, content: Any,
@@ -555,6 +591,15 @@ class Store:
         excluded = sorted({int(r) for r in exclude_rows})
         excl_sql = f" AND t.row_id NOT IN ({','.join('?' * len(excluded))})" if excluded else ""
         sql = (
+            "WITH RECURSIVE committed_tls(timeline_id) AS ("
+            "  SELECT timeline_id FROM timelines WHERE source_id IS NULL "
+            "  UNION ALL "
+            "  SELECT t.timeline_id FROM timelines t "
+            "  JOIN committed_tls ct ON t.source_id = ct.timeline_id "
+            "  WHERE t.status = 'joined' "
+            "     OR EXISTS(SELECT 1 FROM transactions tx WHERE tx.kind = 'join' "
+            "               AND tx.target = t.timeline_id AND tx.status = 'committed')"
+            ") "
             "SELECT t.row_id, t.owner_timeline, tl.source_id, tl.name AS branch_name, "
             "       t.role, t.kind, t.tool_name, "
             "       snippet(turns_fts, 0, '', '', '...', 64) AS snippet, "
@@ -562,13 +607,11 @@ class Store:
             "FROM turns_fts "
             "JOIN turns t ON t.row_id = turns_fts.rowid "
             "JOIN timelines tl ON tl.timeline_id = t.owner_timeline "
+            "JOIN committed_tls ct ON ct.timeline_id = t.owner_timeline "
             "WHERE turns_fts MATCH ? "
             "  AND t.harness = 0 "
             "  AND t.kind IN ('text', 'tool_result') "
             "  AND (t.tool_name IS NULL OR t.tool_name != 'search') "
-            "  AND (tl.source_id IS NULL OR tl.status = 'joined' "
-            "       OR EXISTS(SELECT 1 FROM transactions tx WHERE tx.kind = 'join' "
-            "                 AND tx.target = tl.timeline_id AND tx.status = 'committed')) "
             "  AND NOT EXISTS(SELECT 1 FROM withdrawals w WHERE w.row_id = t.row_id)"
             f"{excl_sql} "
             "ORDER BY rank, t.row_id DESC "
