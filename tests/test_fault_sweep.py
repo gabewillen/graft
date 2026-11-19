@@ -53,6 +53,8 @@ import warnings
 import pytest
 
 import graft.machine as machine
+from graft import a2a
+from graft.agent import fold
 from graft.fake import FakeWorld
 from graft.machine import DecisionFault, TransitionRefused
 from test_parallel import (BAD, BG, FOCUS, STAY, STOP, FaultScript, clone_entry, clone_use, is_wake, make, text,
@@ -348,7 +350,7 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
                 live.append(tl)
             except TransitionRefused:
                 pass
-        await call_(label="settle", coro=chat_of(h).quiet())  # a closed session answers at once (one closing would wait)
+        await call_(label="settle", coro=settle(h))  # a closed session answers at once (one closing would wait)
         if live:
             case.problems.append(f"machines left running after close: {live}")
         return
@@ -377,7 +379,7 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
         await call_(label="user_says", coro=chat_of(h).say("plain"))
     script.open()
     for _ in range(2):
-        await call_(label="settle", coro=chat_of(h).quiet())
+        await call_(label="settle", coro=settle(h))
         if not isinstance(case.calls[-1][1], Exception):
             break
 
@@ -388,6 +390,26 @@ async def drive(h, store, script, scenario: str, case: Case, stashed: asyncio.Ev
 STORE_COPY = {"_forward", "_send", "_note", "take_note", "_scribe_write", 
               "told_after_write", "s_tell_kept", "s_report_write", "scribe_fault", "host.mirror",
               "host.abandon_clone"}  # (an undone call's grafts not marked abandoned: told, and the store keeps them)
+
+
+async def settle(h) -> list[str]:
+    """`quiet`, but a task held by a join whose commit failed is settled at INPUT_REQUIRED: its join
+    is retried at the next commit point, and the task stays INPUT_REQUIRED until then (spec:
+    Host Interface, Errors)."""
+    chat = chat_of(h)
+    following = asyncio.ensure_future(chat.quiet())
+    try:
+        while not following.done():
+            root = h.machines.timelines.get("o")
+            open_ = chat.open_tasks()
+            if open_ and root is not None and root.hold and all(
+                    fold(events=[e for _, e in chat.store.task_events(t)]).status.state == a2a.INPUT_REQUIRED
+                    for t in open_):
+                return chat.heard()
+            await asyncio.wait({following}, timeout=0.02)
+        return following.result()
+    finally:
+        following.cancel()
 
 
 async def usable(h, store, case: Case) -> None:
@@ -403,7 +425,7 @@ async def usable(h, store, case: Case) -> None:
     if not (isinstance(out, list) and out and out[-1] == "answer to next"):
         case.problems.append(f"next answered {out!r}")
     for _ in range(2):
-        await call(case=case, label="settle", coro=chat_of(h).quiet())
+        await call(case=case, label="settle", coro=settle(h))
         if not isinstance(case.calls[-1][1], Exception):
             break
     await call(case=case, label="close", coro=h.close())
